@@ -414,10 +414,8 @@ mod tests {
         sink.send(ws::Message::Close(None)).await.unwrap();
     }
 
-    /// Fragmented binary messages (RFC 6455 §5.4) must be reassembled
-    /// before delivery to the server-fn. An earlier revision silently
-    /// dropped `Frame::Continuation`, losing any large message that a
-    /// ws-client chose to fragment.
+    /// RFC 6455 §5.4: fragmented binary messages must be reassembled
+    /// before delivery to the server-fn.
     #[ntex::test]
     async fn websocket_server_fn_reassembles_fragmented_binary() {
         use ntex::ws::Item;
@@ -633,12 +631,10 @@ mod tests {
 
     /// RFC 9110 §9.3.2: HEAD must mirror GET's status and headers.
     ///
-    /// Note: `test::call_service` bypasses the h1 wire encoder, so we
-    /// cannot assert an empty response body here (that check lives in
-    /// the TCP-based integration tests). What we *can* verify is that
-    /// the handler ran and produced the same status and Content-Type
-    /// as GET — which is the behavioral regression the old synthetic
-    /// `HEAD → 200 OK .finish()` shortcut was hiding.
+    /// Note: `test::call_service` bypasses the h1 wire encoder, so the
+    /// empty-body requirement is asserted in the TCP-based integration
+    /// tests; here we verify that the handler runs and produces the
+    /// same status and Content-Type as GET.
     #[ntex::test]
     async fn head_request_mirrors_get_status_and_content_type() {
         use crate::LeptosRoutes;
@@ -764,11 +760,10 @@ mod tests {
         assert!(text.contains("Privet"));
     }
 
-    // `ensure_executor_initialized()` is called implicitly by every
-    // public entry point. Exercising it from a plain `#[test]` (i.e.
-    // outside the ntex system) catches regressions where the executor
-    // init path starts assuming an arbiter — which would break SSG or
-    // library-mode usage where no ntex runtime is booted yet.
+    // Invariant: `ensure_executor_initialized()` must not depend on a
+    // running ntex arbiter — SSG and library-mode callers invoke public
+    // entry points (like `generate_route_list`) without booting a ntex
+    // runtime. A plain `#[test]` (no `#[ntex::test]`) enforces this.
     #[test]
     fn executor_init_is_safe_without_ntex_system() {
         #[component]
