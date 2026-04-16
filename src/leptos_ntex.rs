@@ -488,41 +488,10 @@ where
     Err: ErrorRenderer,
     IV: IntoView + 'static,
 {
-    ensure_executor_initialized();
     let handler = move |req: HttpRequest| {
-        let app_fn = app_fn.clone();
         let add_context = additional_context.clone();
-        async move {
-            let is_island_router_navigation = cfg!(feature = "islands-router")
-                && req.headers().contains_key("Islands-Router");
-            let res_options = ResponseOptions::default();
-            let (meta_context, meta_output) = ServerMetaContext::new();
-
-            let additional_context = {
-                let meta_context = meta_context.clone();
-                let res_options = res_options.clone();
-                let req = Request::new(&req);
-                move || {
-                    provide_contexts(req, &meta_context, &res_options);
-                    add_context();
-                    if is_island_router_navigation {
-                        provide_context(IslandsRouterNavigation);
-                    }
-                }
-            };
-
-            let res = NtexResponse::from_app(
-                app_fn,
-                meta_output,
-                additional_context,
-                res_options,
-                stream_builder,
-                !is_island_router_navigation,
-            )
-            .await;
-
-            res.take()
-        }
+        let app_fn = app_fn.clone();
+        handle_response_inner(add_context, app_fn, req, stream_builder)
     };
     Route::<Err>::new().method(ntex_method(method)).to(handler)
 }
@@ -1007,6 +976,15 @@ impl StaticRouteGenerator {
     }
 }
 
+/// Per-process cache of [`ResponseOptions`] captured when a static route
+/// is first rendered, keyed by the URL path. Read on cache hits to replay
+/// the original status/headers alongside the on-disk HTML.
+///
+/// ⚠ **Scope is the entire process.** If an application hosts multiple
+/// [`LeptosOptions`] with overlapping route paths (e.g. two sites that
+/// both expose `/index.html`), entries collide — the last writer wins.
+/// Mirrors `leptos_actix` behaviour; in practice apps run a single
+/// `LeptosOptions` instance per process and the collision is theoretical.
 static STATIC_HEADERS: LazyLock<RwLock<HashMap<String, ResponseOptions>>> =
     LazyLock::new(Default::default);
 
@@ -1374,17 +1352,16 @@ where
             let mode = listing.mode();
             let is_static = matches!(mode, SsrMode::Static(_));
 
-            // Register a single HEAD handler per path for non-Static routes
-            // (outside the per-method loop, so GET+POST routes don't get two
-            // identical HEAD handlers).
-            if !is_static {
-                self = self.route(
-                    path,
-                    Route::<Err>::new()
-                        .method(ntex::http::Method::HEAD)
-                        .to(|| async { HttpResponse::Ok().finish() }),
-                );
-            }
+            // Single HEAD handler per path, whether the route is static
+            // or not. Outside the per-method loop so a GET+POST listing
+            // gets one HEAD, not two. `handle_static_route` only accepts
+            // GET, which would leave HEAD unrouted without this.
+            self = self.route(
+                path,
+                Route::<Err>::new()
+                    .method(ntex::http::Method::HEAD)
+                    .to(|| async { HttpResponse::Ok().finish() }),
+            );
 
             for method in listing.methods() {
                 let additional_context = additional_context.clone();
@@ -1498,15 +1475,14 @@ where
             let mode = listing.mode();
             let is_static = matches!(mode, SsrMode::Static(_));
 
-            // Single HEAD handler per path for non-Static routes.
-            if !is_static {
-                router = router.route(
-                    path,
-                    Route::<Err>::new()
-                        .method(ntex::http::Method::HEAD)
-                        .to(|| async { HttpResponse::Ok().finish() }),
-                );
-            }
+            // Single HEAD handler per path for all routes (static and
+            // non-static). See the parity comment in the `App` impl above.
+            router = router.route(
+                path,
+                Route::<Err>::new()
+                    .method(ntex::http::Method::HEAD)
+                    .to(|| async { HttpResponse::Ok().finish() }),
+            );
 
             for method in listing.methods() {
                 let additional_context = additional_context.clone();

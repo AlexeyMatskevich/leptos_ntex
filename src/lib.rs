@@ -725,6 +725,37 @@ mod tests {
     }
 
     #[ntex::test]
+    async fn head_request_on_static_route_returns_ok() {
+        let site_root = temp_site_root("head_static");
+        let (routes, generator) = generate_route_list_with_ssg(StaticApp);
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_head_static")
+            .site_root(site_root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+
+        generator.generate(&options).await;
+
+        let app = test::init_service(
+            NtexApp::new()
+                .state(options.clone())
+                .configure(|cfg| {
+                    register_leptos_routes(cfg, routes.clone(), StaticApp);
+                }),
+        )
+        .await;
+
+        let req = test::TestRequest::default()
+            .method(ntex::http::Method::HEAD)
+            .uri("/")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    #[ntex::test]
     async fn static_route_served_over_http() {
         let site_root = temp_site_root("http_static");
         let (routes, generator) = generate_route_list_with_ssg(StaticApp);
