@@ -50,7 +50,7 @@ use send_wrapper::SendWrapper;
 use server_fn::{
     Protocol, ServerFn, ServerFnTraitObj,
     error::{FromServerFnError, IntoAppError},
-    middleware::BoxedService,
+    middleware::{BoxedService, Layer},
     redirect::REDIRECT_HEADER,
     request::Req,
     response::{Res, TryRes},
@@ -1340,10 +1340,14 @@ where
             .collect::<HashSet<_>>();
 
         for (path, method) in server_fn_paths() {
-            if !excluded.contains(path) {
+            if !excluded.contains(path)
+                && let Some(server_fn) = lookup_server_fn(path, &method)
+            {
                 let additional_context = additional_context.clone();
-                let handler = handle_server_fns_with_context(additional_context).method(method);
-                self = self.route(path, handler);
+                self = self.route(
+                    path,
+                    handle_specific_server_fn_with_context(server_fn, additional_context),
+                );
             }
         }
 
@@ -1463,10 +1467,14 @@ where
             .collect::<HashSet<_>>();
 
         for (path, method) in server_fn_paths() {
-            if !excluded.contains(path) {
+            if !excluded.contains(path)
+                && let Some(server_fn) = lookup_server_fn(path, &method)
+            {
                 let additional_context = additional_context.clone();
-                let handler = handle_server_fns_with_context(additional_context).method(method);
-                router = router.route(path, handler);
+                router = router.route(
+                    path,
+                    handle_specific_server_fn_with_context(server_fn, additional_context),
+                );
             }
         }
 
@@ -2098,21 +2106,145 @@ pub fn server_fn_paths() -> impl Iterator<Item = (&'static str, HttpMethod)> {
     paths.into_iter()
 }
 
+fn lookup_server_fn(
+    path: &str,
+    method: &HttpMethod,
+) -> Option<ServerFnTraitObj<NtexRequest, NtexServerResponse>> {
+    let guard = REGISTERED_SERVER_FUNCTIONS.read().or_poisoned();
+    let entries = guard.get(path)?;
+    entries
+        .iter()
+        .find(|(m, _)| m == method)
+        .map(|(_, f)| f.clone())
+}
+
 /// Looks up the service for the server function registered at the given
 /// path and method, applying any middlewares that were attached to it.
+///
+/// Intended for the catchall [`handle_server_fns`] dispatcher and for
+/// advanced compositions. When server functions are mounted through
+/// [`LeptosRoutes::leptos_routes`] / [`register_leptos_routes`] the
+/// lookup is avoided — each path gets its own handler closing over the
+/// pre-resolved [`ServerFnTraitObj`].
 pub fn get_server_fn_service(
     path: &str,
     method: &HttpMethod,
 ) -> Option<BoxedService<NtexRequest, NtexServerResponse>> {
-    let guard = REGISTERED_SERVER_FUNCTIONS.read().or_poisoned();
-    let entries = guard.get(path)?;
-    let server_fn = entries.iter().find(|(m, _)| m == method).map(|(_, f)| f)?;
+    let server_fn = lookup_server_fn(path, method)?;
     let middleware = server_fn.middleware();
-    let mut service = server_fn.clone().boxed();
+    let mut service = server_fn.boxed();
     for m in middleware {
         service = m.layer(service);
     }
     Some(service)
+}
+
+/// Runs a prepared [`BoxedService`] for a server function, setting up the
+/// reactive Owner, provided contexts, referrer-based redirect fixup, and
+/// `ResponseOptions` extension. Shared between the catchall
+/// [`handle_server_fns_with_context`] handler and the per-path
+/// [`handle_specific_server_fn_with_context`] handler.
+async fn dispatch_server_fn(
+    mut service: BoxedService<NtexRequest, NtexServerResponse>,
+    req: HttpRequest,
+    payload: Payload,
+    additional_context: impl FnOnce() + 'static + Send,
+) -> HttpResponse {
+    let owner = Owner::new();
+    owner
+        .with(|| {
+            ScopedFuture::new(async move {
+                provide_context(Request::new(&req));
+                let res_options = ResponseOptions::default();
+                provide_context(res_options.clone());
+                additional_context();
+
+                let accepts_html = req
+                    .headers()
+                    .get(header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains("text/html"))
+                    .unwrap_or(false);
+                let referrer = req.headers().get(header::REFERER).cloned();
+
+                let mut res = service.run(NtexRequest::from((req, payload))).await;
+
+                if accepts_html
+                    && res.0.headers().get(header::LOCATION).is_none()
+                    && let Some(referrer) = referrer
+                {
+                    *res.0.status_mut() = StatusCode::FOUND;
+                    res.0.headers_mut().insert(header::LOCATION, referrer);
+                }
+
+                {
+                    let mut res_options = res_options.0.write().or_poisoned();
+                    let headers = res.0.headers_mut();
+                    // `HeaderMap::get` returns only the first value; use
+                    // `get_all` so multi-valued `Location` (rare but
+                    // legal via `append_header`) isn't silently dropped.
+                    let mut locations =
+                        res_options.headers.get_all(header::LOCATION).cloned();
+                    if let Some(first) = locations.next() {
+                        headers.insert(header::LOCATION, first);
+                        for v in locations {
+                            headers.append(header::LOCATION, v);
+                        }
+                        res_options.headers.remove(header::LOCATION);
+                    }
+                }
+
+                let mut wrapped = NtexResponse(res.take());
+                wrapped.extend_response(&res_options);
+                wrapped.take()
+            })
+        })
+        .await
+}
+
+/// Returns an ntex [`Route`] bound to a single, pre-resolved server
+/// function — skipping the per-request `HashMap` lookup that
+/// [`handle_server_fns_with_context`] performs. Used by
+/// [`LeptosRoutes::leptos_routes_with_context`] at registration time so
+/// every server-fn endpoint closes over its own [`ServerFnTraitObj`] and
+/// middleware list.
+///
+/// The middleware factory is invoked once at registration and the result
+/// is cached behind an [`Arc`] — cheap to clone per request (one atomic
+/// increment), no per-request `Vec` allocation for the layer list.
+fn handle_specific_server_fn_with_context<Err>(
+    server_fn: ServerFnTraitObj<NtexRequest, NtexServerResponse>,
+    additional_context: impl Fn() + 'static + Clone + Send,
+) -> Route<Err>
+where
+    Err: ErrorRenderer,
+{
+    ensure_executor_initialized();
+    let method = server_fn.method();
+    let middleware: Arc<[Arc<dyn Layer<NtexRequest, NtexServerResponse>>]> =
+        server_fn.middleware().into();
+    let server_fn = Arc::new(server_fn);
+
+    Route::<Err>::new().method(method).to(
+        move |req: HttpRequest, payload: web::types::Payload| {
+            let server_fn = server_fn.clone();
+            let middleware = middleware.clone();
+            let additional_context = additional_context.clone();
+            async move {
+                let mut service = (*server_fn).clone().boxed();
+                for m in middleware.iter() {
+                    service = m.layer(service);
+                }
+                dispatch_server_fn(
+                    service,
+                    req,
+                    payload.into_inner(),
+                    additional_context,
+                )
+                .await
+            }
+        },
+    )
 }
 
 /// Returns an ntex [`Route`] that dispatches requests to the registered
@@ -2171,60 +2303,8 @@ where
     Route::<Err>::new().to(move |req: HttpRequest, payload: web::types::Payload| {
         let additional_context = additional_context.clone();
         async move {
-            if let Some(mut service) = get_server_fn_service(req.path(), req.method()) {
-                let owner = Owner::new();
-                owner
-                    .with(|| {
-                        ScopedFuture::new(async move {
-                            provide_context(Request::new(&req));
-                            let res_options = ResponseOptions::default();
-                            provide_context(res_options.clone());
-                            additional_context();
-
-                            let accepts_html = req
-                                .headers()
-                                .get(header::ACCEPT)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|v| v.contains("text/html"))
-                                .unwrap_or(false);
-                            let referrer = req.headers().get(header::REFERER).cloned();
-
-                            let mut res = service
-                                .run(NtexRequest::from((req, payload.into_inner())))
-                                .await;
-
-                            if accepts_html
-                                && res.0.headers().get(header::LOCATION).is_none()
-                                && let Some(referrer) = referrer
-                            {
-                                *res.0.status_mut() = StatusCode::FOUND;
-                                res.0.headers_mut().insert(header::LOCATION, referrer);
-                            }
-
-                            {
-                                let mut res_options = res_options.0.write().or_poisoned();
-                                let headers = res.0.headers_mut();
-                                // `HeaderMap::get` returns only the first
-                                // value; use `get_all` so multi-valued
-                                // `Location` (rare but legal via
-                                // `append_header`) isn't silently dropped.
-                                let mut locations =
-                                    res_options.headers.get_all(header::LOCATION).cloned();
-                                if let Some(first) = locations.next() {
-                                    headers.insert(header::LOCATION, first);
-                                    for v in locations {
-                                        headers.append(header::LOCATION, v);
-                                    }
-                                    res_options.headers.remove(header::LOCATION);
-                                }
-                            }
-
-                            let mut wrapped = NtexResponse(res.take());
-                            wrapped.extend_response(&res_options);
-                            wrapped.take()
-                        })
-                    })
-                    .await
+            if let Some(service) = get_server_fn_service(req.path(), req.method()) {
+                dispatch_server_fn(service, req, payload.into_inner(), additional_context).await
             } else {
                 HttpResponse::BadRequest().body(format!(
                     "Could not find a server function at the route {}. \
