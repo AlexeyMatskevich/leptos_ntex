@@ -243,7 +243,7 @@ impl ExtendResponse for NtexResponse {
         }));
         NtexResponse(
             HttpResponse::Ok()
-                .content_type("text/html")
+                .content_type("text/html; charset=utf-8")
                 .streaming(pinned),
         )
     }
@@ -1068,7 +1068,14 @@ where
             let path = static_path(&options, &orig_path);
             let path_buf = Path::new(&path).to_path_buf();
 
-            let exists = path_buf.exists();
+            // `Path::exists()` is a synchronous `stat(2)` — keep it off
+            // the arbiter so the io loop isn't blocked on a slow FS
+            // (NFS, FUSE, etc.). Mirrors the `spawn_blocking` usage in
+            // `write_static_route` and the `NamedFile::open` below.
+            let check_path = path_buf.clone();
+            let exists = ntex::rt::spawn_blocking(move || check_path.exists())
+                .await
+                .unwrap_or(false);
 
             let (response_options, html) = if !exists {
                 let path = ResolvedStaticPath::new(&orig_path);
@@ -1950,17 +1957,14 @@ where
     }
 }
 
-type RegisteredServerFns =
-    HashMap<&'static str, Vec<(HttpMethod, ServerFnTraitObj<NtexRequest, NtexServerResponse>)>>;
-
 static REGISTERED_SERVER_FUNCTIONS: LazyServerFnMap<NtexRequest, NtexServerResponse> =
     LazyLock::new(|| {
-        let mut map = RegisteredServerFns::new();
+        let mut map = HashMap::new();
         for obj in server_fn::inventory::iter::<ServerFnTraitObj<NtexRequest, NtexServerResponse>>
             .into_iter()
         {
             map.entry(obj.path())
-                .or_default()
+                .or_insert_with(Vec::new)
                 .push((obj.method(), obj.clone()));
         }
         RwLock::new(map)
@@ -2119,8 +2123,17 @@ where
                             {
                                 let mut res_options = res_options.0.write().or_poisoned();
                                 let headers = res.0.headers_mut();
-                                if let Some(location) = res_options.headers.get(header::LOCATION).cloned() {
-                                    headers.insert(header::LOCATION, location);
+                                // `HeaderMap::get` returns only the first
+                                // value; use `get_all` so multi-valued
+                                // `Location` (rare but legal via
+                                // `append_header`) isn't silently dropped.
+                                let mut locations =
+                                    res_options.headers.get_all(header::LOCATION).cloned();
+                                if let Some(first) = locations.next() {
+                                    headers.insert(header::LOCATION, first);
+                                    for v in locations {
+                                        headers.append(header::LOCATION, v);
+                                    }
                                     res_options.headers.remove(header::LOCATION);
                                 }
                             }

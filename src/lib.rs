@@ -204,6 +204,27 @@ pub async fn read_config() -> Result<String, ServerFnError> {
 }
 
 #[cfg(test)]
+#[server(
+    name = MultiLocation,
+    prefix = "/api",
+    endpoint = "multi_location",
+    server = crate::leptos_ntex::NtexServerFnBackend
+)]
+pub async fn multi_location() -> Result<(), ServerFnError> {
+    let res = leptos::prelude::use_context::<crate::leptos_ntex::ResponseOptions>()
+        .ok_or_else(|| ServerFnError::new("no ResponseOptions in context".to_string()))?;
+    res.append_header(
+        ntex::http::header::LOCATION,
+        ntex::http::header::HeaderValue::from_static("/one"),
+    );
+    res.append_header(
+        ntex::http::header::LOCATION,
+        ntex::http::header::HeaderValue::from_static("/two"),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::leptos_ntex::{
@@ -550,6 +571,34 @@ mod tests {
         let body = test::read_body(resp).await;
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Privet"));
+    }
+
+    #[ntex::test]
+    async fn multi_location_header_is_preserved_through_res_options() {
+        // Regression: `get(LOCATION).cloned()` returned only the first
+        // value, silently dropping the second. Now we use `get_all`.
+        register_explicit::<MultiLocation>();
+        let app = test::init_service(
+            NtexApp::new().route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri(MultiLocation::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload("")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let locations: Vec<String> = resp
+            .headers()
+            .get_all(ntex::http::header::LOCATION)
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+        assert_eq!(locations, vec!["/one".to_string(), "/two".to_string()]);
     }
 
     #[ntex::test]
