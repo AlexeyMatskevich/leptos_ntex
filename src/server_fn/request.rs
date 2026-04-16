@@ -1,0 +1,547 @@
+//! The [`NtexRequest`] newtype and its `server_fn::request::Req` impl —
+//! covering body collection, streaming, and the WebSocket upgrade bridge.
+
+use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
+use futures::{Sink, SinkExt, Stream, StreamExt, channel::mpsc};
+use ntex::http::Payload;
+use ntex::util::Bytes as NBytes;
+use ntex::web::{self, HttpRequest};
+use or_poisoned::OrPoisoned;
+use send_wrapper::SendWrapper;
+use server_fn::{
+    error::{FromServerFnError, IntoAppError},
+    request::Req,
+};
+use std::{
+    borrow::Cow,
+    future::Future,
+    sync::{Arc, Mutex},
+};
+
+use crate::config::{PayloadTooLarge, collect_payload, server_fn_config};
+use crate::server_fn::response::NtexServerResponse;
+
+/// Wraps an ntex request + payload pair for use as a server function input.
+///
+/// Implements [`server_fn::request::Req`] so the generic server-function
+/// runtime can pull bytes, strings, streams, and websockets out of the
+/// request. ntex's types are not [`Send`], so the pair is wrapped in
+/// [`SendWrapper`].
+pub struct NtexRequest(pub SendWrapper<(HttpRequest, Payload)>);
+
+impl NtexRequest {
+    /// Consumes the wrapper and returns the original ntex request/payload.
+    pub fn take(self) -> (HttpRequest, Payload) {
+        self.0.take()
+    }
+
+    fn header(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.0
+            .0
+            .headers()
+            .get(name)
+            .map(|h| String::from_utf8_lossy(h.as_bytes()))
+    }
+}
+
+impl From<(HttpRequest, Payload)> for NtexRequest {
+    fn from(value: (HttpRequest, Payload)) -> Self {
+        Self(SendWrapper::new(value))
+    }
+}
+
+impl<Error, InputStreamError, OutputStreamError> Req<Error, InputStreamError, OutputStreamError>
+    for NtexRequest
+where
+    Error: FromServerFnError + Send,
+    InputStreamError: FromServerFnError + Send,
+    OutputStreamError: FromServerFnError + Send,
+{
+    type WebsocketResponse = NtexServerResponse;
+
+    fn as_query(&self) -> Option<&str> {
+        self.0.0.uri().query()
+    }
+
+    fn to_content_type(&self) -> Option<Cow<'_, str>> {
+        self.header("Content-Type")
+    }
+
+    fn accepts(&self) -> Option<Cow<'_, str>> {
+        self.header("Accept")
+    }
+
+    fn referer(&self) -> Option<Cow<'_, str>> {
+        self.header("Referer")
+    }
+
+    fn try_into_bytes(self) -> impl Future<Output = Result<SfBytes, Error>> + Send {
+        SendWrapper::new(async move {
+            let (req, payload) = self.0.take();
+            let limit = server_fn_config(&req).payload_limit;
+            collect_payload(&req, payload, limit).await.map_err(|e| {
+                // `Args` maps semantically to "error reading arguments
+                // from the request", closer to payload-overflow than
+                // `Deserialization` (which is defined as a client-side
+                // result-parsing error). The outer ntex handler
+                // translates the extension marker into 413.
+                server_fn::error::ServerFnErrorErr::Args(e.to_string()).into_app_error()
+            })
+        })
+    }
+
+    fn try_into_string(self) -> impl Future<Output = Result<String, Error>> + Send {
+        SendWrapper::new(async move {
+            let (req, payload) = self.0.take();
+            let limit = server_fn_config(&req).payload_limit;
+            let bytes = collect_payload(&req, payload, limit).await.map_err(|e| {
+                Error::from_server_fn_error(
+                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
+                )
+            })?;
+            String::from_utf8(bytes.to_vec()).map_err(|e| {
+                Error::from_server_fn_error(
+                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
+                )
+            })
+        })
+    }
+
+    fn try_into_stream(self) -> Result<impl Stream<Item = Result<SfBytes, SfBytes>> + Send, Error> {
+        let (req, payload) = self.0.take();
+        let limit = server_fn_config(&req).payload_limit;
+        // State is `Option<..>`: `None` terminates the stream on the next
+        // poll, so a single error frame (limit exceeded or payload error)
+        // is emitted and then the stream closes. On overflow we also
+        // stash the `PayloadTooLarge` marker on `req.extensions_mut()`
+        // so the outer ntex handler can translate the stream's error
+        // frame into a 413 response body.
+        let stream = futures::stream::unfold(
+            Some((req, payload, 0usize, limit)),
+            |state| async move {
+                let (req, mut payload, so_far, limit) = state?;
+                let item = payload.recv().await?;
+                match item {
+                    Ok(b) => {
+                        let next = so_far.saturating_add(b.len());
+                        if next > limit {
+                            req.extensions_mut().insert(PayloadTooLarge);
+                            let err = Error::from_server_fn_error(
+                                server_fn::error::ServerFnErrorErr::Args(format!(
+                                    "payload exceeds limit of {limit} bytes"
+                                )),
+                            )
+                            .ser();
+                            Some((Err(err), None))
+                        } else {
+                            Some((
+                                Ok(SfBytes::copy_from_slice(&b)),
+                                Some((req, payload, next, limit)),
+                            ))
+                        }
+                    }
+                    Err(e) => {
+                        let err = Error::from_server_fn_error(
+                            server_fn::error::ServerFnErrorErr::Args(e.to_string()),
+                        )
+                        .ser();
+                        Some((Err(err), None))
+                    }
+                }
+            },
+        );
+        Ok(SendWrapper::new(stream))
+    }
+
+    /// Upgrades the request to a WebSocket connection and returns
+    /// `(incoming_stream, outgoing_sink, response)` for the server-fn
+    /// runtime.
+    ///
+    /// The incoming and outgoing mpsc channel capacities default to
+    /// [`DEFAULT_WS_CHANNEL_BUFFER`](crate::DEFAULT_WS_CHANNEL_BUFFER)
+    /// (2048 messages). Override per-app by registering a
+    /// [`LeptosServerFnConfig`](crate::LeptosServerFnConfig) with
+    /// [`App::state`](ntex::web::App::state).
+    ///
+    /// ## Backpressure
+    ///
+    /// Both channels are bounded (`futures::channel::mpsc`). Producers
+    /// (this bridge writing incoming WS frames into the server-fn
+    /// receiver; the server-fn writing outgoing frames into the ntex
+    /// sink) call `Sink::send().await`, which suspends the task until
+    /// the channel has capacity again. A slow consumer therefore stalls
+    /// the frame-reader task, which is exactly the backpressure behavior
+    /// expected. Smaller buffers apply backpressure sooner; larger
+    /// buffers absorb bursts at the cost of memory
+    /// (`O(N_connections * buffer * msg_size)` worst case).
+    ///
+    /// ## Fragmented messages (RFC 6455 §5.4)
+    ///
+    /// Fragmented WebSocket messages — delivered by ntex as
+    /// `Frame::Continuation(Item::{FirstText, FirstBinary, Continue,
+    /// Last})` — are reassembled per-connection into a single payload
+    /// before being handed to the server-fn. Browser ws-clients and
+    /// many library clients fragment large messages automatically, so
+    /// dropping continuation frames (as an earlier revision did) would
+    /// silently lose data.
+    ///
+    /// ## Policy-violation close
+    ///
+    /// When a reassembled fragmented message exceeds
+    /// `LeptosServerFnConfig::payload_limit`, this bridge closes the
+    /// connection with [`CloseCode::Size`](ntex::ws::CloseCode::Size)
+    /// (1009, "Message Too Big" per RFC 6455 §7.4.1) and delivers an
+    /// `InputStreamError` to the server-fn receiver. The client gets
+    /// a structured reason rather than an abrupt disconnect.
+    fn try_into_websocket(
+        self,
+    ) -> impl Future<
+        Output = Result<
+        (
+            impl Stream<Item = Result<SfBytes, SfBytes>> + Send + 'static,
+            impl Sink<SfBytes> + Send + 'static,
+            Self::WebsocketResponse,
+        ),
+        Error,
+        >,
+    > + Send {
+        use std::{cell::RefCell, rc::Rc};
+        use ntex::ws::{CloseCode, CloseReason};
+
+        #[derive(Copy, Clone)]
+        enum FragmentKind {
+            Text,
+            Binary,
+        }
+
+        SendWrapper::new(async move {
+            let (request, _payload) = self.0.take();
+
+            let config = server_fn_config(&request);
+            let payload_limit = config.payload_limit;
+            let (response_stream_tx, response_stream_rx) =
+                mpsc::channel::<Result<SfBytes, SfBytes>>(config.ws_channel_buffer);
+            let (response_sink_tx, response_sink_rx) =
+                mpsc::channel::<SfBytes>(config.ws_channel_buffer);
+            let response_sink_rx = Arc::new(Mutex::new(Some(response_sink_rx)));
+
+            let response = web::ws::start::<_, _, &str, web::Error>(
+                request,
+                config.ws_subprotocol,
+                ntex::service::fn_factory_with_config(move |sink: web::ws::WsSink| {
+                    let response_stream_tx = response_stream_tx.clone();
+                    let response_sink_rx = response_sink_rx.clone();
+
+                    async move {
+                        let mut response_sink_rx = response_sink_rx
+                            .lock()
+                            .or_poisoned()
+                            .take()
+                            .expect("websocket response sink should only be initialized once");
+
+                        let outbound_sink = sink.clone();
+                        let mut outbound_errors = response_stream_tx.clone();
+                        ntex::rt::spawn(async move {
+                            while let Some(incoming) = response_sink_rx.next().await {
+                                if let Err(err) = outbound_sink
+                                    .send(web::ws::Message::Binary(NBytes::copy_from_slice(&incoming)))
+                                    .await
+                                {
+                                    // Surface the error to the
+                                    // server-fn receiver with full
+                                    // backpressure semantics; if the
+                                    // receiver is also gone there is
+                                    // nothing to do.
+                                    let _ = outbound_errors
+                                        .send(Err(InputStreamError::from_server_fn_error(
+                                            server_fn::error::ServerFnErrorErr::Request(
+                                                err.to_string(),
+                                            ),
+                                        )
+                                        .ser()))
+                                        .await;
+                                    let _ = outbound_sink
+                                        .send(web::ws::Message::Close(Some(CloseReason {
+                                            code: CloseCode::Abnormal,
+                                            description: Some(err.to_string()),
+                                        })))
+                                        .await;
+                                    return;
+                                }
+                            }
+                            let _ = outbound_sink.send(web::ws::Message::Close(None)).await;
+                        });
+
+                        // Per-connection reassembly buffer for
+                        // `Frame::Continuation`. `Rc<RefCell<_>>`
+                        // because `fn_factory_with_config` returns a
+                        // `!Send` future — one per connection.
+                        let fragment: Rc<RefCell<Option<(FragmentKind, SfBytesMut)>>> =
+                            Rc::new(RefCell::new(None));
+
+                        Ok::<_, web::Error>(ntex::service::fn_service({
+                            let response_stream_tx = response_stream_tx.clone();
+                            let fragment = fragment.clone();
+                            move |frame: web::ws::Frame| {
+                                let mut tx = response_stream_tx.clone();
+                                let fragment = fragment.clone();
+                                async move {
+                                    use web::ws::{Frame, Message};
+                                    use ntex::ws::Item;
+                                    match frame {
+                                        Frame::Ping(bytes) => {
+                                            Ok::<Option<Message>, web::Error>(Some(
+                                                Message::Pong(bytes),
+                                            ))
+                                        }
+                                        Frame::Pong(_) => Ok(None),
+                                        Frame::Close(reason) => {
+                                            fragment.borrow_mut().take();
+                                            Ok(Some(Message::Close(reason)))
+                                        }
+                                        Frame::Binary(bytes) => {
+                                            // Unfragmented binary; bypass
+                                            // the reassembly buffer and
+                                            // enforce the limit directly.
+                                            if bytes.len() > payload_limit {
+                                                let _ = tx
+                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                        server_fn::error::ServerFnErrorErr::Args(format!(
+                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
+                                                            bytes.len()
+                                                        )),
+                                                    )
+                                                    .ser()))
+                                                    .await;
+                                                return Ok(Some(close_too_big(payload_limit)));
+                                            }
+                                            // `send().await` applies
+                                            // backpressure when the
+                                            // consumer is slow. If the
+                                            // receiver is gone, the WS
+                                            // is about to close anyway.
+                                            let _ = tx
+                                                .send(Ok(SfBytes::copy_from_slice(&bytes)))
+                                                .await;
+                                            Ok(None)
+                                        }
+                                        Frame::Text(text) => {
+                                            if text.len() > payload_limit {
+                                                let _ = tx
+                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                        server_fn::error::ServerFnErrorErr::Args(format!(
+                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
+                                                            text.len()
+                                                        )),
+                                                    )
+                                                    .ser()))
+                                                    .await;
+                                                return Ok(Some(close_too_big(payload_limit)));
+                                            }
+                                            let _ = tx
+                                                .send(Ok(SfBytes::copy_from_slice(&text)))
+                                                .await;
+                                            Ok(None)
+                                        }
+                                        Frame::Continuation(item) => {
+                                            // What to do with a First*
+                                            // fragment after state + size
+                                            // checks. Computed inside one
+                                            // borrow window so no `RefMut`
+                                            // is held across `.await`.
+                                            enum FirstAction {
+                                                Installed,
+                                                ProtocolViolation,
+                                                Overflow(usize),
+                                            }
+                                            // For Continue: whether to
+                                            // extend the buffer, reject as
+                                            // protocol error, or reject
+                                            // on overflow.
+                                            enum ContinueAction {
+                                                Extended,
+                                                NoOpener,
+                                                Overflow(usize),
+                                            }
+                                            // For Last: take the buffer
+                                            // (if any), or reject.
+                                            enum LastAction {
+                                                Complete(SfBytesMut),
+                                                NoOpener,
+                                                Overflow(usize),
+                                            }
+                                            // Inline overflow-emit block:
+                                            // builds the `InputStreamError`
+                                            // (generic captured by the
+                                            // enclosing impl), sends it
+                                            // through the receiver with
+                                            // backpressure, then returns
+                                            // the policy-close message.
+                                            macro_rules! overflow_close {
+                                                ($total:expr) => {{
+                                                    let total = $total;
+                                                    let _ = tx
+                                                        .send(Err(InputStreamError::from_server_fn_error(
+                                                            server_fn::error::ServerFnErrorErr::Args(format!(
+                                                                "websocket payload exceeded limit of {payload_limit} bytes (observed {total})"
+                                                            )),
+                                                        )
+                                                        .ser()))
+                                                        .await;
+                                                    Ok(Some(close_too_big(payload_limit)))
+                                                }};
+                                            }
+                                            let protocol_close = |msg: &'static str| {
+                                                Ok::<Option<Message>, web::Error>(Some(
+                                                    Message::Close(Some(CloseReason {
+                                                        code: CloseCode::Protocol,
+                                                        description: Some(msg.into()),
+                                                    })),
+                                                ))
+                                            };
+
+                                            match item {
+                                                Item::FirstText(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        if guard.is_some() {
+                                                            *guard = None;
+                                                            FirstAction::ProtocolViolation
+                                                        } else if b.len() > payload_limit {
+                                                            FirstAction::Overflow(b.len())
+                                                        } else {
+                                                            let mut buf = SfBytesMut::new();
+                                                            buf.extend_from_slice(&b);
+                                                            *guard = Some((FragmentKind::Text, buf));
+                                                            FirstAction::Installed
+                                                        }
+                                                    };
+                                                    match action {
+                                                        FirstAction::Installed => Ok(None),
+                                                        FirstAction::ProtocolViolation => protocol_close(
+                                                            "new fragmented message started before previous one terminated",
+                                                        ),
+                                                        FirstAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::FirstBinary(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        if guard.is_some() {
+                                                            *guard = None;
+                                                            FirstAction::ProtocolViolation
+                                                        } else if b.len() > payload_limit {
+                                                            FirstAction::Overflow(b.len())
+                                                        } else {
+                                                            let mut buf = SfBytesMut::new();
+                                                            buf.extend_from_slice(&b);
+                                                            *guard = Some((FragmentKind::Binary, buf));
+                                                            FirstAction::Installed
+                                                        }
+                                                    };
+                                                    match action {
+                                                        FirstAction::Installed => Ok(None),
+                                                        FirstAction::ProtocolViolation => protocol_close(
+                                                            "new fragmented message started before previous one terminated",
+                                                        ),
+                                                        FirstAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::Continue(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        match guard.as_mut() {
+                                                            None => ContinueAction::NoOpener,
+                                                            Some((_, buf)) => {
+                                                                if buf
+                                                                    .len()
+                                                                    .saturating_add(b.len())
+                                                                    > payload_limit
+                                                                {
+                                                                    let total =
+                                                                        buf.len() + b.len();
+                                                                    *guard = None;
+                                                                    ContinueAction::Overflow(total)
+                                                                } else {
+                                                                    buf.extend_from_slice(&b);
+                                                                    ContinueAction::Extended
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+                                                    match action {
+                                                        ContinueAction::Extended => Ok(None),
+                                                        ContinueAction::NoOpener => protocol_close(
+                                                            "unexpected continuation frame",
+                                                        ),
+                                                        ContinueAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::Last(b) => {
+                                                    let action = {
+                                                        let taken = fragment.borrow_mut().take();
+                                                        match taken {
+                                                            None => LastAction::NoOpener,
+                                                            Some((_, mut buf)) => {
+                                                                if buf
+                                                                    .len()
+                                                                    .saturating_add(b.len())
+                                                                    > payload_limit
+                                                                {
+                                                                    LastAction::Overflow(
+                                                                        buf.len() + b.len(),
+                                                                    )
+                                                                } else {
+                                                                    buf.extend_from_slice(&b);
+                                                                    LastAction::Complete(buf)
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+                                                    match action {
+                                                        LastAction::Complete(buf) => {
+                                                            let _ = tx.send(Ok(buf.freeze())).await;
+                                                            Ok(None)
+                                                        }
+                                                        LastAction::NoOpener => protocol_close(
+                                                            "unexpected terminal continuation frame",
+                                                        ),
+                                                        LastAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                }),
+            )
+            .await
+            .map_err(|e| {
+                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Request(
+                    e.to_string(),
+                ))
+            })?;
+
+            Ok((
+                response_stream_rx,
+                response_sink_tx,
+                NtexServerResponse::from(response),
+            ))
+        })
+    }
+}
+
+/// Builds a policy-violation `Close` message carrying `CloseCode::Size`
+/// (1009, "Message Too Big" per RFC 6455 §7.4.1) with a human-readable
+/// description. The corresponding `InputStreamError` is emitted at the
+/// call site because its generic type is only in scope inside
+/// `impl Req for NtexRequest`.
+fn close_too_big(limit: usize) -> web::ws::Message {
+    web::ws::Message::Close(Some(ntex::ws::CloseReason {
+        code: ntex::ws::CloseCode::Size,
+        description: Some(format!("message exceeds limit of {limit} bytes")),
+    }))
+}
