@@ -1633,6 +1633,7 @@ pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
 ///     .state(LeptosServerFnConfig {
 ///         payload_limit: 8 * 1024 * 1024, // 8 MiB
 ///         ws_channel_buffer: 512,
+///         ws_subprotocol: Some("graphql-ws"),
 ///     })
 ///     .route("/api/{tail:.*}", handle_server_fns());
 /// # }
@@ -1647,6 +1648,15 @@ pub struct LeptosServerFnConfig {
     /// server functions. Larger values allow bursts at the cost of
     /// memory; smaller values apply stronger backpressure upstream.
     pub ws_channel_buffer: usize,
+    /// Subprotocol echoed in the `Sec-WebSocket-Protocol` response
+    /// header during WebSocket upgrade. `None` negotiates no
+    /// subprotocol (the default; matches bare `ws://` clients).
+    ///
+    /// For dynamic per-request selection — e.g. picking the first
+    /// subprotocol the client advertises that the server supports —
+    /// read [`ntex::web::ws::subprotocols`] inside a custom WebSocket
+    /// handler instead of going through [`handle_server_fns`].
+    pub ws_subprotocol: Option<&'static str>,
 }
 
 impl Default for LeptosServerFnConfig {
@@ -1654,6 +1664,7 @@ impl Default for LeptosServerFnConfig {
         Self {
             payload_limit: DEFAULT_PAYLOAD_LIMIT,
             ws_channel_buffer: DEFAULT_WS_CHANNEL_BUFFER,
+            ws_subprotocol: None,
         }
     }
 }
@@ -1833,7 +1844,7 @@ where
 
             let response = web::ws::start::<_, _, &str, web::Error>(
                 request,
-                None,
+                config.ws_subprotocol,
                 ntex::service::fn_factory_with_config(move |sink: web::ws::WsSink| {
                     let response_stream_tx = response_stream_tx.clone();
                     let response_sink_rx = response_sink_rx.clone();
