@@ -1,0 +1,28 @@
+[package]
+name = "leptos_ntex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+any_spawner = "0.3.0"
+bytes = "1.11.1"
+futures = "0.3.31"
+hydration_context = "0.3.0"
+leptos = { version = "0.8.17", features = ["ssr", "nonce"] }
+leptos_integration_utils = "0.8.8"
+leptos_meta = { version = "0.8.6", features = ["ssr", "nonce"] }
+leptos_router = { version = "0.8.13", features = ["ssr"] }
+ntex = "3.7.2"
+ntex-files = "3.2.0"
+or_poisoned = "0.1.0"
+send_wrapper = { version = "0.6.0", features = ["futures"] }
+server_fn = { version = "0.8.11", features = ["ssr"] }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0.145"
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+islands-router = ["leptos/islands-router"]
