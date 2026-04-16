@@ -574,6 +574,65 @@ mod tests {
     }
 
     #[ntex::test]
+    async fn payload_limit_rejects_oversized_body() {
+        use crate::leptos_ntex::LeptosServerFnConfig;
+        register_explicit::<EchoName>();
+        let app = test::init_service(
+            NtexApp::new()
+                // 10-byte limit; `name=AAA...` will blow past it.
+                .state(LeptosServerFnConfig {
+                    payload_limit: 10,
+                    ws_channel_buffer: 32,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        let oversized = format!("name={}", "A".repeat(100));
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload(oversized)
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        // server_fn surfaces the deserialization error as a non-2xx
+        // response; we just need to see it didn't succeed.
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    #[ntex::test]
+    async fn payload_limit_accepts_small_body() {
+        use crate::leptos_ntex::LeptosServerFnConfig;
+        register_explicit::<EchoName>();
+        let app = test::init_service(
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 1024,
+                    ws_channel_buffer: 32,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload("name=Bob")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Hello, Bob"));
+    }
+
+    #[ntex::test]
     async fn multi_location_header_is_preserved_through_res_options() {
         // Regression: `get(LOCATION).cloned()` returned only the first
         // value, silently dropping the second. Now we use `get_all`.

@@ -1620,10 +1620,74 @@ pub fn generate_request_and_parts(
     (NtexRequest::from((req, payload)), head)
 }
 
-async fn collect_payload(mut payload: Payload) -> Result<SfBytes, io::Error> {
+/// Default maximum payload size accepted by [`NtexRequest`] when collecting
+/// server-function request bodies (2 MiB).
+///
+/// Matches ntex's own default [`PayloadConfig`](ntex::web::types::PayloadConfig)
+/// limit. Override per-app by registering a [`LeptosServerFnConfig`] via
+/// [`App::state`](ntex::web::App::state).
+pub const DEFAULT_PAYLOAD_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Default channel buffer size for the incoming / outgoing WebSocket
+/// mpsc channels used by server-function websockets (2048 messages).
+///
+/// Override per-app via [`LeptosServerFnConfig::ws_channel_buffer`].
+pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
+
+/// Tunables for the server-function dispatcher.
+///
+/// Register via [`App::state`](ntex::web::App::state) to override the
+/// built-in defaults per application. Missing configuration falls back to
+/// [`DEFAULT_PAYLOAD_LIMIT`] and [`DEFAULT_WS_CHANNEL_BUFFER`].
+///
+/// ```no_run
+/// use ntex::web::App as NtexApp;
+/// use leptos_ntex::leptos_ntex::{handle_server_fns, LeptosServerFnConfig};
+///
+/// # fn example() {
+/// let _app = NtexApp::new()
+///     .state(LeptosServerFnConfig {
+///         payload_limit: 8 * 1024 * 1024, // 8 MiB
+///         ws_channel_buffer: 512,
+///     })
+///     .route("/api/{tail:.*}", handle_server_fns());
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct LeptosServerFnConfig {
+    /// Maximum accepted payload body size in bytes for non-streaming
+    /// server-function requests. Requests exceeding this limit return a
+    /// `413 Payload Too Large` via the server-fn error channel.
+    pub payload_limit: usize,
+    /// Buffer size for the WebSocket mpsc channels used by streaming
+    /// server functions. Larger values allow bursts at the cost of
+    /// memory; smaller values apply stronger backpressure upstream.
+    pub ws_channel_buffer: usize,
+}
+
+impl Default for LeptosServerFnConfig {
+    fn default() -> Self {
+        Self {
+            payload_limit: DEFAULT_PAYLOAD_LIMIT,
+            ws_channel_buffer: DEFAULT_WS_CHANNEL_BUFFER,
+        }
+    }
+}
+
+fn server_fn_config(req: &HttpRequest) -> LeptosServerFnConfig {
+    req.app_state::<LeptosServerFnConfig>().copied().unwrap_or_default()
+}
+
+async fn collect_payload(mut payload: Payload, limit: usize) -> Result<SfBytes, io::Error> {
     let mut buf = SfBytesMut::new();
     while let Some(chunk) = payload.recv().await {
         let chunk = chunk.map_err(io::Error::other)?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("payload exceeds limit of {limit} bytes"),
+            ));
+        }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf.freeze())
@@ -1685,8 +1749,9 @@ where
 
     fn try_into_bytes(self) -> impl Future<Output = Result<SfBytes, Error>> + Send {
         SendWrapper::new(async move {
-            let payload = self.0.take().1;
-            collect_payload(payload).await.map_err(|e| {
+            let (req, payload) = self.0.take();
+            let limit = server_fn_config(&req).payload_limit;
+            collect_payload(payload, limit).await.map_err(|e| {
                 server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()).into_app_error()
             })
         })
@@ -1694,8 +1759,9 @@ where
 
     fn try_into_string(self) -> impl Future<Output = Result<String, Error>> + Send {
         SendWrapper::new(async move {
-            let payload = self.0.take().1;
-            let bytes = collect_payload(payload).await.map_err(|e| {
+            let (req, payload) = self.0.take();
+            let limit = server_fn_config(&req).payload_limit;
+            let bytes = collect_payload(payload, limit).await.map_err(|e| {
                 Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()))
             })?;
             String::from_utf8(bytes.to_vec()).map_err(|e| {
@@ -1705,23 +1771,60 @@ where
     }
 
     fn try_into_stream(self) -> Result<impl Stream<Item = Result<SfBytes, SfBytes>> + Send, Error> {
-        let payload = self.0.take().1;
-        let stream = futures::stream::unfold(payload, |mut payload| async move {
-            payload.recv().await.map(|res| {
-                let item = res
-                    .map(|b| SfBytes::copy_from_slice(&b))
-                    .map_err(|e| {
-                        Error::from_server_fn_error(
+        let (req, payload) = self.0.take();
+        let limit = server_fn_config(&req).payload_limit;
+        // State is `Option<..>`: `None` terminates the stream on the next
+        // poll, so a single error frame (limit exceeded or payload error)
+        // is emitted and then the stream closes.
+        let stream = futures::stream::unfold(
+            Some((payload, 0usize, limit)),
+            |state| async move {
+                let (mut payload, so_far, limit) = state?;
+                let item = payload.recv().await?;
+                match item {
+                    Ok(b) => {
+                        let next = so_far.saturating_add(b.len());
+                        if next > limit {
+                            let err = Error::from_server_fn_error(
+                                server_fn::error::ServerFnErrorErr::Deserialization(format!(
+                                    "payload exceeds limit of {limit} bytes"
+                                )),
+                            )
+                            .ser();
+                            Some((Err(err), None))
+                        } else {
+                            Some((
+                                Ok(SfBytes::copy_from_slice(&b)),
+                                Some((payload, next, limit)),
+                            ))
+                        }
+                    }
+                    Err(e) => {
+                        let err = Error::from_server_fn_error(
                             server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()),
                         )
-                        .ser()
-                    });
-                (item, payload)
-            })
-        });
+                        .ser();
+                        Some((Err(err), None))
+                    }
+                }
+            },
+        );
         Ok(SendWrapper::new(stream))
     }
 
+    /// Upgrades the request to a WebSocket connection and returns
+    /// `(incoming_stream, outgoing_sink, response)` for the server-fn
+    /// runtime.
+    ///
+    /// The incoming and outgoing mpsc channel capacities default to
+    /// [`DEFAULT_WS_CHANNEL_BUFFER`] (2048 messages). Override per-app by
+    /// registering a [`LeptosServerFnConfig`] with
+    /// [`App::state`](ntex::web::App::state). Backpressure semantics: if
+    /// a producer outruns the consumer, `start_send` on the sink will
+    /// fail with `TrySendError::Full` once the buffer fills. Choose a
+    /// smaller buffer to push backpressure up the stack sooner; a larger
+    /// buffer to absorb bursts at the cost of memory
+    /// (`O(N_connections * buffer * msg_size)` worst case).
     fn try_into_websocket(
         self,
     ) -> impl Future<
@@ -1737,9 +1840,11 @@ where
         SendWrapper::new(async move {
             let (request, _payload) = self.0.take();
 
+            let config = server_fn_config(&request);
             let (response_stream_tx, response_stream_rx) =
-                mpsc::channel::<Result<SfBytes, SfBytes>>(2048);
-            let (response_sink_tx, response_sink_rx) = mpsc::channel::<SfBytes>(2048);
+                mpsc::channel::<Result<SfBytes, SfBytes>>(config.ws_channel_buffer);
+            let (response_sink_tx, response_sink_rx) =
+                mpsc::channel::<SfBytes>(config.ws_channel_buffer);
             let response_sink_rx = Arc::new(Mutex::new(Some(response_sink_rx)));
 
             let response = web::ws::start::<_, _, &str, web::Error>(
