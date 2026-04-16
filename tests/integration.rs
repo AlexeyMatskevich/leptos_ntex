@@ -1,13 +1,13 @@
 //! End-to-end integration tests that boot a real ntex server over TCP and
 //! issue HTTP requests through the ntex test client. These exercise the
-//! public `leptos_ntex` API from outside the crate (no `cfg(test)` access),
+//! public `leptos_ntex_unofficial` API from outside the crate (no `cfg(test)` access),
 //! so they catch visibility and API-shape regressions that the in-crate
 //! tests cannot.
 
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Title, provide_meta_context};
-use leptos_ntex::leptos_ntex::{
+use leptos_ntex_unofficial::{
     LeptosRoutes, file_and_error_handler, generate_route_list, handle_server_fns,
     register_explicit, register_leptos_routes, site_pkg_dir_service,
 };
@@ -67,7 +67,7 @@ fn shell_with_options(_: LeptosOptions) -> impl IntoView {
     name = SumTwo,
     prefix = "/api",
     endpoint = "sum_two",
-    server = leptos_ntex::leptos_ntex::NtexServerFnBackend
+    server = leptos_ntex_unofficial::NtexServerFnBackend
 )]
 pub async fn sum_two(a: i32, b: i32) -> Result<i32, ServerFnError> {
     Ok(a + b)
@@ -258,7 +258,7 @@ async fn real_server_site_pkg_dir_service_registers() {
     name = MulTwo,
     prefix = "/api",
     endpoint = "mul_two_auto_inventory",
-    server = leptos_ntex::leptos_ntex::NtexServerFnBackend
+    server = leptos_ntex_unofficial::NtexServerFnBackend
 )]
 pub async fn mul_two_auto_inventory(a: i32, b: i32) -> Result<i32, ServerFnError> {
     Ok(a * b)
@@ -307,7 +307,7 @@ async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
     endpoint = "sum_cbor",
     input = Cbor,
     output = Cbor,
-    server = leptos_ntex::leptos_ntex::NtexServerFnBackend
+    server = leptos_ntex_unofficial::NtexServerFnBackend
 )]
 pub async fn sum_cbor(a: i32, b: i32) -> Result<i32, ServerFnError> {
     Ok(a + b)

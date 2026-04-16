@@ -1,7 +1,21 @@
 [package]
-name = "leptos_ntex"
+name = "leptos-ntex-unofficial"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Unofficial Leptos SSR integration for the ntex web framework."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AlexeyMatskevich/leptos_ntex"
+documentation = "https://docs.rs/leptos-ntex-unofficial"
+readme = "README.md"
+keywords = ["leptos", "ntex", "ssr", "web", "integration"]
+categories = ["web-programming", "web-programming::http-server"]
+authors = ["Aleksey Matskevich"]
+exclude = ["ACTIX_TO_NTEX_NOTES.md", "scripts/", "flake.nix", "flake.lock", ".zed/", ".serena/", ".venv/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 any_spawner = "0.3.0"

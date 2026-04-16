@@ -1070,6 +1070,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "leptos-ntex-unofficial"
+version = "0.1.0"
+dependencies = [
+ "any_spawner",
+ "bytes",
+ "ciborium",
+ "futures",
+ "hydration_context",
+ "leptos",
+ "leptos_integration_utils",
+ "leptos_meta",
+ "leptos_router",
+ "ntex",
+ "ntex-files",
+ "or_poisoned",
+ "send_wrapper",
+ "serde_json",
+ "server_fn",
+ "tracing",
+]
+
+[[package]]
 name = "leptos_config"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,28 +1189,6 @@ dependencies = [
  "send_wrapper",
  "wasm-bindgen",
  "web-sys",
-]
-
-[[package]]
-name = "leptos_ntex"
-version = "0.1.0"
-dependencies = [
- "any_spawner",
- "bytes",
- "ciborium",
- "futures",
- "hydration_context",
- "leptos",
- "leptos_integration_utils",
- "leptos_meta",
- "leptos_router",
- "ntex",
- "ntex-files",
- "or_poisoned",
- "send_wrapper",
- "serde_json",
- "server_fn",
- "tracing",
 ]
 
 [[package]]
