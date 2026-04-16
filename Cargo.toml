@@ -28,6 +28,7 @@ leptos_meta = { version = "0.8.6", features = ["ssr", "nonce"] }
 leptos_router = { version = "0.8.13", features = ["ssr"] }
 ntex = "3.7.2"
 ntex-files = "3.2.0"
+percent-encoding = "2.3"
 or_poisoned = "0.1.0"
 send_wrapper = { version = "0.6.0", features = ["futures"] }
 server_fn = { version = "0.8.11", features = ["ssr"] }

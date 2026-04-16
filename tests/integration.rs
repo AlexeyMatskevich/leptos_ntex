@@ -350,3 +350,78 @@ async fn real_server_roundtrips_cbor_server_fn() {
     let value: i32 = ciborium::de::from_reader(body.as_ref()).unwrap();
     assert_eq!(value, 14);
 }
+
+/// RFC 9110 §9.3.2: HEAD shares GET's status and headers but returns no
+/// body. Verified against the real h1 wire — the test harness’s
+/// `test::call_service` cannot exercise the body-elision path because it
+/// bypasses the encoder.
+#[ntex::test]
+async fn real_server_head_mirrors_get_with_empty_body() {
+    let srv = test::server(move || {
+        let routes = generate_route_list(App);
+        async move {
+            NtexApp::new().configure(move |cfg| {
+                register_leptos_routes(cfg, routes.clone(), shell);
+            })
+        }
+    })
+    .await;
+
+    let get_resp = srv
+        .request(ntex::http::Method::GET, srv.url("/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), ntex::http::StatusCode::OK);
+    let get_ct = get_resp
+        .headers()
+        .get(ntex::http::header::CONTENT_TYPE)
+        .cloned();
+
+    let head_resp = srv
+        .request(ntex::http::Method::HEAD, srv.url("/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_resp.status(), ntex::http::StatusCode::OK);
+    assert_eq!(
+        head_resp
+            .headers()
+            .get(ntex::http::header::CONTENT_TYPE)
+            .cloned(),
+        get_ct,
+        "HEAD Content-Type must match GET"
+    );
+    let body = head_resp.body().await.unwrap();
+    assert!(
+        body.is_empty(),
+        "HEAD wire body must be empty, got {} bytes",
+        body.len()
+    );
+}
+
+/// HEAD on an unregistered route must not return 200 — the old synthetic
+/// HEAD-to-200 handler hid real 404s from monitoring. Regression probe.
+#[ntex::test]
+async fn real_server_head_on_missing_route_not_200() {
+    let srv = test::server(move || {
+        let routes = generate_route_list(App);
+        async move {
+            NtexApp::new().configure(move |cfg| {
+                register_leptos_routes(cfg, routes.clone(), shell);
+            })
+        }
+    })
+    .await;
+
+    let resp = srv
+        .request(ntex::http::Method::HEAD, srv.url("/this-path-does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        ntex::http::StatusCode::OK,
+        "HEAD on a missing route must not falsely report 200"
+    );
+}

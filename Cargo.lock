@@ -1085,6 +1085,7 @@ dependencies = [
  "ntex",
  "ntex-files",
  "or_poisoned",
+ "percent-encoding",
  "send_wrapper",
  "serde_json",
  "server_fn",

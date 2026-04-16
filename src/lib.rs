@@ -3,7 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
-use futures::{Sink, Stream, StreamExt, channel::mpsc, stream::once};
+use futures::{Sink, SinkExt, Stream, StreamExt, channel::mpsc, stream::once};
 use ntex::http::{Method as HttpMethod, StatusCode};
 use hydration_context::SsrSharedContext;
 use leptos::{
@@ -51,7 +51,7 @@ use std::{
     fs,
     future::Future,
     io,
-    path::Path,
+    path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
@@ -481,7 +481,25 @@ where
         let app_fn = app_fn.clone();
         handle_response_inner(add_context, app_fn, req, stream_builder)
     };
-    Route::<Err>::new().method(ntex_method(method)).to(handler)
+    let route = Route::<Err>::new();
+    // RFC 9110 §9.3.2: HEAD == GET without body. ntex's h1 encoder
+    // unconditionally strips the body when the request method is HEAD
+    // (ntex-3.7.2/src/http/h1/encoder.rs:292-293 forces
+    // `TransferEncoding::empty()`), so binding the same handler to
+    // both methods produces the correct status and headers with no
+    // body on the wire. `Route::method()` pushes onto a Vec that
+    // `take_guards()` turns into AND-combined guards on the owning
+    // Resource (see ntex/web/route.rs:35-43), which makes it unusable
+    // for multi-method matching — use `Any(..).or(..)` instead.
+    let route = if matches!(method, Method::Get) {
+        route.guard(
+            ntex::web::guard::Any(ntex::web::guard::Get())
+                .or(ntex::web::guard::Head()),
+        )
+    } else {
+        route.method(ntex_method(method))
+    };
+    route.to(handler)
 }
 
 /// Low-level building block: runs the SSR pipeline for a single request
@@ -789,14 +807,62 @@ fn ensure_executor_initialized() {
     // after the first init. `any_spawner::Executor::init_custom_executor`
     // internally `Box::new`s the executor before attempting its own
     // `OnceLock::set`, so calling it per-request would allocate every
-    // time even though the set would silently fail. The inner
-    // `init_custom_executor` can still fail once — if something *else*
-    // installed a global executor before we got here — which is why we
-    // swallow the result with `let _ = ...`.
+    // time even though the set would silently fail.
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = any_spawner::Executor::init_custom_executor(NtexExecutor);
+        if let Err(err) = any_spawner::Executor::init_custom_executor(NtexExecutor) {
+            // Another async executor (tokio, glib, futures-executor, or
+            // a different Leptos integration) was installed first.
+            // `any_spawner` is globally one-shot, so Leptos tasks will
+            // now run on *that* executor instead of `ntex::rt`. Apps
+            // that want to fail fast should call
+            // `try_init_executor()` at startup.
+            //
+            // Always emit to stderr so the conflict is visible in the
+            // default feature configuration (no `tracing` feature), and
+            // additionally emit a structured record via `tracing` when
+            // that feature is enabled so it integrates with the app's
+            // subscriber setup.
+            let msg = format!(
+                "leptos_ntex_unofficial: another async executor is already installed \
+                 via `any_spawner` (error: {err}). Leptos async tasks will run on \
+                 that executor instead of ntex::rt. Call \
+                 `leptos_ntex_unofficial::try_init_executor()` at startup to surface \
+                 this error deterministically. See the `Request` wrapper docs for \
+                 cross-thread-drop caveats."
+            );
+            // `tracing::warn!` only lives when the feature is on;
+            // `eprintln!` runs unconditionally so the conflict is not
+            // silent in the default build.
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = ?err, "{msg}");
+            eprintln!("warning: {msg}");
+        }
     });
+}
+
+/// Attempts to install the ntex-backed executor with [`any_spawner`].
+///
+/// Most apps never need to call this — every rendering helper and
+/// server-function handler in this crate performs the install lazily the
+/// first time it runs. Call this explicitly when the app mixes multiple
+/// runtimes (e.g. tokio + ntex, or two Leptos integrations) and you want
+/// to fail fast at startup rather than discover the conflict under load.
+///
+/// Returns `Err(ExecutorError::AlreadySet)` if *another* executor won the
+/// global one-shot install race. When that happens, Leptos async tasks
+/// run on the foreign executor instead of `ntex::rt`; cross-thread drops
+/// of [`Request`] may leak or panic — see the `Request` documentation.
+///
+/// Safe to call repeatedly — the return value is deterministic — but
+/// not free: `any_spawner::Executor::init_custom_executor` allocates a
+/// boxed executor on every call before attempting its internal
+/// `OnceLock::set` (see `any_spawner` 0.3). Once this crate has
+/// auto-installed the executor, every subsequent user call allocates,
+/// fails with `AlreadySet`, and drops the allocation. Call once at
+/// startup — don't put it on a per-request path.
+pub fn try_init_executor() -> Result<(), any_spawner::ExecutorError> {
+    any_spawner::Executor::init_custom_executor(NtexExecutor)
 }
 
 /// Most general form of route list generation — lets you inject additional
@@ -1109,7 +1175,16 @@ where
             res.take()
         }
     };
-    Route::<Err>::new().method(ntex::http::Method::GET).to(handler)
+    // HEAD mirrors GET semantics (RFC 9110 §9.3.2); ntex strips the body
+    // at the h1 writer when the request is HEAD. `.method()` is
+    // unusable for multi-method routes because `take_guards` converts
+    // it into an AND-combined MethodGuard on the owning Resource.
+    Route::<Err>::new()
+        .guard(
+            ntex::web::guard::Any(ntex::web::guard::Get())
+                .or(ntex::web::guard::Head()),
+        )
+        .to(handler)
 }
 
 /// Creates a file-serving [`ntex_files::Files`] service for the
@@ -1181,6 +1256,54 @@ where
     file_and_error_handler_with_context(|| {}, shell)
 }
 
+/// Resolves a URL path to a safe absolute filesystem path under `site_root`,
+/// returning `None` if the request attempts to escape the root or reference
+/// hidden entries.
+///
+/// Rejects `..` (parent), dotfiles (`.env`), NUL bytes, Windows backslashes,
+/// and any non-`Normal` path component. Percent-decodes each URL segment
+/// before comparison, so `%2e%2e` and similar encodings cannot bypass the
+/// filter. Finally canonicalizes the resolved path and verifies that it
+/// stays under the canonical `site_root` — defense against symlink-escape
+/// and against `Path::join` replacing the root when the request contains an
+/// absolute path.
+///
+/// This is blocking I/O (`canonicalize`). Callers must run it on a blocking
+/// executor via [`ntex::rt::spawn_blocking`].
+fn safe_subpath(site_root: &Path, raw_path: &str) -> Option<PathBuf> {
+    let mut rel = PathBuf::new();
+    for segment in raw_path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        let decoded = percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .ok()?;
+        let s = decoded.as_ref();
+        if s == "." {
+            continue;
+        }
+        if s == ".." || s.starts_with('.') || s.contains('\0') {
+            return None;
+        }
+        if cfg!(windows) && s.contains('\\') {
+            return None;
+        }
+        rel.push(s);
+    }
+    // Reject anything the percent-decoded segment smuggled in (e.g. a
+    // decoded absolute path or `..` lodged inside a segment). Only
+    // `Component::Normal` is acceptable for a relative user-controlled
+    // path.
+    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let candidate = site_root.join(&rel);
+    let canon_root = site_root.canonicalize().ok()?;
+    let canon_target = candidate.canonicalize().ok()?;
+    canon_target.starts_with(&canon_root).then_some(canon_target)
+}
+
 /// Variant of [`file_and_error_handler`] that injects additional values
 /// into the reactive context before rendering the shell on a miss.
 pub fn file_and_error_handler_with_context<IV, Err>(
@@ -1198,17 +1321,16 @@ where
         let additional_context = additional_context.clone();
         let options = state.get_ref().clone();
         async move {
-            let uri_path = req.uri().path().trim_start_matches('/');
+            let site_root = PathBuf::from(&*options.site_root);
+            let uri_path = req.uri().path().to_owned();
 
-            let opened = if uri_path.is_empty() {
-                None
-            } else {
-                let candidate = Path::new(&*options.site_root).join(uri_path);
-                ntex::rt::spawn_blocking(move || ntex_files::NamedFile::open(&candidate))
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-            };
+            let opened = ntex::rt::spawn_blocking(move || {
+                let safe = safe_subpath(&site_root, &uri_path)?;
+                ntex_files::NamedFile::open(&safe).ok()
+            })
+            .await
+            .ok()
+            .flatten();
 
             if let Some(named) = opened {
                 return named.into_response(&req);
@@ -1259,7 +1381,16 @@ where
             res.take()
         }
     };
-    Route::<Err>::new().method(ntex::http::Method::GET).to(handler)
+    // HEAD mirrors GET: same handler, ntex's h1 writer strips the body.
+    // Using a union guard instead of `.method()` because `take_guards`
+    // turns `.method()` into AND-combined guards — incompatible with
+    // multi-method routes.
+    Route::<Err>::new()
+        .guard(
+            ntex::web::guard::Any(ntex::web::guard::Get())
+                .or(ntex::web::guard::Head()),
+        )
+        .to(handler)
 }
 
 /// Adds a list of [`NtexRouteListing`]s and a Leptos app to an ntex router,
@@ -1344,16 +1475,12 @@ where
             let mode = listing.mode();
             let is_static = matches!(mode, SsrMode::Static(_));
 
-            // Single HEAD handler per path, whether the route is static
-            // or not. Outside the per-method loop so a GET+POST listing
-            // gets one HEAD, not two. `handle_static_route` only accepts
-            // GET, which would leave HEAD unrouted without this.
-            self = self.route(
-                path,
-                Route::<Err>::new()
-                    .method(ntex::http::Method::HEAD)
-                    .to(|| async { HttpResponse::Ok().finish() }),
-            );
+            // HEAD is routed through the GET handlers (`handle_static_route`
+            // and `handle_response`), both of which register themselves for
+            // GET + HEAD. ntex's h1 writer then strips the body at the
+            // wire, giving RFC 9110 §9.3.2-compliant headers/status with
+            // no body. Listings that only register POST/PUT/etc. will
+            // correctly 405 on HEAD instead of returning a bogus 200.
 
             for method in listing.methods() {
                 let additional_context = additional_context.clone();
@@ -1471,14 +1598,8 @@ where
             let mode = listing.mode();
             let is_static = matches!(mode, SsrMode::Static(_));
 
-            // Single HEAD handler per path for all routes (static and
-            // non-static). See the parity comment in the `App` impl above.
-            router = router.route(
-                path,
-                Route::<Err>::new()
-                    .method(ntex::http::Method::HEAD)
-                    .to(|| async { HttpResponse::Ok().finish() }),
-            );
+            // HEAD is handled by the GET route registrations below (see
+            // the `App` impl for details).
 
             for method in listing.methods() {
                 let additional_context = additional_context.clone();
@@ -1629,8 +1750,14 @@ pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
 #[derive(Debug, Clone, Copy)]
 pub struct LeptosServerFnConfig {
     /// Maximum accepted payload body size in bytes for non-streaming
-    /// server-function requests. Requests exceeding this limit return a
-    /// `413 Payload Too Large` via the server-fn error channel.
+    /// server-function requests. Requests exceeding this limit are
+    /// rejected with `413 Payload Too Large`, whether the client
+    /// declares size up-front via `Content-Length` (rejected before
+    /// the server function runs) or streams a body whose length is
+    /// unknown to the server (`Transfer-Encoding: chunked`, any body
+    /// without `Content-Length`) and exceeds the limit mid-flight
+    /// (rejected once the excess byte is observed; the partial
+    /// payload is discarded).
     pub payload_limit: usize,
     /// Buffer size for the WebSocket mpsc channels used by streaming
     /// server functions. Larger values allow bursts at the cost of
@@ -1661,11 +1788,45 @@ fn server_fn_config(req: &HttpRequest) -> LeptosServerFnConfig {
     req.app_state::<LeptosServerFnConfig>().copied().unwrap_or_default()
 }
 
-async fn collect_payload(mut payload: Payload, limit: usize) -> Result<SfBytes, io::Error> {
+/// Request-scoped sentinel used to promote a `server_fn` oversize-payload
+/// error into a real HTTP 413 response in the outer ntex handler.
+///
+/// `server_fn` 0.8 has no dedicated `RequestTooLarge` error variant, so we
+/// cannot influence the HTTP status from inside `try_into_bytes` /
+/// `try_into_string` / `try_into_stream`. Instead those methods insert
+/// this marker via `HttpRequest::extensions_mut()` before returning the
+/// generic `Args` error; the public handler checks the extension after
+/// the server-fn pipeline completes and rewrites the response with the
+/// correct status. Private — the marker is an internal implementation
+/// detail.
+#[derive(Copy, Clone)]
+struct PayloadTooLarge;
+
+/// Returns true when the request declares `Content-Length` and it exceeds
+/// `limit`. The preflight avoids reading the body at all when the client
+/// tells us up-front that it is oversize.
+fn content_length_exceeds(req: &HttpRequest, limit: usize) -> bool {
+    req.headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|declared| declared > limit)
+}
+
+/// Collects the full request body into memory, enforcing `limit` against
+/// the cumulative chunk size. On overflow, stashes a [`PayloadTooLarge`]
+/// marker in `req.extensions_mut()` so the outer handler can translate the
+/// `server_fn` error into `413 Payload Too Large`.
+async fn collect_payload(
+    req: &HttpRequest,
+    mut payload: Payload,
+    limit: usize,
+) -> Result<SfBytes, io::Error> {
     let mut buf = SfBytesMut::new();
     while let Some(chunk) = payload.recv().await {
         let chunk = chunk.map_err(io::Error::other)?;
         if buf.len().saturating_add(chunk.len()) > limit {
+            req.extensions_mut().insert(PayloadTooLarge);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("payload exceeds limit of {limit} bytes"),
@@ -1734,8 +1895,13 @@ where
         SendWrapper::new(async move {
             let (req, payload) = self.0.take();
             let limit = server_fn_config(&req).payload_limit;
-            collect_payload(payload, limit).await.map_err(|e| {
-                server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()).into_app_error()
+            collect_payload(&req, payload, limit).await.map_err(|e| {
+                // `Args` maps semantically to "error reading arguments
+                // from the request", closer to payload-overflow than
+                // `Deserialization` (which is defined as a client-side
+                // result-parsing error). The outer ntex handler
+                // translates the extension marker into 413.
+                server_fn::error::ServerFnErrorErr::Args(e.to_string()).into_app_error()
             })
         })
     }
@@ -1744,11 +1910,15 @@ where
         SendWrapper::new(async move {
             let (req, payload) = self.0.take();
             let limit = server_fn_config(&req).payload_limit;
-            let bytes = collect_payload(payload, limit).await.map_err(|e| {
-                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()))
+            let bytes = collect_payload(&req, payload, limit).await.map_err(|e| {
+                Error::from_server_fn_error(
+                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
+                )
             })?;
             String::from_utf8(bytes.to_vec()).map_err(|e| {
-                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()))
+                Error::from_server_fn_error(
+                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
+                )
             })
         })
     }
@@ -1758,18 +1928,22 @@ where
         let limit = server_fn_config(&req).payload_limit;
         // State is `Option<..>`: `None` terminates the stream on the next
         // poll, so a single error frame (limit exceeded or payload error)
-        // is emitted and then the stream closes.
+        // is emitted and then the stream closes. On overflow we also
+        // stash the `PayloadTooLarge` marker on `req.extensions_mut()`
+        // so the outer ntex handler can translate the stream's error
+        // frame into a 413 response body.
         let stream = futures::stream::unfold(
-            Some((payload, 0usize, limit)),
+            Some((req, payload, 0usize, limit)),
             |state| async move {
-                let (mut payload, so_far, limit) = state?;
+                let (req, mut payload, so_far, limit) = state?;
                 let item = payload.recv().await?;
                 match item {
                     Ok(b) => {
                         let next = so_far.saturating_add(b.len());
                         if next > limit {
+                            req.extensions_mut().insert(PayloadTooLarge);
                             let err = Error::from_server_fn_error(
-                                server_fn::error::ServerFnErrorErr::Deserialization(format!(
+                                server_fn::error::ServerFnErrorErr::Args(format!(
                                     "payload exceeds limit of {limit} bytes"
                                 )),
                             )
@@ -1778,13 +1952,13 @@ where
                         } else {
                             Some((
                                 Ok(SfBytes::copy_from_slice(&b)),
-                                Some((payload, next, limit)),
+                                Some((req, payload, next, limit)),
                             ))
                         }
                     }
                     Err(e) => {
                         let err = Error::from_server_fn_error(
-                            server_fn::error::ServerFnErrorErr::Deserialization(e.to_string()),
+                            server_fn::error::ServerFnErrorErr::Args(e.to_string()),
                         )
                         .ser();
                         Some((Err(err), None))
@@ -1802,12 +1976,38 @@ where
     /// The incoming and outgoing mpsc channel capacities default to
     /// [`DEFAULT_WS_CHANNEL_BUFFER`] (2048 messages). Override per-app by
     /// registering a [`LeptosServerFnConfig`] with
-    /// [`App::state`](ntex::web::App::state). Backpressure semantics: if
-    /// a producer outruns the consumer, `start_send` on the sink will
-    /// fail with `TrySendError::Full` once the buffer fills. Choose a
-    /// smaller buffer to push backpressure up the stack sooner; a larger
-    /// buffer to absorb bursts at the cost of memory
+    /// [`App::state`](ntex::web::App::state).
+    ///
+    /// ## Backpressure
+    ///
+    /// Both channels are bounded (`futures::channel::mpsc`). Producers
+    /// (this bridge writing incoming WS frames into the server-fn
+    /// receiver; the server-fn writing outgoing frames into the ntex
+    /// sink) call `Sink::send().await`, which suspends the task until
+    /// the channel has capacity again. A slow consumer therefore stalls
+    /// the frame-reader task, which is exactly the backpressure behavior
+    /// expected. Smaller buffers apply backpressure sooner; larger
+    /// buffers absorb bursts at the cost of memory
     /// (`O(N_connections * buffer * msg_size)` worst case).
+    ///
+    /// ## Fragmented messages (RFC 6455 §5.4)
+    ///
+    /// Fragmented WebSocket messages — delivered by ntex as
+    /// `Frame::Continuation(Item::{FirstText, FirstBinary, Continue,
+    /// Last})` — are reassembled per-connection into a single payload
+    /// before being handed to the server-fn. Browser ws-clients and
+    /// many library clients fragment large messages automatically, so
+    /// dropping continuation frames (as an earlier revision did) would
+    /// silently lose data.
+    ///
+    /// ## Policy-violation close
+    ///
+    /// When a reassembled fragmented message exceeds
+    /// `LeptosServerFnConfig::payload_limit`, this bridge closes the
+    /// connection with [`CloseCode::Size`](ntex::ws::CloseCode::Size)
+    /// (1009, "Message Too Big" per RFC 6455 §7.4.1) and delivers an
+    /// `InputStreamError` to the server-fn receiver. The client gets
+    /// a structured reason rather than an abrupt disconnect.
     fn try_into_websocket(
         self,
     ) -> impl Future<
@@ -1820,10 +2020,20 @@ where
         Error,
         >,
     > + Send {
+        use std::{cell::RefCell, rc::Rc};
+        use ntex::ws::{CloseCode, CloseReason};
+
+        #[derive(Copy, Clone)]
+        enum FragmentKind {
+            Text,
+            Binary,
+        }
+
         SendWrapper::new(async move {
             let (request, _payload) = self.0.take();
 
             let config = server_fn_config(&request);
+            let payload_limit = config.payload_limit;
             let (response_stream_tx, response_stream_rx) =
                 mpsc::channel::<Result<SfBytes, SfBytes>>(config.ws_channel_buffer);
             let (response_sink_tx, response_sink_rx) =
@@ -1852,54 +2062,274 @@ where
                                     .send(web::ws::Message::Binary(NBytes::copy_from_slice(&incoming)))
                                     .await
                                 {
-                                    _ = outbound_errors.start_send(Err(
-                                        InputStreamError::from_server_fn_error(
+                                    // Surface the error to the
+                                    // server-fn receiver with full
+                                    // backpressure semantics; if the
+                                    // receiver is also gone there is
+                                    // nothing to do.
+                                    let _ = outbound_errors
+                                        .send(Err(InputStreamError::from_server_fn_error(
                                             server_fn::error::ServerFnErrorErr::Request(
                                                 err.to_string(),
                                             ),
                                         )
-                                        .ser(),
-                                    ));
-                                    break;
+                                        .ser()))
+                                        .await;
+                                    let _ = outbound_sink
+                                        .send(web::ws::Message::Close(Some(CloseReason {
+                                            code: CloseCode::Abnormal,
+                                            description: Some(err.to_string()),
+                                        })))
+                                        .await;
+                                    return;
                                 }
                             }
                             let _ = outbound_sink.send(web::ws::Message::Close(None)).await;
                         });
 
-                        Ok::<_, web::Error>(ntex::service::fn_service(
+                        // Per-connection reassembly buffer for
+                        // `Frame::Continuation`. `Rc<RefCell<_>>`
+                        // because `fn_factory_with_config` returns a
+                        // `!Send` future — one per connection.
+                        let fragment: Rc<RefCell<Option<(FragmentKind, SfBytesMut)>>> =
+                            Rc::new(RefCell::new(None));
+
+                        Ok::<_, web::Error>(ntex::service::fn_service({
+                            let response_stream_tx = response_stream_tx.clone();
+                            let fragment = fragment.clone();
                             move |frame: web::ws::Frame| {
-                                let mut response_stream_tx = response_stream_tx.clone();
+                                let mut tx = response_stream_tx.clone();
+                                let fragment = fragment.clone();
                                 async move {
+                                    use web::ws::{Frame, Message};
+                                    use ntex::ws::Item;
                                     match frame {
-                                        web::ws::Frame::Ping(bytes) => {
-                                            Ok::<Option<web::ws::Message>, web::Error>(Some(
-                                                web::ws::Message::Pong(bytes),
+                                        Frame::Ping(bytes) => {
+                                            Ok::<Option<Message>, web::Error>(Some(
+                                                Message::Pong(bytes),
                                             ))
                                         }
-                                        web::ws::Frame::Binary(bytes) => {
-                                            _ = response_stream_tx.start_send(Ok(
-                                                SfBytes::copy_from_slice(&bytes),
-                                            ));
-                                            Ok::<Option<web::ws::Message>, web::Error>(None)
+                                        Frame::Pong(_) => Ok(None),
+                                        Frame::Close(reason) => {
+                                            fragment.borrow_mut().take();
+                                            Ok(Some(Message::Close(reason)))
                                         }
-                                        web::ws::Frame::Text(text) => {
-                                            _ = response_stream_tx.start_send(Ok(
-                                                SfBytes::copy_from_slice(&text),
-                                            ));
-                                            Ok::<Option<web::ws::Message>, web::Error>(None)
+                                        Frame::Binary(bytes) => {
+                                            // Unfragmented binary; bypass
+                                            // the reassembly buffer and
+                                            // enforce the limit directly.
+                                            if bytes.len() > payload_limit {
+                                                let _ = tx
+                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                        server_fn::error::ServerFnErrorErr::Args(format!(
+                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
+                                                            bytes.len()
+                                                        )),
+                                                    )
+                                                    .ser()))
+                                                    .await;
+                                                return Ok(Some(close_too_big(payload_limit)));
+                                            }
+                                            // `send().await` applies
+                                            // backpressure when the
+                                            // consumer is slow. If the
+                                            // receiver is gone, the WS
+                                            // is about to close anyway.
+                                            let _ = tx
+                                                .send(Ok(SfBytes::copy_from_slice(&bytes)))
+                                                .await;
+                                            Ok(None)
                                         }
-                                        web::ws::Frame::Close(reason) => {
-                                            Ok::<Option<web::ws::Message>, web::Error>(Some(
-                                                web::ws::Message::Close(reason),
-                                            ))
+                                        Frame::Text(text) => {
+                                            if text.len() > payload_limit {
+                                                let _ = tx
+                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                        server_fn::error::ServerFnErrorErr::Args(format!(
+                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
+                                                            text.len()
+                                                        )),
+                                                    )
+                                                    .ser()))
+                                                    .await;
+                                                return Ok(Some(close_too_big(payload_limit)));
+                                            }
+                                            let _ = tx
+                                                .send(Ok(SfBytes::copy_from_slice(&text)))
+                                                .await;
+                                            Ok(None)
                                         }
-                                        web::ws::Frame::Pong(_) | web::ws::Frame::Continuation(_) => {
-                                            Ok::<Option<web::ws::Message>, web::Error>(None)
+                                        Frame::Continuation(item) => {
+                                            // What to do with a First*
+                                            // fragment after state + size
+                                            // checks. Computed inside one
+                                            // borrow window so no `RefMut`
+                                            // is held across `.await`.
+                                            enum FirstAction {
+                                                Installed,
+                                                ProtocolViolation,
+                                                Overflow(usize),
+                                            }
+                                            // For Continue: whether to
+                                            // extend the buffer, reject as
+                                            // protocol error, or reject
+                                            // on overflow.
+                                            enum ContinueAction {
+                                                Extended,
+                                                NoOpener,
+                                                Overflow(usize),
+                                            }
+                                            // For Last: take the buffer
+                                            // (if any), or reject.
+                                            enum LastAction {
+                                                Complete(SfBytesMut),
+                                                NoOpener,
+                                                Overflow(usize),
+                                            }
+                                            // Inline overflow-emit block:
+                                            // builds the `InputStreamError`
+                                            // (generic captured by the
+                                            // enclosing impl), sends it
+                                            // through the receiver with
+                                            // backpressure, then returns
+                                            // the policy-close message.
+                                            macro_rules! overflow_close {
+                                                ($total:expr) => {{
+                                                    let total = $total;
+                                                    let _ = tx
+                                                        .send(Err(InputStreamError::from_server_fn_error(
+                                                            server_fn::error::ServerFnErrorErr::Args(format!(
+                                                                "websocket payload exceeded limit of {payload_limit} bytes (observed {total})"
+                                                            )),
+                                                        )
+                                                        .ser()))
+                                                        .await;
+                                                    Ok(Some(close_too_big(payload_limit)))
+                                                }};
+                                            }
+                                            let protocol_close = |msg: &'static str| {
+                                                Ok::<Option<Message>, web::Error>(Some(
+                                                    Message::Close(Some(CloseReason {
+                                                        code: CloseCode::Protocol,
+                                                        description: Some(msg.into()),
+                                                    })),
+                                                ))
+                                            };
+
+                                            match item {
+                                                Item::FirstText(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        if guard.is_some() {
+                                                            *guard = None;
+                                                            FirstAction::ProtocolViolation
+                                                        } else if b.len() > payload_limit {
+                                                            FirstAction::Overflow(b.len())
+                                                        } else {
+                                                            let mut buf = SfBytesMut::new();
+                                                            buf.extend_from_slice(&b);
+                                                            *guard = Some((FragmentKind::Text, buf));
+                                                            FirstAction::Installed
+                                                        }
+                                                    };
+                                                    match action {
+                                                        FirstAction::Installed => Ok(None),
+                                                        FirstAction::ProtocolViolation => protocol_close(
+                                                            "new fragmented message started before previous one terminated",
+                                                        ),
+                                                        FirstAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::FirstBinary(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        if guard.is_some() {
+                                                            *guard = None;
+                                                            FirstAction::ProtocolViolation
+                                                        } else if b.len() > payload_limit {
+                                                            FirstAction::Overflow(b.len())
+                                                        } else {
+                                                            let mut buf = SfBytesMut::new();
+                                                            buf.extend_from_slice(&b);
+                                                            *guard = Some((FragmentKind::Binary, buf));
+                                                            FirstAction::Installed
+                                                        }
+                                                    };
+                                                    match action {
+                                                        FirstAction::Installed => Ok(None),
+                                                        FirstAction::ProtocolViolation => protocol_close(
+                                                            "new fragmented message started before previous one terminated",
+                                                        ),
+                                                        FirstAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::Continue(b) => {
+                                                    let action = {
+                                                        let mut guard = fragment.borrow_mut();
+                                                        match guard.as_mut() {
+                                                            None => ContinueAction::NoOpener,
+                                                            Some((_, buf)) => {
+                                                                if buf
+                                                                    .len()
+                                                                    .saturating_add(b.len())
+                                                                    > payload_limit
+                                                                {
+                                                                    let total =
+                                                                        buf.len() + b.len();
+                                                                    *guard = None;
+                                                                    ContinueAction::Overflow(total)
+                                                                } else {
+                                                                    buf.extend_from_slice(&b);
+                                                                    ContinueAction::Extended
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+                                                    match action {
+                                                        ContinueAction::Extended => Ok(None),
+                                                        ContinueAction::NoOpener => protocol_close(
+                                                            "unexpected continuation frame",
+                                                        ),
+                                                        ContinueAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                                Item::Last(b) => {
+                                                    let action = {
+                                                        let taken = fragment.borrow_mut().take();
+                                                        match taken {
+                                                            None => LastAction::NoOpener,
+                                                            Some((_, mut buf)) => {
+                                                                if buf
+                                                                    .len()
+                                                                    .saturating_add(b.len())
+                                                                    > payload_limit
+                                                                {
+                                                                    LastAction::Overflow(
+                                                                        buf.len() + b.len(),
+                                                                    )
+                                                                } else {
+                                                                    buf.extend_from_slice(&b);
+                                                                    LastAction::Complete(buf)
+                                                                }
+                                                            }
+                                                        }
+                                                    };
+                                                    match action {
+                                                        LastAction::Complete(buf) => {
+                                                            let _ = tx.send(Ok(buf.freeze())).await;
+                                                            Ok(None)
+                                                        }
+                                                        LastAction::NoOpener => protocol_close(
+                                                            "unexpected terminal continuation frame",
+                                                        ),
+                                                        LastAction::Overflow(t) => overflow_close!(t),
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                            },
-                        ))
+                            }
+                        }))
                     }
                 }),
             )
@@ -1917,6 +2347,18 @@ where
             ))
         })
     }
+}
+
+/// Builds a policy-violation `Close` message carrying `CloseCode::Size`
+/// (1009, "Message Too Big" per RFC 6455 §7.4.1) with a human-readable
+/// description. The corresponding `InputStreamError` is emitted at the
+/// call site because its generic type is only in scope inside
+/// `impl Req for NtexRequest`.
+fn close_too_big(limit: usize) -> web::ws::Message {
+    web::ws::Message::Close(Some(ntex::ws::CloseReason {
+        code: ntex::ws::CloseCode::Size,
+        description: Some(format!("message exceeds limit of {limit} bytes")),
+    }))
 }
 
 /// Wraps an ntex [`HttpResponse`] for use as a server function output.
@@ -2230,20 +2672,41 @@ where
             let middleware = middleware.clone();
             let additional_context = additional_context.clone();
             async move {
+                let limit = server_fn_config(&req).payload_limit;
+                // Preflight: reject oversize bodies declared up-front
+                // via Content-Length without reading any of the body.
+                if content_length_exceeds(&req, limit) {
+                    return oversize_response(limit);
+                }
                 let mut service = (*server_fn).clone().boxed();
                 for m in middleware.iter() {
                     service = m.layer(service);
                 }
-                dispatch_server_fn(
+                let resp = dispatch_server_fn(
                     service,
-                    req,
+                    req.clone(),
                     payload.into_inner(),
                     additional_context,
                 )
-                .await
+                .await;
+                // Promote streaming/chunked overflow (detected by
+                // `collect_payload` or the `try_into_stream` adapter
+                // through the request-scoped marker) into a real 413.
+                if req.extensions().get::<PayloadTooLarge>().is_some() {
+                    return oversize_response(limit);
+                }
+                resp
             }
         },
     )
+}
+
+/// Builds a canonical `413 Payload Too Large` response with a human-
+/// readable body that states the configured limit.
+fn oversize_response(limit: usize) -> HttpResponse {
+    HttpResponse::PayloadTooLarge()
+        .content_type("text/plain; charset=utf-8")
+        .body(format!("payload exceeds limit of {limit} bytes"))
 }
 
 /// Returns an ntex [`Route`] that dispatches requests to the registered
@@ -2302,8 +2765,22 @@ where
     Route::<Err>::new().to(move |req: HttpRequest, payload: web::types::Payload| {
         let additional_context = additional_context.clone();
         async move {
+            let limit = server_fn_config(&req).payload_limit;
+            if content_length_exceeds(&req, limit) {
+                return oversize_response(limit);
+            }
             if let Some(service) = get_server_fn_service(req.path(), req.method()) {
-                dispatch_server_fn(service, req, payload.into_inner(), additional_context).await
+                let resp = dispatch_server_fn(
+                    service,
+                    req.clone(),
+                    payload.into_inner(),
+                    additional_context,
+                )
+                .await;
+                if req.extensions().get::<PayloadTooLarge>().is_some() {
+                    return oversize_response(limit);
+                }
+                resp
             } else {
                 HttpResponse::BadRequest().body(format!(
                     "Could not find a server function at the route {}. \
@@ -2867,6 +3344,161 @@ mod tests {
         sink.send(ws::Message::Close(None)).await.unwrap();
     }
 
+    /// Fragmented binary messages (RFC 6455 §5.4) must be reassembled
+    /// before delivery to the server-fn. An earlier revision silently
+    /// dropped `Frame::Continuation`, losing any large message that a
+    /// ws-client chose to fragment.
+    #[ntex::test]
+    async fn websocket_server_fn_reassembles_fragmented_binary() {
+        use ntex::ws::Item;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        // Build the full payload and split into three chunks.
+        let full = serialize_ws_ok(&"fragmented-hello");
+        let (head, tail) = full.split_at(4);
+        let (mid, last) = tail.split_at(tail.len() / 2);
+
+        sink.send(ws::Message::Continuation(Item::FirstBinary(
+            head.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Continue(
+            mid.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(
+            last.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, "fragmented-hello");
+            }
+            other => panic!("unexpected websocket frame: {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// An oversized opening fragment (`FirstBinary`/`FirstText`) must
+    /// be rejected with `CloseCode::Size` *before* the buffer is
+    /// established. A prior bug simply pushed the bytes into the buffer
+    /// without a size check, so a client could already exceed the limit
+    /// on the first frame.
+    #[ntex::test]
+    async fn websocket_server_fn_first_fragment_over_limit_closes_with_size() {
+        use crate::LeptosServerFnConfig;
+        use ntex::ws::{CloseCode, Item};
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let oversize = [b'A'; 64];
+        sink.send(ws::Message::Continuation(Item::FirstBinary(
+            oversize.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Size);
+            }
+            other => panic!(
+                "expected Close(Size) on oversized First* frame, got {other:?}"
+            ),
+        }
+    }
+
+    // Note: the interleaved-First* protocol check in the bridge is
+    // defense-in-depth. ntex's own WS codec enforces the same
+    // invariant at the frame decoder/encoder layer
+    // (`ProtocolError::ContinuationStarted`), so a well-behaved client
+    // cannot even send such a frame sequence through `ntex::ws`. The
+    // server-side guard catches the case where a custom framer or
+    // future codec change would forward the bad sequence to us.
+
+    /// When a reassembled fragmented message exceeds `payload_limit`,
+    /// the bridge must close the connection with `CloseCode::Size`
+    /// (1009, "Message Too Big" per RFC 6455 §7.4.1) and not forward
+    /// the partial payload to the server-fn.
+    #[ntex::test]
+    async fn websocket_server_fn_oversize_fragmented_closes_with_size() {
+        use crate::LeptosServerFnConfig;
+        use ntex::ws::{CloseCode, Item};
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let blob = [b'A'; 100];
+        sink.send(ws::Message::Continuation(Item::FirstBinary(
+            blob[..40].to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Continue(
+            blob[40..80].to_vec().into(),
+        )))
+        .await
+        .unwrap();
+
+        // The next frame received must be a Close with CloseCode::Size.
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Size);
+            }
+            other => panic!(
+                "expected Close(Size), got {other:?} (limit enforcement regressed)"
+            ),
+        }
+    }
+
     #[ntex::test]
     async fn static_route_generator_writes_html() {
         let site_root = temp_site_root("static");
@@ -2929,8 +3561,16 @@ mod tests {
         assert!(html.contains("Async"));
     }
 
+    /// RFC 9110 §9.3.2: HEAD must mirror GET's status and headers.
+    ///
+    /// Note: `test::call_service` bypasses the h1 wire encoder, so we
+    /// cannot assert an empty response body here (that check lives in
+    /// the TCP-based integration tests). What we *can* verify is that
+    /// the handler ran and produced the same status and Content-Type
+    /// as GET — which is the behavioral regression the old synthetic
+    /// `HEAD → 200 OK .finish()` shortcut was hiding.
     #[ntex::test]
-    async fn head_request_returns_ok() {
+    async fn head_request_mirrors_get_status_and_content_type() {
         use crate::LeptosRoutes;
 
         let routes = generate_route_list(MixedApp);
@@ -2939,30 +3579,71 @@ mod tests {
         )
         .await;
 
-        let req = test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/out")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        let get_resp =
+            test::call_service(&app, test::TestRequest::with_uri("/out").to_request()).await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_headers = get_resp.headers().clone();
+
+        let head_resp = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(ntex::http::Method::HEAD)
+                .uri("/out")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(
+            head_resp.headers().get(header::CONTENT_TYPE),
+            get_headers.get(header::CONTENT_TYPE),
+            "HEAD must advertise the same Content-Type as GET"
+        );
     }
 
+    /// Same parity assertions via `register_leptos_routes` on a
+    /// `ServiceConfig`.
     #[ntex::test]
-    async fn head_request_via_service_config_returns_ok() {
+    async fn head_request_via_service_config_mirrors_get() {
+        let routes = generate_route_list(MixedApp);
+        let app = test::init_service(NtexApp::new().configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), mixed_shell);
+        }))
+        .await;
+
+        let head = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(ntex::http::Method::HEAD)
+                .uri("/out")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+    }
+
+    /// HEAD on an unregistered path must not return 200 — the old
+    /// synthetic HEAD handler did exactly that, hiding real 404s from
+    /// monitoring. Now HEAD on a missing route falls through to the
+    /// default 404 (or the app's configured fallback).
+    #[ntex::test]
+    async fn head_request_on_missing_route_not_200() {
+        use crate::LeptosRoutes;
+
         let routes = generate_route_list(MixedApp);
         let app = test::init_service(
-            NtexApp::new().configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), mixed_shell);
-            }),
+            NtexApp::new().leptos_routes(routes, mixed_shell),
         )
         .await;
 
-        let req = test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/out")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(ntex::http::Method::HEAD)
+                .uri("/totally-bogus-path")
+                .to_request(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 
     #[ntex::test]
@@ -3029,8 +3710,29 @@ mod tests {
         let _routes2 = crate::generate_route_list(Empty);
     }
 
+    #[test]
+    fn try_init_executor_is_idempotent_and_reports_conflicts() {
+        // First call either wins (Ok) or loses to a previous lib-test's
+        // auto-install (Err). Either way, must not panic.
+        let _first = crate::try_init_executor();
+        // A second call must always return AlreadySet: the global
+        // OnceLock is one-shot, and we rely on that property to report
+        // cross-integration conflicts to callers.
+        match crate::try_init_executor() {
+            Err(any_spawner::ExecutorError::AlreadySet) => {}
+            other => panic!(
+                "expected Err(AlreadySet) on second call, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Oversize request detected via streaming (no Content-Length
+    /// preflight, because `set_payload` doesn't set the header — the
+    /// limit trips mid-read in `collect_payload` and is promoted to 413
+    /// by the `PayloadTooLarge` extension marker.
     #[ntex::test]
-    async fn payload_limit_rejects_oversized_body() {
+    async fn payload_limit_streaming_overflow_returns_413() {
         use crate::LeptosServerFnConfig;
         register_explicit::<EchoName>();
         let app = test::init_service(
@@ -3053,7 +3755,42 @@ mod tests {
             .to_request();
 
         let resp = test::call_service(&app, req).await;
-        assert_ne!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("10"), "body should mention limit: {text:?}");
+    }
+
+    /// Oversize request declared via `Content-Length` is rejected by the
+    /// preflight, *before* any body bytes are read. The test uses a
+    /// deliberately impossible CL value and a tiny body; if the preflight
+    /// did not run, `collect_payload` would still succeed (body is small)
+    /// and we would incorrectly return 200.
+    #[ntex::test]
+    async fn payload_limit_content_length_preflight_returns_413() {
+        use crate::LeptosServerFnConfig;
+        register_explicit::<EchoName>();
+        let app = test::init_service(
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 32,
+                    ws_channel_buffer: 32,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .header("Content-Length", "999999")
+            .set_payload("name=Bob")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[ntex::test]
@@ -3175,8 +3912,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(&site_root);
     }
 
+    /// Builds a shell-only app with `file_and_error_handler` rooted at
+    /// `site_root`, suitable for traversal assertions.
+    macro_rules! traversal_app {
+        ($site_root:expr) => {{
+            use crate::file_and_error_handler;
+            let options = LeptosOptions::builder()
+                .output_name("leptos_ntex_traversal")
+                .site_root($site_root.to_string_lossy().to_string())
+                .site_pkg_dir("pkg")
+                .build();
+            test::init_service(NtexApp::new().state(options).route(
+                "/{tail:.*}",
+                file_and_error_handler(|_opts: LeptosOptions| {
+                    view! { <h1>"Shell"</h1> }
+                }),
+            ))
+            .await
+        }};
+    }
+
+    /// Verifies that relative-parent traversal does not escape `site_root`.
+    /// Writes a "secret" file *outside* the root but inside its parent, then
+    /// checks that `/../secret.txt` returns the shell rather than file
+    /// contents.
     #[ntex::test]
-    async fn head_request_on_static_route_returns_ok() {
+    async fn traversal_relative_parent_rejected() {
+        let parent = temp_site_root("traversal_parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("secret.txt"), "SECRET").unwrap();
+        let site_root = parent.join("public");
+        std::fs::create_dir_all(&site_root).unwrap();
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/../secret.txt").to_request();
+        let resp = test::call_service(&app, req).await;
+        let status = resp.status();
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "traversal must not return 200, got body = {text:?}"
+        );
+        assert!(!text.contains("SECRET"), "traversal leaked: body = {text:?}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Percent-encoded `..` (`%2e%2e`) must not bypass the traversal filter.
+    #[ntex::test]
+    async fn traversal_percent_encoded_parent_rejected() {
+        let parent = temp_site_root("traversal_pct");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("secret.txt"), "PCT_SECRET").unwrap();
+        let site_root = parent.join("public");
+        std::fs::create_dir_all(&site_root).unwrap();
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/%2e%2e/secret.txt").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("PCT_SECRET"));
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A root-style URI (leading `/etc/…`) must not pull files from the
+    /// real `/etc` — `Path::join` replacement of the root is the classic
+    /// exploit vector. Our `safe_subpath` reconstructs the path from split
+    /// segments so a bare `/etc/passwd` resolves under `<site_root>/etc/…`.
+    #[ntex::test]
+    async fn traversal_absolute_path_rejected() {
+        let site_root = temp_site_root("traversal_abs");
+        std::fs::create_dir_all(&site_root).unwrap();
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/etc/passwd").to_request();
+        let resp = test::call_service(&app, req).await;
+        let status = resp.status();
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_ne!(status, StatusCode::OK);
+        assert!(!text.contains("root:"), "leaked /etc/passwd: {text:?}");
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    /// Dotfiles (`.env`, `.htaccess`) must not be served by the fallback
+    /// handler — matches the convention established by `ntex_files::Files`.
+    #[ntex::test]
+    async fn traversal_dotfile_rejected() {
+        let site_root = temp_site_root("traversal_dot");
+        std::fs::create_dir_all(&site_root).unwrap();
+        std::fs::write(site_root.join(".env"), "API_KEY=secret").unwrap();
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/.env").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("API_KEY"));
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    /// A NUL byte in a path segment must be rejected outright — NUL is
+    /// illegal in POSIX paths and typically signals a smuggling attempt.
+    #[ntex::test]
+    async fn traversal_null_byte_rejected() {
+        let site_root = temp_site_root("traversal_nul");
+        std::fs::create_dir_all(&site_root).unwrap();
+        std::fs::write(site_root.join("ok.txt"), "ok").unwrap();
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/ok%00hidden.txt").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    /// Symlink escape: a symlink inside `site_root` pointing outside must
+    /// not leak external files. `canonicalize()` + `starts_with(canon_root)`
+    /// catches this.
+    #[cfg(unix)]
+    #[ntex::test]
+    async fn traversal_symlink_escape_rejected() {
+        let parent = temp_site_root("traversal_symlink");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("outside.txt"), "OUTSIDE").unwrap();
+        let site_root = parent.join("public");
+        std::fs::create_dir_all(&site_root).unwrap();
+        let _ = std::os::unix::fs::symlink(
+            parent.join("outside.txt"),
+            site_root.join("escape.txt"),
+        );
+
+        let app = traversal_app!(&site_root);
+        let req = test::TestRequest::with_uri("/escape.txt").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("OUTSIDE"), "symlink escape leaked: {text:?}");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// HEAD on a statically pre-rendered route must mirror GET's status
+    /// and Content-Type. (Wire-level body elision is covered by the
+    /// TCP-based integration tests.)
+    #[ntex::test]
+    async fn head_request_on_static_route_mirrors_get() {
         let site_root = temp_site_root("head_static");
         let (routes, generator) = generate_route_list_with_ssg(StaticApp);
         let options = LeptosOptions::builder()
@@ -3187,21 +4075,34 @@ mod tests {
 
         generator.generate(&options).await;
 
-        let app = test::init_service(
-            NtexApp::new()
-                .state(options.clone())
-                .configure(|cfg| {
-                    register_leptos_routes(cfg, routes.clone(), StaticApp);
-                }),
-        )
+        let app = test::init_service(NtexApp::new().state(options.clone()).configure(
+            |cfg| {
+                register_leptos_routes(cfg, routes.clone(), StaticApp);
+            },
+        ))
         .await;
 
-        let req = test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        let get_resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/").to_request(),
+        )
+        .await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_headers = get_resp.headers().clone();
+
+        let head_resp = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(ntex::http::Method::HEAD)
+                .uri("/")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(
+            head_resp.headers().get(header::CONTENT_TYPE),
+            get_headers.get(header::CONTENT_TYPE)
+        );
 
         let _ = std::fs::remove_dir_all(&site_root);
     }
