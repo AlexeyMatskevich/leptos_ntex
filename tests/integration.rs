@@ -19,6 +19,7 @@ use leptos_router::{
 };
 use ntex::web::{App as NtexApp, test};
 use server_fn::ServerFn;
+use server_fn::codec::Cbor;
 
 #[component]
 fn App() -> impl IntoView {
@@ -289,4 +290,63 @@ async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
     let body = resp.body().await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("12"));
+}
+
+// ---------------------------------------------------------------------------
+// CBOR end-to-end probe.
+//
+// Proves the adapter is codec-agnostic: `NtexRequest::try_into_bytes` and
+// `NtexServerResponse::try_from_bytes` handle arbitrary binary bodies, so any
+// `server_fn` codec that plugs into the byte pipeline works. Here we wire up
+// a `#[server(input = Cbor, output = Cbor)]` function, encode the arguments
+// with `ciborium` into `application/cbor`, POST through the ntex test server,
+// and decode the response.
+#[server(
+    name = SumCbor,
+    prefix = "/api",
+    endpoint = "sum_cbor",
+    input = Cbor,
+    output = Cbor,
+    server = leptos_ntex::leptos_ntex::NtexServerFnBackend
+)]
+pub async fn sum_cbor(a: i32, b: i32) -> Result<i32, ServerFnError> {
+    Ok(a + b)
+}
+
+#[ntex::test]
+async fn real_server_roundtrips_cbor_server_fn() {
+    register_explicit::<SumCbor>();
+
+    let srv = test::server(|| async {
+        NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+    })
+    .await;
+
+    // Encode `{a: 5, b: 9}` as a CBOR map with text keys. The `#[server]`
+    // macro synthesises a struct `SumCbor { a: i32, b: i32 }` on the server
+    // side; ciborium deserialises our map into that struct by field name.
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("a", 5i32);
+    args.insert("b", 9i32);
+    let mut buf: Vec<u8> = Vec::new();
+    ciborium::ser::into_writer(&args, &mut buf).unwrap();
+
+    let resp = srv
+        .request(ntex::http::Method::POST, srv.url(SumCbor::PATH))
+        .header("Content-Type", "application/cbor")
+        .header("Accept", "application/cbor")
+        .send_body(buf)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/cbor"),
+    );
+
+    let body = resp.body().await.unwrap();
+    let value: i32 = ciborium::de::from_reader(body.as_ref()).unwrap();
+    assert_eq!(value, 14);
 }

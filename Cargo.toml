@@ -20,7 +20,9 @@ server_fn = { version = "0.8.11", features = ["ssr"] }
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
+ciborium = "0.2.2"
 serde_json = "1.0.145"
+server_fn = { version = "0.8.11", features = ["cbor"] }
 
 [features]
 default = []
