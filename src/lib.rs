@@ -573,6 +573,26 @@ mod tests {
         assert!(text.contains("Privet"));
     }
 
+    // `ensure_executor_initialized()` is called implicitly by every
+    // public entry point. Exercising it from a plain `#[test]` (i.e.
+    // outside the ntex system) catches regressions where the executor
+    // init path starts assuming an arbiter — which would break SSG or
+    // library-mode usage where no ntex runtime is booted yet.
+    #[test]
+    fn executor_init_is_safe_without_ntex_system() {
+        // `generate_route_list` calls `ensure_executor_initialized`
+        // internally. Build a route list for an empty app — no futures
+        // actually need to be spawned, so no arbiter is required.
+        #[component]
+        fn Empty() -> impl IntoView {
+            provide_meta_context();
+            view! { <h1>"empty"</h1> }
+        }
+        let _routes = crate::leptos_ntex::generate_route_list(Empty);
+        // Second call goes through `Once::call_once`'s fast path.
+        let _routes2 = crate::leptos_ntex::generate_route_list(Empty);
+    }
+
     #[ntex::test]
     async fn payload_limit_rejects_oversized_body() {
         use crate::leptos_ntex::LeptosServerFnConfig;
