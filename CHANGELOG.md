@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-22
+
+### Breaking
+
+- **Removed `use_app_state` / `expect_app_state`.**  These functions
+  had no counterpart in `leptos_actix` or `leptos_axum` and were
+  incorrectly attributed to the axum adapter.  Use
+  `extract::<ntex::web::types::State<T>>().await?` instead, which
+  matches the pattern used by both upstream integrations.
+- Minimum supported Rust version raised from 1.85 to **1.88**
+  (required by leptos 0.8.19 and server_fn 0.8.12).
+
+### Changed
+
+- Bumped `leptos` 0.8.17 → 0.8.19, `server_fn` 0.8.11 → 0.8.12.
+- `file_and_error_handler_with_context` now reuses the internal
+  `async_stream_builder` instead of duplicating the streaming
+  pipeline.
+- `ACTIX_TO_NTEX_NOTES.md` rewritten: corrected "Borrowed from axum"
+  claims, added "Original to this crate" section documenting items
+  unique to this adapter (`extract_with_err`, `register_leptos_routes`,
+  `LeptosServerFnConfig`, `register_explicit`, `server_fn_paths`,
+  `get_server_fn_service`, `try_init_executor`, per-method routing).
+
+### Added
+
+- 8 new tests: payload boundary precision (exactly-at-limit,
+  one-over-limit), WebSocket frame-type coverage (unfragmented binary
+  oversize, text echo, text oversize, ping/pong, close echo),
+  dotfile-in-subdirectory traversal rejection.
+- CI workflow via GitHub Actions (`rust.yml`).
+
 ## [0.2.0] - 2026-04-17
 
 ### Security
@@ -86,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlexeyMatskevich/leptos_ntex/releases/tag/v0.1.0
