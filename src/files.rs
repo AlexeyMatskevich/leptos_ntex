@@ -1,16 +1,14 @@
 //! Static file serving: the `site_pkg_dir` service plus the
 //! [`file_and_error_handler`] fallback route.
 
-use futures::{StreamExt, stream::once};
 use leptos::{IntoView, config::LeptosOptions};
-use leptos_integration_utils::PinnedStream;
 use leptos_meta::ServerMetaContext;
 use ntex::http::StatusCode;
 use ntex::web::{self, ErrorRenderer, HttpRequest, Route};
 use ntex::web::error::StateExtractorError;
 use std::path::{Component, Path, PathBuf};
 
-use crate::render::provide_contexts;
+use crate::render::{async_stream_builder, provide_contexts};
 use crate::request::Request;
 use crate::response::{NtexResponse, ResponseOptions};
 use crate::routes::ensure_executor_initialized;
@@ -185,19 +183,7 @@ where
                 meta_output,
                 cx,
                 res_options,
-                |app, chunks, _supports_ooo| {
-                    Box::pin(async move {
-                        let app = if cfg!(feature = "islands-router") {
-                            app.to_html_stream_in_order_branching()
-                        } else {
-                            app.to_html_stream_in_order()
-                        };
-                        let app = app.collect::<String>().await;
-                        let chunks = chunks();
-                        Box::pin(once(async move { app }).chain(chunks))
-                            as PinnedStream<String>
-                    })
-                },
+                async_stream_builder,
                 true,
             )
             .await;

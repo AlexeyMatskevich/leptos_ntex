@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository for the full migration log.
 - Public API: `generate_route_list`, `LeptosRoutes::leptos_routes`,
   `register_leptos_routes`, `handle_server_fns`, `file_and_error_handler`,
-  `site_pkg_dir_service`, `NtexServerFnBackend`, `use_app_state`, `extract`,
+  `site_pkg_dir_service`, `NtexServerFnBackend`, `extract`,
   `redirect`, `ResponseOptions`, `LeptosServerFnConfig`.
 - Configurable payload limit, WebSocket channel buffer, and WebSocket
   subprotocol via `LeptosServerFnConfig`.

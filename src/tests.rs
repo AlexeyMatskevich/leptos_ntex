@@ -175,22 +175,6 @@ async fn probe_path() -> Result<String, ServerFnError> {
     Ok(req.path().to_string())
 }
 
-#[derive(Clone)]
-struct AppConfig {
-    greeting: String,
-}
-
-#[server(
-    name = ReadConfig,
-    prefix = "/api",
-    endpoint = "read_config",
-    server = crate::NtexServerFnBackend
-)]
-async fn read_config() -> Result<String, ServerFnError> {
-    let cfg = crate::use_app_state::<AppConfig>()
-        .ok_or_else(|| ServerFnError::new("AppConfig not registered".to_string()))?;
-    Ok(cfg.greeting)
-}
 
 #[server(
     name = MultiLocation,
@@ -733,33 +717,6 @@ mod tests {
         assert!(html.contains("Leptos over ntex"));
     }
 
-    #[ntex::test]
-    async fn use_app_state_reads_registered_ntex_state() {
-        register_explicit::<ReadConfig>();
-        let config = AppConfig {
-            greeting: "Privet".to_string(),
-        };
-        let app = test::init_service(
-            NtexApp::new()
-                .state(config)
-                .route("/api/{tail:.*}", handle_server_fns()),
-        )
-        .await;
-
-        let req = test::TestRequest::post()
-            .uri(ReadConfig::PATH)
-            .header("Accept", "application/json")
-            .set_payload("")
-            .to_request();
-
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = test::read_body(resp).await;
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("Privet"));
-    }
-
     // Invariant: `ensure_executor_initialized()` must not depend on a
     // running ntex arbiter — SSG and library-mode callers invoke public
     // entry points (like `generate_route_list`) without booting a ntex
@@ -1224,6 +1181,268 @@ mod tests {
 
         let missing = get_server_fn_service("/api/does_not_exist", &ntex::http::Method::POST);
         assert!(missing.is_none());
+    }
+
+    // -- Payload boundary tests ----------------------------------------
+
+    /// Payload exactly at the limit must be accepted (the check is `>`,
+    /// not `>=`).
+    #[ntex::test]
+    async fn payload_limit_exactly_at_limit_succeeds() {
+        use crate::LeptosServerFnConfig;
+        register_explicit::<EchoName>();
+        let limit = 32;
+        let app = test::init_service(
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: limit,
+                    ws_channel_buffer: 32,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        // "name=X" is 6 bytes overhead; pad the value so total == limit.
+        let value = "A".repeat(limit - "name=".len());
+        let body = format!("name={value}");
+        assert_eq!(body.len(), limit);
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload(body)
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Payload one byte over the limit must be rejected with 413.
+    #[ntex::test]
+    async fn payload_limit_one_over_limit_returns_413() {
+        use crate::LeptosServerFnConfig;
+        register_explicit::<EchoName>();
+        let limit = 32;
+        let app = test::init_service(
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: limit,
+                    ws_channel_buffer: 32,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns()),
+        )
+        .await;
+
+        let value = "A".repeat(limit - "name=".len() + 1);
+        let body = format!("name={value}");
+        assert_eq!(body.len(), limit + 1);
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload(body)
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // -- WebSocket frame-type coverage ----------------------------------
+
+    /// A single unfragmented Binary frame exceeding `payload_limit` must
+    /// close with `CloseCode::Size`.
+    #[ntex::test]
+    async fn websocket_unfragmented_binary_oversize_closes_with_size() {
+        use crate::LeptosServerFnConfig;
+        use ntex::ws::CloseCode;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let oversize = vec![b'X'; 64];
+        sink.send(ws::Message::Binary(oversize.into()))
+            .await
+            .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Size);
+            }
+            other => panic!(
+                "expected Close(Size) on oversized Binary frame, got {other:?}"
+            ),
+        }
+    }
+
+    /// A single unfragmented Text frame must be forwarded to the
+    /// server-fn and echoed back.
+    #[ntex::test]
+    async fn websocket_text_frame_echoed() {
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let payload = serialize_ws_ok(&"text-hello");
+        sink.send(ws::Message::Text(
+            String::from_utf8(payload).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, "text-hello");
+            }
+            other => panic!("expected Binary echo response, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// An oversized Text frame must close with `CloseCode::Size`.
+    #[ntex::test]
+    async fn websocket_text_oversize_closes_with_size() {
+        use crate::LeptosServerFnConfig;
+        use ntex::ws::CloseCode;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let oversize_text = "X".repeat(64);
+        sink.send(ws::Message::Text(oversize_text.into()))
+            .await
+            .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Size);
+            }
+            other => panic!(
+                "expected Close(Size) on oversized Text frame, got {other:?}"
+            ),
+        }
+    }
+
+    /// A Ping frame must be answered with Pong.
+    #[ntex::test]
+    async fn websocket_ping_receives_pong() {
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        sink.send(ws::Message::Ping(ntex::util::Bytes::from_static(b"ping-data")))
+            .await
+            .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Pong(data) => {
+                assert_eq!(&data[..], b"ping-data");
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// A Close frame must be echoed back.
+    #[ntex::test]
+    async fn websocket_close_is_echoed() {
+        use ntex::ws::CloseCode;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        sink.send(ws::Message::Close(Some(ws::CloseReason {
+            code: CloseCode::Normal,
+            description: Some("bye".into()),
+        })))
+        .await
+        .unwrap();
+
+        let frame = rx.recv().await.unwrap().unwrap();
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Normal);
+            }
+            other => panic!("expected Close echo, got {other:?}"),
+        }
+    }
+
+    /// A dotfile nested inside a subdirectory must be rejected.
+    #[ntex::test]
+    async fn traversal_dotfile_in_subdirectory_rejected() {
+        let site_root = temp_site_root("dotfile_subdir");
+        std::fs::create_dir_all(site_root.join("subdir")).unwrap();
+        std::fs::write(site_root.join("subdir/.env"), "SECRET=abc").unwrap();
+
+        let app = traversal_app!(&site_root);
+
+        let req = test::TestRequest::with_uri("/subdir/.env").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("SECRET"), "dotfile in subdirectory must not be served");
+
+        let _ = std::fs::remove_dir_all(&site_root);
     }
 
     #[ntex::test]

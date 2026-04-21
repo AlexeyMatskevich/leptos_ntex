@@ -88,7 +88,6 @@ cargo run --example basic
 | `file_and_error_handler` | Serves files from `site_root` and falls back to a shell on 404 |
 | `site_pkg_dir_service` | Serves `cargo-leptos`-produced JS/WASM/CSS bundle |
 | `NtexServerFnBackend` | Use as `server = leptos_ntex_unofficial::NtexServerFnBackend` on `#[server]` |
-| `use_app_state::<T>()` | Read ntex application state from inside a server function |
 | `extract`, `extract_with_err` | Extract ntex extractors (e.g. `HttpRequest`) from a server function |
 | `redirect(path)` | Issue a redirect from inside a server function |
 | `ResponseOptions` | Mutate response headers/status from inside a server function |

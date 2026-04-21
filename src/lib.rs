@@ -14,7 +14,7 @@ pub mod server_fn;
 pub mod static_routes;
 
 pub use config::{DEFAULT_PAYLOAD_LIMIT, DEFAULT_WS_CHANNEL_BUFFER, LeptosServerFnConfig};
-pub use extract::{expect_app_state, extract, extract_with_err, use_app_state};
+pub use extract::{extract, extract_with_err};
 pub use files::{file_and_error_handler, file_and_error_handler_with_context, site_pkg_dir_service};
 pub use leptos_routes::{LeptosRoutes, register_leptos_routes};
 pub use render::{

@@ -8,10 +8,10 @@ Baseline: `integrations/actix/src/lib.rs` from the `leptos` repository.
 Several additions are lifted from `integrations/axum/src/lib.rs` when
 axum solves a problem more cleanly than actix does.
 
-## Ported from actix unchanged
+## Ported from actix
 
-Public API kept 1:1 with `leptos_actix` so that porting an existing
-actix app is a mechanical crate-rename:
+Core public API mirrors `leptos_actix` so that porting an existing
+actix app is close to a crate-rename:
 
 - `ResponseParts`, `ResponseOptions`, `Request`, `redirect()`
 - `handle_server_fns()` / `handle_server_fns_with_context()`
@@ -24,6 +24,9 @@ actix app is a mechanical crate-rename:
   `&mut ServiceConfig<Err>`
 - `extract()` helper (for ntex extractors that operate on the request
   head)
+
+Not a 1:1 copy — ntex-specific additions listed below have no actix
+or axum counterpart.
 
 Crate-root attributes match too: `#![forbid(unsafe_code)]`,
 `#![deny(missing_docs)]`, doc comments on every public item.
@@ -51,21 +54,44 @@ does; all of them adapted to ntex types:
   running the SSR pipeline on a single request (returns
   `PinnedFuture<HttpResponse>`), so it can be embedded in custom
   route handlers.
-- **`use_app_state::<T>() -> Option<T>`.** Pulls a clone of ntex app
-  state from the `Request` in the reactive context. More idiomatic
-  than `extract::<types::State<T>>()` and avoids having the
-  type-parameter signature leak into user components.
-- **Per-method server-fn routing.** When registered through
-  `leptos_routes*`, every `(path, method)` gets its own `Route` with a
-  method filter so a wrong method is rejected at the router level
-  (405). The catch-all `handle_server_fns()` still returns 400 from
-  inside the dispatcher — that matches actix's historical behaviour
-  and is documented.
 - **Async filesystem I/O on the static path.** `write_static_route`
   and `handle_static_route` wrap `fs::write`, `fs::create_dir_all`,
   `Path::exists`, and `NamedFile::open` in `ntex::rt::spawn_blocking`
   so slow filesystems (NFS, FUSE, overloaded disks) don't stall the
   arbiter.
+
+## Original to this crate
+
+Public API that has no counterpart in either `leptos_actix` or
+`leptos_axum`:
+
+- **`extract_with_err<T, Err>()`.**  Like `extract()` but
+  parameterised over the ntex error renderer. Needed because ntex
+  parametrises routes on `Err: ErrorRenderer`, unlike actix/axum.
+- **`register_leptos_routes(cfg, ...)`.**  Free-function shortcut for
+  `LeptosRoutes` that avoids repeating the verbose
+  `App<M, T, Err>` bounds at every call site.
+- **`LeptosServerFnConfig`.**  Per-app tunables (`payload_limit`,
+  `ws_channel_buffer`, `ws_subprotocol`) registered via
+  `App::state`.
+- **`register_explicit::<T>()`.**  Manual server-function registration
+  for platforms where `inventory` auto-collection doesn't work
+  (wasm, edge runtimes) and for test binaries.
+- **`server_fn_paths()`.**  Iterator over registered `(path, method)`
+  pairs; used internally by `leptos_routes*` and exposed for custom
+  routing.
+- **`get_server_fn_service()`.**  Looks up the middleware-wrapped
+  service for a server function by path and method; called from
+  `handle_server_fns` and exposed for advanced compositions.
+- **`try_init_executor()`.**  Fallible executor installation that
+  returns `AlreadySet` instead of panicking, for apps that mix
+  runtimes and want to fail fast at startup.
+- **Per-method server-fn routing.** When registered through
+  `leptos_routes*`, every `(path, method)` gets its own `Route` with
+  a method filter so a wrong method is rejected at the router level
+  (405). The catch-all `handle_server_fns()` still returns 400 from
+  inside the dispatcher — that matches actix's historical behaviour
+  and is documented.
 
 ## What had to change for ntex
 
@@ -126,10 +152,7 @@ typed per value via `.state::<T>(value)` and multiple types can
 coexist. The adapter surfaces this with two idioms:
 
 - **Reading state from a server fn:**
-  - `use_app_state::<T>() -> Option<T>` — synchronous, clones out of
-    the `Request` stored in the Leptos context. Requires
-    `T: Clone + 'static`.
-  - Or: `extract::<ntex::web::types::State<T>>().await?`.
+  `extract::<ntex::web::types::State<T>>().await?`.
 - **Propagating state into SSR components:** via
   `leptos_routes_with_context`, the user supplies an
   `additional_context` closure that calls
