@@ -284,6 +284,58 @@ mod tests {
         assert_eq!(config.ws_subprotocol, Some("graphql-ws"));
     }
 
+    #[test]
+    fn singleton_response_headers_replace_existing_values() {
+        let mut response = crate::response::NtexResponse(
+            ntex::web::HttpResponse::Ok()
+                .header(header::CACHE_CONTROL, "public, max-age=60")
+                .header(header::EXPIRES, "Wed, 21 Oct 2015 07:28:00 GMT")
+                .header(header::CONTENT_DISPOSITION, "inline")
+                .finish(),
+        );
+        let mut parts = crate::ResponseParts::default();
+        parts.append_header(
+            header::CACHE_CONTROL,
+            ntex::http::header::HeaderValue::from_static("no-store"),
+        );
+        parts.append_header(
+            header::CONTENT_DISPOSITION,
+            ntex::http::header::HeaderValue::from_static("attachment"),
+        );
+        parts.append_header(
+            header::EXPIRES,
+            ntex::http::header::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+
+        response.extend_response_parts(parts);
+        let response = response.take();
+
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::CACHE_CONTROL)
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["no-store"]
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::CONTENT_DISPOSITION)
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["attachment"]
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::EXPIRES)
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["Thu, 01 Jan 1970 00:00:00 GMT"]
+        );
+    }
+
     #[ntex::test]
     async fn renders_root_route() {
         register_explicit::<EchoName>();
@@ -452,6 +504,47 @@ mod tests {
             .uri(EchoName::PATH)
             .header(header::HOST, "example.test:8080")
             .header(header::REFERER, "http://example.test:9090/form")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .set_payload("name=Alice")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("location").is_none());
+    }
+
+    #[ntex::test]
+    async fn server_fn_html_form_does_not_fallback_to_protocol_relative_referrer() {
+        register_explicit::<EchoName>();
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header(header::HOST, "example.test")
+            .header(header::REFERER, "//attacker.test/form")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .set_payload("name=Alice")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("location").is_none());
+    }
+
+    #[ntex::test]
+    async fn server_fn_html_form_does_not_fallback_to_different_scheme_referrer() {
+        register_explicit::<EchoName>();
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header(header::HOST, "example.test")
+            .header("X-Forwarded-Proto", "https")
+            .header(header::REFERER, "http://example.test/form")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Accept", "text/html")
             .set_payload("name=Alice")
@@ -1051,6 +1144,7 @@ mod tests {
         std::fs::create_dir_all(&site_root).unwrap();
         std::fs::write(site_root.join("app.js"), "console.log('plain');").unwrap();
         std::fs::write(site_root.join("app.js.br"), "br-bytes").unwrap();
+        std::fs::write(site_root.join("app.js.gz"), "gzip-bytes").unwrap();
 
         let options = LeptosOptions::builder()
             .output_name("leptos_ntex_file_handler_br")
@@ -1098,7 +1192,10 @@ mod tests {
         let resp = test::call_service(
             &app,
             test::TestRequest::with_uri("/app.js")
-                .header(ntex::http::header::ACCEPT_ENCODING, "br;q=0, *;q=1")
+                .header(
+                    ntex::http::header::ACCEPT_ENCODING,
+                    "br;q=0, gzip;q=0, *;q=1",
+                )
                 .to_request(),
         )
         .await;
@@ -1113,6 +1210,23 @@ mod tests {
             String::from_utf8(body.to_vec()).unwrap(),
             "console.log('plain');"
         );
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/app.js")
+                .header(ntex::http::header::ACCEPT_ENCODING, "gzip;q=0.1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(ntex::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let body = test::read_body(resp).await;
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "gzip-bytes");
 
         let _ = std::fs::remove_dir_all(&site_root);
     }

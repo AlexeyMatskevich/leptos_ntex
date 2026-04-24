@@ -117,6 +117,9 @@ fn should_replace_header(key: &HeaderName) -> bool {
             | &header::LOCATION
             | &header::ETAG
             | &header::LAST_MODIFIED
+            | &header::CACHE_CONTROL
+            | &header::EXPIRES
+            | &header::CONTENT_DISPOSITION
             | &header::CONTENT_RANGE
             | &header::ACCEPT_RANGES
     )

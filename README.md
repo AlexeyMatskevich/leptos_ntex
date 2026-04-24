@@ -178,6 +178,15 @@ Configured WebSocket subprotocols are only echoed when the client offered the
 same protocol in `Sec-WebSocket-Protocol`. For dynamic negotiation, use a
 custom ntex WebSocket handler and `ntex::web::ws::subprotocols`.
 
+### Proxy headers
+
+ntex's `ConnectionInfo` trusts `Forwarded`, `X-Forwarded-Host`, and
+`X-Forwarded-Proto` when resolving the request host and scheme. If the
+application runs behind a reverse proxy, configure the proxy to strip any
+client-supplied forwarding headers and set trusted values itself before the
+request reaches ntex. This matters for same-origin decisions such as the
+HTML-form server-function referrer fallback.
+
 ## Development
 
 The shortest local feedback loop is:

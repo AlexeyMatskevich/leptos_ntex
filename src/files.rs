@@ -59,10 +59,9 @@ where
                         .strip_prefix(&prefix)
                         .unwrap_or("/")
                         .to_owned();
-                    let accepts_br = accepts_encoding(&req, "br");
-                    let accepts_gzip = accepts_encoding(&req, "gzip");
+                    let encodings = accepted_encodings(&req);
                     let opened = ntex::rt::spawn_blocking(move || {
-                        open_static_file(&dir, &raw_path, accepts_br, accepts_gzip)
+                        open_static_file(&dir, &raw_path, encodings)
                     })
                     .await
                     .ok()
@@ -119,14 +118,14 @@ where
 /// Rejects `..` (parent), dotfiles (`.env`), NUL bytes, Windows backslashes,
 /// and any non-`Normal` path component. Percent-decodes each URL segment
 /// before comparison, so `%2e%2e` and similar encodings cannot bypass the
-/// filter. Finally canonicalizes the resolved path and verifies that it
-/// stays under the canonical `site_root` — defense against symlink-escape
+/// filter. Finally canonicalizes the resolved path and verifies that it stays
+/// under the already-canonical `site_root` — defense against symlink-escape
 /// and against `Path::join` replacing the root when the request contains an
 /// absolute path.
 ///
-/// This is blocking I/O (`canonicalize`). Callers must run it on a blocking
-/// executor via [`ntex::rt::spawn_blocking`].
-fn safe_subpath(site_root: &Path, raw_path: &str) -> Option<PathBuf> {
+/// This is blocking I/O (`canonicalize` for the target). Callers must run it
+/// on a blocking executor via [`ntex::rt::spawn_blocking`].
+fn safe_subpath(canon_root: &Path, raw_path: &str) -> Option<PathBuf> {
     let mut rel = PathBuf::new();
     for segment in raw_path.split('/') {
         if segment.is_empty() {
@@ -157,12 +156,9 @@ fn safe_subpath(site_root: &Path, raw_path: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let candidate = site_root.join(&rel);
-    let canon_root = site_root.canonicalize().ok()?;
+    let candidate = canon_root.join(&rel);
     let canon_target = candidate.canonicalize().ok()?;
-    canon_target
-        .starts_with(&canon_root)
-        .then_some(canon_target)
+    canon_target.starts_with(canon_root).then_some(canon_target)
 }
 
 struct OpenedStaticFile {
@@ -177,8 +173,15 @@ fn compressed_path(path: &Path, extension: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn accepts_encoding(req: &HttpRequest, encoding: &str) -> bool {
-    let mut explicit_q = None;
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptedEncodings {
+    br: bool,
+    gzip: bool,
+}
+
+fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
+    let mut br_q = None;
+    let mut gzip_q = None;
     let mut wildcard_q = None;
 
     for value in req.headers().get_all(header::ACCEPT_ENCODING) {
@@ -200,15 +203,20 @@ fn accepts_encoding(req: &HttpRequest, encoding: &str) -> bool {
                 }
             }
 
-            if token.eq_ignore_ascii_case(encoding) {
-                explicit_q = Some(q);
+            if token.eq_ignore_ascii_case("br") {
+                br_q = Some(q);
+            } else if token.eq_ignore_ascii_case("gzip") {
+                gzip_q = Some(q);
             } else if token == "*" {
                 wildcard_q = Some(q);
             }
         }
     }
 
-    explicit_q.or(wildcard_q).is_some_and(|q| q > 0.0)
+    AcceptedEncodings {
+        br: br_q.or(wildcard_q).is_some_and(|q| q > 0.0),
+        gzip: gzip_q.or(wildcard_q).is_some_and(|q| q > 0.0),
+    }
 }
 
 fn canonical_under(canon_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -219,19 +227,18 @@ fn canonical_under(canon_root: &Path, path: &Path) -> Option<PathBuf> {
 fn open_static_file(
     site_root: &Path,
     raw_path: &str,
-    accepts_br: bool,
-    accepts_gzip: bool,
+    accepted_encodings: AcceptedEncodings,
 ) -> Option<OpenedStaticFile> {
-    let safe = safe_subpath(site_root, raw_path)?;
     let canon_root = site_root.canonicalize().ok()?;
+    let safe = safe_subpath(&canon_root, raw_path)?;
     let mime = safe
         .extension()
         .and_then(|ext| ext.to_str())
         .map(ntex_files::file_extension_to_mime);
 
     for (extension, encoding, header_value, accepted) in [
-        ("br", ContentEncoding::Br, "br", accepts_br),
-        ("gz", ContentEncoding::Gzip, "gzip", accepts_gzip),
+        ("br", ContentEncoding::Br, "br", accepted_encodings.br),
+        ("gz", ContentEncoding::Gzip, "gzip", accepted_encodings.gzip),
     ] {
         if !accepted {
             continue;
@@ -297,10 +304,9 @@ where
             let site_root = PathBuf::from(&*options.site_root);
             let uri_path = req.uri().path().to_owned();
 
-            let accepts_br = accepts_encoding(&req, "br");
-            let accepts_gzip = accepts_encoding(&req, "gzip");
+            let encodings = accepted_encodings(&req);
             let opened = ntex::rt::spawn_blocking(move || {
-                open_static_file(&site_root, &uri_path, accepts_br, accepts_gzip)
+                open_static_file(&site_root, &uri_path, encodings)
             })
             .await
             .ok()
