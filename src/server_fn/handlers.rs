@@ -8,24 +8,21 @@ use leptos::{
 };
 use leptos_integration_utils::ExtendResponse;
 use ntex::http::{
-    Payload, StatusCode,
-    header,
+    Payload, StatusCode, Uri,
+    header::{self, HeaderValue},
 };
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
-use or_poisoned::OrPoisoned;
 use server_fn::{
     ServerFnTraitObj,
     middleware::{BoxedService, Layer},
 };
 use std::sync::Arc;
 
-use crate::config::{
-    PayloadTooLarge, content_length_exceeds, server_fn_config,
-};
+use crate::config::{PayloadTooLarge, content_length_exceeds, server_fn_config};
 use crate::request::Request;
 use crate::response::{NtexResponse, ResponseOptions};
 use crate::routes::ensure_executor_initialized;
-use crate::server_fn::registry::get_server_fn_service;
+use crate::server_fn::registry::{get_server_fn_service, server_fn_methods};
 use crate::server_fn::request::NtexRequest;
 use crate::server_fn::response::NtexServerResponse;
 
@@ -55,32 +52,37 @@ pub(crate) async fn dispatch_server_fn(
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.contains("text/html"))
                     .unwrap_or(false);
-                let referrer = req.headers().get(header::REFERER).cloned();
+                let raw_referrer = req.headers().get(header::REFERER).cloned();
+                let referrer = raw_referrer
+                    .as_ref()
+                    .and_then(|value| same_origin_referrer(&req, value));
 
                 let mut res = service.run(NtexRequest::from((req, payload))).await;
 
-                if accepts_html
-                    && res.0.headers().get(header::LOCATION).is_none()
-                    && let Some(referrer) = referrer
-                {
-                    *res.0.status_mut() = StatusCode::FOUND;
-                    res.0.headers_mut().insert(header::LOCATION, referrer);
-                }
+                if accepts_html {
+                    let location_is_referrer = raw_referrer.as_ref().is_some_and(|raw| {
+                        res.0
+                            .headers()
+                            .get(header::LOCATION)
+                            .is_some_and(|location| location_matches_referrer(location, raw))
+                    });
 
-                {
-                    let mut res_options = res_options.0.write().or_poisoned();
-                    let headers = res.0.headers_mut();
-                    // `HeaderMap::get` returns only the first value; use
-                    // `get_all` so multi-valued `Location` (rare but
-                    // legal via `append_header`) isn't silently dropped.
-                    let mut locations =
-                        res_options.headers.get_all(header::LOCATION).cloned();
-                    if let Some(first) = locations.next() {
-                        headers.insert(header::LOCATION, first);
-                        for v in locations {
-                            headers.append(header::LOCATION, v);
+                    if location_is_referrer {
+                        if let Some(referrer) = referrer {
+                            *res.0.status_mut() = StatusCode::FOUND;
+                            res.0.headers_mut().insert(header::LOCATION, referrer);
+                        } else {
+                            res.0.headers_mut().remove(header::LOCATION);
+                            if res.0.status().is_redirection() {
+                                *res.0.status_mut() = StatusCode::OK;
+                            }
                         }
-                        res_options.headers.remove(header::LOCATION);
+                    } else if res.0.status().is_success()
+                        && res.0.headers().get(header::LOCATION).is_none()
+                        && let Some(referrer) = referrer
+                    {
+                        *res.0.status_mut() = StatusCode::FOUND;
+                        res.0.headers_mut().insert(header::LOCATION, referrer);
                     }
                 }
 
@@ -90,6 +92,36 @@ pub(crate) async fn dispatch_server_fn(
             })
         })
         .await
+}
+
+fn location_matches_referrer(location: &HeaderValue, referrer: &HeaderValue) -> bool {
+    let Some(location) = location.to_str().ok() else {
+        return false;
+    };
+    let Some(referrer) = referrer.to_str().ok() else {
+        return false;
+    };
+    location == referrer || location.strip_suffix('?') == Some(referrer)
+}
+
+fn same_origin_referrer(req: &HttpRequest, referrer: &HeaderValue) -> Option<HeaderValue> {
+    let referrer = referrer.to_str().ok()?;
+    if referrer.starts_with('/') && !referrer.starts_with("//") {
+        return HeaderValue::from_str(referrer).ok();
+    }
+
+    let uri = referrer.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?.as_str();
+    let connection_info = req.connection_info();
+    if !scheme.eq_ignore_ascii_case(connection_info.scheme())
+        || !authority.eq_ignore_ascii_case(connection_info.host())
+    {
+        return None;
+    }
+
+    let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    HeaderValue::from_str(path_and_query).ok()
 }
 
 /// Returns an ntex [`Route`] bound to a single, pre-resolved server
@@ -115,8 +147,9 @@ where
         server_fn.middleware().into();
     let server_fn = Arc::new(server_fn);
 
-    Route::<Err>::new().method(method).to(
-        move |req: HttpRequest, payload: web::types::Payload| {
+    Route::<Err>::new()
+        .method(method)
+        .to(move |req: HttpRequest, payload: web::types::Payload| {
             let server_fn = server_fn.clone();
             let middleware = middleware.clone();
             let additional_context = additional_context.clone();
@@ -146,8 +179,7 @@ where
                 }
                 resp
             }
-        },
-    )
+        })
 }
 
 /// Builds a canonical `413 Payload Too Large` response with a human-
@@ -232,13 +264,28 @@ where
                 }
                 resp
             } else {
-                HttpResponse::BadRequest().body(format!(
-                    "Could not find a server function at the route {}. \
+                let allowed = server_fn_methods(req.path());
+                if allowed.is_empty() {
+                    HttpResponse::BadRequest().body(format!(
+                        "Could not find a server function at the route {}. \
 \n\nIt's likely that either\n1. The API prefix you specify in the `#[server]` macro doesn't match the prefix at which your server function handler is mounted, or\n2. You are on a platform that doesn't support automatic server function registration and you need to call register_explicit() on the server function type, somewhere in your `main` function.",
-                    req.path()
-                ))
+                        req.path()
+                    ))
+                } else {
+                    let allow = allowed
+                        .iter()
+                        .map(ntex::http::Method::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    HttpResponse::MethodNotAllowed()
+                        .header(header::ALLOW, allow)
+                        .body(format!(
+                            "Server function at route {} does not accept method {}.",
+                            req.path(),
+                            req.method()
+                        ))
+                }
             }
         }
     })
 }
-

@@ -2,10 +2,7 @@
 //! that enforce payload limits for non-streaming request bodies.
 
 use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
-use ntex::http::{
-    Payload,
-    header,
-};
+use ntex::http::{Payload, header};
 use ntex::web::HttpRequest;
 use std::io;
 
@@ -72,18 +69,60 @@ pub struct LeptosServerFnConfig {
     pub ws_subprotocol: Option<&'static str>,
 }
 
-impl Default for LeptosServerFnConfig {
-    fn default() -> Self {
+impl LeptosServerFnConfig {
+    /// Creates a config initialized with the crate defaults.
+    ///
+    /// This is equivalent to [`Default::default`], but is easier to use in
+    /// builder-style app wiring:
+    ///
+    /// ```no_run
+    /// use leptos_ntex_unofficial::LeptosServerFnConfig;
+    ///
+    /// let config = LeptosServerFnConfig::new()
+    ///     .with_payload_limit(8 * 1024 * 1024)
+    ///     .with_ws_channel_buffer(512)
+    ///     .with_ws_subprotocol("graphql-ws");
+    /// ```
+    pub const fn new() -> Self {
         Self {
             payload_limit: DEFAULT_PAYLOAD_LIMIT,
             ws_channel_buffer: DEFAULT_WS_CHANNEL_BUFFER,
             ws_subprotocol: None,
         }
     }
+
+    /// Sets the maximum accepted non-streaming server-function request
+    /// body size in bytes.
+    pub const fn with_payload_limit(mut self, payload_limit: usize) -> Self {
+        self.payload_limit = payload_limit;
+        self
+    }
+
+    /// Sets the bounded channel capacity used by server-function
+    /// WebSocket streams.
+    pub const fn with_ws_channel_buffer(mut self, ws_channel_buffer: usize) -> Self {
+        self.ws_channel_buffer = ws_channel_buffer;
+        self
+    }
+
+    /// Sets the WebSocket subprotocol this adapter may echo during
+    /// upgrade if the client offered the same value.
+    pub const fn with_ws_subprotocol(mut self, ws_subprotocol: &'static str) -> Self {
+        self.ws_subprotocol = Some(ws_subprotocol);
+        self
+    }
+}
+
+impl Default for LeptosServerFnConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub(crate) fn server_fn_config(req: &HttpRequest) -> LeptosServerFnConfig {
-    req.app_state::<LeptosServerFnConfig>().copied().unwrap_or_default()
+    req.app_state::<LeptosServerFnConfig>()
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Request-scoped sentinel used to promote a `server_fn` oversize-payload
@@ -120,7 +159,14 @@ pub(crate) async fn collect_payload(
     mut payload: Payload,
     limit: usize,
 ) -> Result<SfBytes, io::Error> {
-    let mut buf = SfBytesMut::new();
+    let capacity = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|declared| *declared <= limit)
+        .unwrap_or(0);
+    let mut buf = SfBytesMut::with_capacity(capacity);
     while let Some(chunk) = payload.recv().await {
         let chunk = chunk.map_err(io::Error::other)?;
         if buf.len().saturating_add(chunk.len()) > limit {

@@ -97,7 +97,11 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
     })
     .await;
 
-    let resp = srv.request(ntex::http::Method::GET, srv.url("/")).send().await.unwrap();
+    let resp = srv
+        .request(ntex::http::Method::GET, srv.url("/"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), ntex::http::StatusCode::OK);
     let body = resp.body().await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
@@ -118,25 +122,28 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
 }
 
 #[ntex::test]
-async fn catchall_handle_server_fns_returns_400_on_method_mismatch() {
+async fn catchall_handle_server_fns_returns_405_on_method_mismatch() {
     register_explicit::<SumTwo>();
 
-    let srv = test::server(|| async {
-        NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-    })
-    .await;
+    let srv =
+        test::server(|| async { NtexApp::new().route("/api/{tail:.*}", handle_server_fns()) })
+            .await;
 
     let resp = srv
         .request(ntex::http::Method::GET, srv.url(SumTwo::PATH))
         .send()
         .await
         .unwrap();
-    // `SumTwo` is POST-only. The catchall `.route("/api/{tail:.*}", ...)`
-    // accepts every method, so the request reaches the handler body, which
-    // looks up the (path, method) pair and — finding no match — returns
-    // 400. This is the catchall-mode behavior; use `leptos_routes` for
-    // router-level method filtering (see next test).
-    assert_eq!(resp.status(), ntex::http::StatusCode::BAD_REQUEST);
+    // `SumTwo` is POST-only. The catchall accepts every method, so the
+    // request reaches the handler body, which can still distinguish "known
+    // path, wrong method" from "unknown server function".
+    assert_eq!(resp.status(), ntex::http::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        resp.headers()
+            .get(ntex::http::header::ALLOW)
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
 }
 
 #[ntex::test]
@@ -145,22 +152,35 @@ async fn real_server_method_specific_routing_rejects_wrong_method() {
 
     let srv = test::server(|| {
         let routes = generate_route_list(App);
-        async move {
-            NtexApp::new().leptos_routes(routes, shell)
-        }
+        async move { NtexApp::new().leptos_routes(routes, shell) }
     })
     .await;
 
+    let ok = srv
+        .request(ntex::http::Method::POST, srv.url(SumTwo::PATH))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .send_body("a=3&b=4")
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), ntex::http::StatusCode::OK);
+
     // SumTwo is registered as POST via leptos_routes. GET on it should be
-    // rejected at the router level (405 Method Not Allowed or 404 depending
-    // on ntex's router — either way, NOT the 400 from the fall-through).
+    // rejected at the router level; ntex may surface that as either 404
+    // or 405 depending on resource matching details.
     let resp = srv
         .request(ntex::http::Method::GET, srv.url(SumTwo::PATH))
         .send()
         .await
         .unwrap();
-    assert_ne!(resp.status(), ntex::http::StatusCode::BAD_REQUEST);
-    assert_ne!(resp.status(), ntex::http::StatusCode::OK);
+    assert!(
+        matches!(
+            resp.status(),
+            ntex::http::StatusCode::NOT_FOUND | ntex::http::StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "wrong method must be rejected by router, got {}",
+        resp.status()
+    );
 }
 
 #[ntex::test]
@@ -214,6 +234,7 @@ async fn real_server_site_pkg_dir_service_registers() {
     let pkg_dir = site_root.join("pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("app.js"), "console.log('hi');").unwrap();
+    std::fs::write(pkg_dir.join("app.js.br"), "br-js").unwrap();
 
     let options = LeptosOptions::builder()
         .output_name("leptos_ntex_integration_pkg_service")
@@ -240,6 +261,23 @@ async fn real_server_site_pkg_dir_service_registers() {
     let body = resp.body().await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("console.log"));
+
+    let resp = srv
+        .request(ntex::http::Method::GET, srv.url("/pkg/app.js"))
+        .header(ntex::http::header::ACCEPT_ENCODING, "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(ntex::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("br")
+    );
+    let body = resp.body().await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(text, "br-js");
 
     let _ = std::fs::remove_dir_all(&site_root);
 }
@@ -317,10 +355,9 @@ pub async fn sum_cbor(a: i32, b: i32) -> Result<i32, ServerFnError> {
 async fn real_server_roundtrips_cbor_server_fn() {
     register_explicit::<SumCbor>();
 
-    let srv = test::server(|| async {
-        NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-    })
-    .await;
+    let srv =
+        test::server(|| async { NtexApp::new().route("/api/{tail:.*}", handle_server_fns()) })
+            .await;
 
     // Encode `{a: 5, b: 9}` as a CBOR map with text keys. The `#[server]`
     // macro synthesises a struct `SumCbor { a: i32, b: i32 }` on the server
@@ -415,7 +452,10 @@ async fn real_server_head_on_missing_route_not_200() {
     .await;
 
     let resp = srv
-        .request(ntex::http::Method::HEAD, srv.url("/this-path-does-not-exist"))
+        .request(
+            ntex::http::Method::HEAD,
+            srv.url("/this-path-does-not-exist"),
+        )
         .send()
         .await
         .unwrap();

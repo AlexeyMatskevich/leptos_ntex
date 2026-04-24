@@ -26,8 +26,7 @@ use crate::request::Request;
 
 /// A boxed stream of HTML chunks, as used for progressive streaming of SSR
 /// responses. Mirrors the equivalent type alias in `leptos_axum`.
-pub type PinnedHtmlStream =
-    std::pin::Pin<Box<dyn Stream<Item = io::Result<NBytes>> + Send>>;
+pub type PinnedHtmlStream = std::pin::Pin<Box<dyn Stream<Item = io::Result<NBytes>> + Send>>;
 
 /// Describes overrides for the HTTP response headers and status code.
 ///
@@ -92,15 +91,42 @@ impl NtexResponse {
     pub(crate) fn take(self) -> HttpResponse {
         self.0
     }
+
+    pub(crate) fn extend_response_parts(&mut self, parts: ResponseParts) {
+        let headers = self.0.headers_mut();
+        for (key, value) in parts.headers.iter() {
+            if should_replace_header(key) {
+                headers.insert(key.clone(), value.clone());
+            } else {
+                headers.append(key.clone(), value.clone());
+            }
+        }
+        if let Some(status) = parts.status {
+            *self.0.status_mut() = status;
+        }
+    }
+}
+
+fn should_replace_header(key: &HeaderName) -> bool {
+    matches!(
+        key,
+        &header::CONTENT_LENGTH
+            | &header::CONTENT_TYPE
+            | &header::CONTENT_ENCODING
+            | &header::TRANSFER_ENCODING
+            | &header::LOCATION
+            | &header::ETAG
+            | &header::LAST_MODIFIED
+            | &header::CONTENT_RANGE
+            | &header::ACCEPT_RANGES
+    )
 }
 
 impl ExtendResponse for NtexResponse {
     type ResponseOptions = ResponseOptions;
 
     fn from_stream(stream: impl Stream<Item = String> + Send + 'static) -> Self {
-        let pinned = Box::pin(stream.map(|chunk| {
-            Ok::<NBytes, io::Error>(NBytes::from(chunk))
-        }));
+        let pinned = Box::pin(stream.map(|chunk| Ok::<NBytes, io::Error>(NBytes::from(chunk))));
         NtexResponse(
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
@@ -110,13 +136,7 @@ impl ExtendResponse for NtexResponse {
 
     fn extend_response(&mut self, res_options: &Self::ResponseOptions) {
         let taken = std::mem::take(&mut *res_options.0.write().or_poisoned());
-        let headers = self.0.headers_mut();
-        for (key, value) in taken.headers.iter() {
-            headers.append(key.clone(), value.clone());
-        }
-        if let Some(status) = taken.status {
-            *self.0.status_mut() = status;
-        }
+        self.extend_response_parts(taken);
     }
 
     fn set_default_content_type(&mut self, content_type: &str) {
@@ -172,5 +192,7 @@ pub fn redirect(path: &str) {
         tracing::warn!(
             "Couldn't retrieve either Parts or ResponseOptions while trying to redirect()."
         );
+        #[cfg(not(feature = "tracing"))]
+        eprintln!("Couldn't retrieve either Parts or ResponseOptions while trying to redirect().");
     }
 }

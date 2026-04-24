@@ -20,7 +20,7 @@ Add the dependency:
 ```toml
 [dependencies]
 leptos = { version = "0.8", features = ["ssr", "nonce"] }
-leptos-ntex-unofficial = "0.1"
+leptos-ntex-unofficial = "0.4"
 ntex = "3"
 ```
 
@@ -76,6 +76,48 @@ A runnable version of the same example is in
 cargo run --example basic
 ```
 
+## Recommended ntex wiring
+
+Most applications want three ntex registrations:
+
+1. app state containing `LeptosOptions`;
+2. a static bundle service for `site_pkg_dir`;
+3. generated Leptos routes plus a final file/404 fallback.
+
+```rust,no_run
+use leptos::{config::LeptosOptions, prelude::*};
+use leptos_ntex_unofficial::{
+    file_and_error_handler, register_leptos_routes, site_pkg_dir_service,
+    LeptosServerFnConfig, NtexRouteListing,
+};
+use ntex::web::App as NtexApp;
+
+# fn app() -> impl IntoView { "" }
+# fn shell(_: LeptosOptions) -> impl IntoView { app() }
+# fn example(options: LeptosOptions, routes: Vec<NtexRouteListing>) {
+let _app = NtexApp::new()
+    .state(options.clone())
+    .state(
+        LeptosServerFnConfig::new()
+            .with_payload_limit(8 * 1024 * 1024)
+            .with_ws_channel_buffer(512),
+    )
+    .service(site_pkg_dir_service::<ntex::web::DefaultError>(&options))
+    .configure(move |cfg| {
+        register_leptos_routes(cfg, routes.clone(), app);
+    })
+    .route(
+        "/{tail:.*}",
+        file_and_error_handler::<_, ntex::web::DefaultError>(shell),
+    );
+# }
+```
+
+`site_pkg_dir_service` is intended for generated assets such as JS, WASM,
+CSS, and their precompressed `.br` / `.gz` siblings. `file_and_error_handler`
+is the catch-all fallback: it first serves a safe file hit from `site_root`,
+then renders the Leptos shell with `404 Not Found` when no file exists.
+
 ## Public API at a glance
 
 | Item | Purpose |
@@ -86,12 +128,15 @@ cargo run --example basic
 | `register_leptos_routes` | `ServiceConfig`-style alternative for composable setup |
 | `handle_server_fns` | Returns a `Route` that dispatches all registered server functions |
 | `file_and_error_handler` | Serves files from `site_root` and falls back to a shell on 404 |
-| `site_pkg_dir_service` | Serves `cargo-leptos`-produced JS/WASM/CSS bundle |
+| `site_pkg_dir_service` | Serves `cargo-leptos`-produced JS/WASM/CSS bundle, including `.br`/`.gz` siblings |
 | `NtexServerFnBackend` | Use as `server = leptos_ntex_unofficial::NtexServerFnBackend` on `#[server]` |
 | `extract`, `extract_with_err` | Extract ntex extractors (e.g. `HttpRequest`) from a server function |
 | `redirect(path)` | Issue a redirect from inside a server function |
 | `ResponseOptions` | Mutate response headers/status from inside a server function |
 | `LeptosServerFnConfig` | Configure payload limit, WebSocket buffer, WS subprotocol |
+| `try_init_executor` | Eagerly install the ntex-backed Leptos executor |
+| `register_explicit` | Manually register server functions when `inventory` is unavailable |
+| `server_fn_paths`, `get_server_fn_service` | Advanced hooks for custom server-fn routing |
 
 See the [API docs](https://docs.rs/leptos-ntex-unofficial) for the full list,
 signatures, and runnable snippets.
@@ -114,11 +159,12 @@ use leptos_ntex_unofficial::{handle_server_fns, LeptosServerFnConfig};
 use ntex::web::App as NtexApp;
 
 let _app = NtexApp::new()
-    .state(LeptosServerFnConfig {
-        payload_limit: 8 * 1024 * 1024, // 8 MiB
-        ws_channel_buffer: 512,
-        ws_subprotocol: Some("graphql-ws"),
-    })
+    .state(
+        LeptosServerFnConfig::new()
+            .with_payload_limit(8 * 1024 * 1024) // 8 MiB
+            .with_ws_channel_buffer(512)
+            .with_ws_subprotocol("graphql-ws"),
+    )
     .route("/api/{tail:.*}", handle_server_fns());
 ```
 
@@ -127,6 +173,25 @@ If you don't register a `LeptosServerFnConfig`, the defaults from
 and
 [`DEFAULT_WS_CHANNEL_BUFFER`](https://docs.rs/leptos-ntex-unofficial/latest/leptos_ntex_unofficial/constant.DEFAULT_WS_CHANNEL_BUFFER.html)
 are used.
+
+Configured WebSocket subprotocols are only echoed when the client offered the
+same protocol in `Sec-WebSocket-Protocol`. For dynamic negotiation, use a
+custom ntex WebSocket handler and `ntex::web::ws::subprotocols`.
+
+## Development
+
+The shortest local feedback loop is:
+
+```sh
+cargo fmt --all -- --check
+cargo test
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the repository workflow and
+release checklist.
 
 ## Migrating from `leptos_actix`
 
@@ -138,7 +203,7 @@ switching the crate name and the `server = ...` backend:
 | `use leptos_actix::{...}` | `use leptos_ntex_unofficial::{...}` |
 | `server = leptos_actix::ActixServerFnBackend` | `server = leptos_ntex_unofficial::NtexServerFnBackend` |
 | `actix-web` types (`HttpRequest`, `HttpResponse`) | `ntex::web::HttpRequest`, `ntex::web::HttpResponse` |
-| `actix-files::Files` | `ntex-files::Files` (already wired in `site_pkg_dir_service`) |
+| `actix-files::Files` | `ntex-files::NamedFile` behind `site_pkg_dir_service` / `file_and_error_handler` |
 
 A detailed port log is kept in
 [`ACTIX_TO_NTEX_NOTES.md`](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/ACTIX_TO_NTEX_NOTES.md)

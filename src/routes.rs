@@ -7,22 +7,48 @@
 //! `NtexExecutor` on `any_spawner`.
 
 use hydration_context::SsrSharedContext;
-use leptos::{
-    IntoView,
-    context::provide_context,
-    reactive::owner::Owner,
-};
+use leptos::{IntoView, context::provide_context, reactive::owner::Owner};
 use leptos_meta::ServerMetaContext;
 use leptos_router::{
-    ExpandOptionals, Method, PathSegment, RouteList, RouteListing, SsrMode,
-    location::RequestUrl,
+    ExpandOptionals, Method, PathSegment, RouteList, RouteListing, SsrMode, location::RequestUrl,
     static_routes::RegenerationFn,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::response::ResponseOptions;
 use crate::server_fn::NtexExecutor;
 use crate::static_routes::StaticRouteGenerator;
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ExecutorInitState {
+    Unknown,
+    NtexInstalled,
+    ForeignInstalled,
+}
+
+static EXECUTOR_INIT_STATE: Mutex<ExecutorInitState> = Mutex::new(ExecutorInitState::Unknown);
+
+fn init_ntex_executor() -> Result<(), any_spawner::ExecutorError> {
+    let mut state = EXECUTOR_INIT_STATE
+        .lock()
+        .expect("executor init state poisoned");
+    match *state {
+        ExecutorInitState::NtexInstalled => Ok(()),
+        ExecutorInitState::ForeignInstalled => Err(any_spawner::ExecutorError::AlreadySet),
+        ExecutorInitState::Unknown => {
+            match any_spawner::Executor::init_custom_executor(NtexExecutor) {
+                Ok(()) => {
+                    *state = ExecutorInitState::NtexInstalled;
+                    Ok(())
+                }
+                Err(err) => {
+                    *state = ExecutorInitState::ForeignInstalled;
+                    Err(err)
+                }
+            }
+        }
+    }
+}
 
 /// A route that this application can serve.
 ///
@@ -64,11 +90,12 @@ impl NtexPath for Vec<PathSegment> {
                 }
                 PathSegment::Unit => {}
                 PathSegment::OptionalParam(_) => {
+                    let msg = "to_ntex_path should only be called on expanded paths, \
+                         which do not have OptionalParam any longer";
                     #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        "to_ntex_path should only be called on expanded paths, \
-                         which do not have OptionalParam any longer"
-                    );
+                    tracing::error!("{msg}");
+                    #[cfg(not(feature = "tracing"))]
+                    eprintln!("{msg}");
                 }
             }
         }
@@ -88,7 +115,11 @@ impl IntoRouteListing for RouteListing {
             .into_iter()
             .map(|path| {
                 let path = path.to_ntex_path();
-                let path = if path.is_empty() { "/".to_string() } else { path };
+                let path = if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path
+                };
                 NtexRouteListing {
                     path,
                     mode: self.mode().clone(),
@@ -137,7 +168,9 @@ impl NtexRouteListing {
 /// Walks the Leptos router tree and returns a list of routes that can be
 /// registered with ntex using [`LeptosRoutes::leptos_routes`](crate::LeptosRoutes::leptos_routes)
 /// or [`register_leptos_routes`](crate::register_leptos_routes).
-pub fn generate_route_list<IV>(app_fn: impl Fn() -> IV + 'static + Send + Clone) -> Vec<NtexRouteListing>
+pub fn generate_route_list<IV>(
+    app_fn: impl Fn() -> IV + 'static + Send + Clone,
+) -> Vec<NtexRouteListing>
 where
     IV: IntoView + 'static,
 {
@@ -187,7 +220,7 @@ pub(crate) fn ensure_executor_initialized() {
     // time even though the set would silently fail.
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        if let Err(err) = any_spawner::Executor::init_custom_executor(NtexExecutor) {
+        if let Err(err) = init_ntex_executor() {
             // Another async executor (tokio, glib, futures-executor, or
             // a different Leptos integration) was installed first.
             // `any_spawner` is globally one-shot, so Leptos tasks will
@@ -232,15 +265,13 @@ pub(crate) fn ensure_executor_initialized() {
 /// of [`Request`](crate::Request) may leak or panic — see the `Request`
 /// documentation.
 ///
-/// Safe to call repeatedly — the return value is deterministic — but
-/// not free: `any_spawner::Executor::init_custom_executor` allocates a
-/// boxed executor on every call before attempting its internal
-/// `OnceLock::set` (see `any_spawner` 0.3). Once this crate has
-/// auto-installed the executor, every subsequent user call allocates,
-/// fails with `AlreadySet`, and drops the allocation. Call once at
-/// startup — don't put it on a per-request path.
+/// Safe to call repeatedly: once this crate has installed its own
+/// executor, later calls return `Ok(())` without touching
+/// `any_spawner` again. If a foreign executor was already installed, the
+/// `AlreadySet` result is cached so later lazy initialization does not
+/// emit misleading diagnostics.
 pub fn try_init_executor() -> Result<(), any_spawner::ExecutorError> {
-    any_spawner::Executor::init_custom_executor(NtexExecutor)
+    init_ntex_executor()
 }
 
 /// Most general form of route list generation — lets you inject additional
@@ -289,13 +320,16 @@ where
         routes
     };
 
-    let excluded = excluded_routes.into_iter().flatten().map(|path| NtexRouteListing {
-        path,
-        mode: Default::default(),
-        methods: Vec::new(),
-        regenerate: Vec::new(),
-        exclude: true,
-    });
+    let excluded = excluded_routes
+        .into_iter()
+        .flatten()
+        .map(|path| NtexRouteListing {
+            path,
+            mode: Default::default(),
+            methods: Vec::new(),
+            regenerate: Vec::new(),
+            exclude: true,
+        });
 
     (routes.into_iter().chain(excluded).collect(), generator)
 }

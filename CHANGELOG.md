@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-24
+
+### Breaking
+
+- `site_pkg_dir_service(options)` now returns an ntex `Scope<Err>` backed
+  by `ntex_files::NamedFile` handlers instead of returning
+  `ntex_files::Files<Err>` directly. Normal `.service(...)` usage keeps
+  working, but code that configured the returned `Files` value or named
+  its concrete type must be updated.
+- `handle_server_fns()` now returns `405 Method Not Allowed` with an
+  `Allow` header when a server-function path exists but the request uses
+  the wrong method. Unknown server-function paths still return the
+  migration-oriented 400 diagnostic.
+- `ResponseOptions` header merging now replaces singleton/framing headers
+  such as `Location`, `Content-Type`, `Content-Length`, `ETag`, and
+  `Content-Encoding`; repeatable headers such as `Set-Cookie` still
+  append.
+
+### Security
+
+- Hardened custom static path resolution against percent-encoded separator
+  tricks such as `%2F.env`, backslash smuggling, dotfiles, NUL bytes,
+  parent segments, absolute-path replacement, and symlink escape.
+- HTML form referrer fallback for server functions now only redirects to
+  relative or same-origin referrers, including when the underlying
+  `server_fn` response already populated `Location` from the raw
+  `Referer`.
+- WebSocket upgrade only echoes the configured subprotocol when the client
+  offered the same value in `Sec-WebSocket-Protocol`.
+
+### Added
+
+- Builder-style helpers on `LeptosServerFnConfig`
+  (`new`, `with_payload_limit`, `with_ws_channel_buffer`,
+  `with_ws_subprotocol`) for less error-prone ntex app wiring.
+- `CONTRIBUTING.md` with local verification commands and repository
+  development notes.
+- README sections for recommended ntex wiring, static-file/fallback
+  registration, and local development checks.
+- Static file helpers serve adjacent `.br` / `.gz` assets when
+  `Accept-Encoding` allows them, including honoring an explicit `q=0`
+  over a wildcard, while still delegating MIME, validators, ranges, and
+  conditional responses to `ntex_files::NamedFile`.
+- Regression coverage for precompressed assets, encoded separator
+  traversal, repeated static-header replay, WebSocket subprotocol
+  negotiation, server-function 405 responses, referrer fallback
+  sanitization, `Accept-Encoding` wildcard precedence, and the config
+  builder API.
+
+### Changed
+
+- CI now checks formatting, clippy with all features, all-feature tests,
+  and rustdoc warnings instead of only `cargo build` + default tests.
+- `LeptosServerFnConfig` examples now use the builder-style API.
+- `file_and_error_handler` now runs `additional_context` and provides
+  `Request` / `ResponseOptions` context on static file hits, matching the
+  fallback rendering path more closely.
+- Static-route cache hits now replay an immutable snapshot of captured
+  response status and headers instead of storing a one-shot
+  `ResponseOptions`.
+- Executor initialization is idempotent when this crate installed the ntex
+  executor itself, while preserving deterministic `AlreadySet` reporting
+  when a foreign executor was installed first.
+- `collect_payload` reserves from a valid in-limit `Content-Length`, and
+  server-function string conversion avoids an extra bytes copy when
+  possible.
+
+### Fixed
+
+- rustdoc warning cleanup so
+  `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+  succeeds.
+- Documentation around static path hardening and `site_pkg_dir_service`
+  now matches the current implementation.
+- Static routes no longer regenerate unsafe paths and no longer do a
+  blocking `exists()` check before opening the on-disk file.
+- Static route header/status snapshots are replayed reliably across
+  repeated cache hits.
+- `redirect()` and optional route path diagnostics remain visible in
+  default builds without the `tracing` feature.
+
 ## [0.3.0] - 2026-04-22
 
 ### Breaking
@@ -118,7 +199,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlexeyMatskevich/leptos_ntex/releases/tag/v0.1.0

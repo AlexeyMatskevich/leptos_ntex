@@ -39,6 +39,34 @@ fn StaticApp() -> impl IntoView {
 }
 
 #[component]
+fn StaticHeaderApp() -> impl IntoView {
+    provide_meta_context();
+
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <h1>"Not Found"</h1> }>
+                    <Route
+                        path=path!("/headers")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| {
+                            if let Some(res) = use_context::<crate::ResponseOptions>() {
+                                res.set_status(ntex::http::StatusCode::CREATED);
+                                res.insert_header(
+                                    ntex::http::header::HeaderName::from_static("x-static-cache"),
+                                    ntex::http::header::HeaderValue::from_static("preserved"),
+                                );
+                            }
+                            view! { <h1>"Static Headers"</h1> }
+                        }
+                    />
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
+#[component]
 fn MixedApp() -> impl IntoView {
     provide_meta_context();
 
@@ -175,7 +203,6 @@ async fn probe_path() -> Result<String, ServerFnError> {
     Ok(req.path().to_string())
 }
 
-
 #[server(
     name = MultiLocation,
     prefix = "/api",
@@ -205,11 +232,14 @@ mod tests {
     };
     use leptos::config::LeptosOptions;
     use ntex::http::{StatusCode, header};
-    use ntex::web::{App as NtexApp, test};
     use ntex::web::ws;
+    use ntex::web::{App as NtexApp, test};
     use server_fn::serde;
     use server_fn::{ServerFn, redirect::REDIRECT_HEADER};
-    use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn serialize_ws_ok<T: serde::Serialize>(value: &T) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(1);
@@ -224,12 +254,34 @@ mod tests {
         serde_json::from_slice(&bytes[1..]).unwrap()
     }
 
+    async fn recv_ws_frame<E: std::fmt::Debug>(
+        rx: &ntex::channel::mpsc::Receiver<Result<ws::Frame, E>>,
+    ) -> ws::Frame {
+        ntex::time::timeout(ntex::time::Millis(1_000), rx.recv())
+            .await
+            .expect("timed out waiting for websocket frame")
+            .expect("websocket receiver closed")
+            .expect("websocket frame error")
+    }
+
     fn temp_site_root(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("leptos_ntex_{name}_{nonce}"))
+    }
+
+    #[test]
+    fn server_fn_config_builder_sets_expected_values() {
+        let config = crate::LeptosServerFnConfig::new()
+            .with_payload_limit(4096)
+            .with_ws_channel_buffer(32)
+            .with_ws_subprotocol("graphql-ws");
+
+        assert_eq!(config.payload_limit, 4096);
+        assert_eq!(config.ws_channel_buffer, 32);
+        assert_eq!(config.ws_subprotocol, Some("graphql-ws"));
     }
 
     #[ntex::test]
@@ -368,15 +420,57 @@ mod tests {
     }
 
     #[ntex::test]
+    async fn server_fn_html_form_falls_back_to_same_origin_referrer() {
+        register_explicit::<EchoName>();
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header(header::HOST, "example.test:8080")
+            .header(header::REFERER, "http://example.test:8080/form")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .set_payload("name=Alice")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/form")
+        );
+    }
+
+    #[ntex::test]
+    async fn server_fn_html_form_does_not_fallback_to_different_port_referrer() {
+        register_explicit::<EchoName>();
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header(header::HOST, "example.test:8080")
+            .header(header::REFERER, "http://example.test:9090/form")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .set_payload("name=Alice")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("location").is_none());
+    }
+
+    #[ntex::test]
     async fn websocket_server_fn_echoes_messages() {
         register_explicit::<EchoName>();
         register_explicit::<RedirectToAbout>();
         register_explicit::<EchoWebsocket>();
 
-        let srv = test::server(async || {
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-        })
-        .await;
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
+                .await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -386,7 +480,7 @@ mod tests {
             .await
             .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Binary(bytes) => {
                 let echoed: String = deserialize_ws_ok(&bytes);
@@ -406,10 +500,9 @@ mod tests {
 
         register_explicit::<EchoWebsocket>();
 
-        let srv = test::server(async || {
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-        })
-        .await;
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
+                .await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -430,13 +523,11 @@ mod tests {
         )))
         .await
         .unwrap();
-        sink.send(ws::Message::Continuation(Item::Last(
-            last.to_vec().into(),
-        )))
-        .await
-        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(last.to_vec().into())))
+            .await
+            .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Binary(bytes) => {
                 let echoed: String = deserialize_ws_ok(&bytes);
@@ -482,14 +573,12 @@ mod tests {
         .await
         .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Close(Some(reason)) => {
                 assert_eq!(reason.code, CloseCode::Size);
             }
-            other => panic!(
-                "expected Close(Size) on oversized First* frame, got {other:?}"
-            ),
+            other => panic!("expected Close(Size) on oversized First* frame, got {other:?}"),
         }
     }
 
@@ -540,14 +629,12 @@ mod tests {
         .unwrap();
 
         // The next frame received must be a Close with CloseCode::Size.
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Close(Some(reason)) => {
                 assert_eq!(reason.code, CloseCode::Size);
             }
-            other => panic!(
-                "expected Close(Size), got {other:?} (limit enforcement regressed)"
-            ),
+            other => panic!("expected Close(Size), got {other:?} (limit enforcement regressed)"),
         }
     }
 
@@ -578,11 +665,9 @@ mod tests {
     #[ntex::test]
     async fn renders_in_order_ssr_route() {
         let routes = generate_route_list(MixedApp);
-        let app = test::init_service(
-            NtexApp::new().configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), mixed_shell);
-            }),
-        )
+        let app = test::init_service(NtexApp::new().configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), mixed_shell);
+        }))
         .await;
 
         let req = test::TestRequest::with_uri("/in").to_request();
@@ -597,11 +682,9 @@ mod tests {
     #[ntex::test]
     async fn renders_async_ssr_route() {
         let routes = generate_route_list(MixedApp);
-        let app = test::init_service(
-            NtexApp::new().configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), mixed_shell);
-            }),
-        )
+        let app = test::init_service(NtexApp::new().configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), mixed_shell);
+        }))
         .await;
 
         let req = test::TestRequest::with_uri("/async").to_request();
@@ -624,10 +707,7 @@ mod tests {
         use crate::LeptosRoutes;
 
         let routes = generate_route_list(MixedApp);
-        let app = test::init_service(
-            NtexApp::new().leptos_routes(routes, mixed_shell),
-        )
-        .await;
+        let app = test::init_service(NtexApp::new().leptos_routes(routes, mixed_shell)).await;
 
         let get_resp =
             test::call_service(&app, test::TestRequest::with_uri("/out").to_request()).await;
@@ -680,10 +760,7 @@ mod tests {
         use crate::LeptosRoutes;
 
         let routes = generate_route_list(MixedApp);
-        let app = test::init_service(
-            NtexApp::new().leptos_routes(routes, mixed_shell),
-        )
-        .await;
+        let app = test::init_service(NtexApp::new().leptos_routes(routes, mixed_shell)).await;
 
         let resp = test::call_service(
             &app,
@@ -734,18 +811,15 @@ mod tests {
 
     #[test]
     fn try_init_executor_is_idempotent_and_reports_conflicts() {
-        // First call either wins (Ok) or loses to a previous lib-test's
-        // auto-install (Err). Either way, must not panic.
-        let _first = crate::try_init_executor();
-        // A second call must always return AlreadySet: the global
-        // OnceLock is one-shot, and we rely on that property to report
-        // cross-integration conflicts to callers.
-        match crate::try_init_executor() {
-            Err(any_spawner::ExecutorError::AlreadySet) => {}
-            other => panic!(
-                "expected Err(AlreadySet) on second call, got {:?}",
-                other
-            ),
+        let first = crate::try_init_executor();
+        let second = crate::try_init_executor();
+        match (first, second) {
+            (Ok(()), Ok(())) => {}
+            (
+                Err(any_spawner::ExecutorError::AlreadySet),
+                Err(any_spawner::ExecutorError::AlreadySet),
+            ) => {}
+            other => panic!("executor init result should be stable, got {other:?}"),
         }
     }
 
@@ -845,12 +919,10 @@ mod tests {
     }
 
     #[ntex::test]
-    async fn multi_location_header_is_preserved_through_res_options() {
+    async fn singleton_location_header_is_replaced_through_res_options() {
         register_explicit::<MultiLocation>();
-        let app = test::init_service(
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns()),
-        )
-        .await;
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(MultiLocation::PATH)
@@ -862,21 +934,19 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let locations: Vec<String> = resp
+        let locations: Vec<_> = resp
             .headers()
             .get_all(ntex::http::header::LOCATION)
-            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .filter_map(|v| v.to_str().ok())
             .collect();
-        assert_eq!(locations, vec!["/one".to_string(), "/two".to_string()]);
+        assert_eq!(locations, vec!["/two"]);
     }
 
     #[ntex::test]
     async fn extract_helper_reads_request_path() {
         register_explicit::<ProbePath>();
-        let app = test::init_service(
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns()),
-        )
-        .await;
+        let app =
+            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(ProbePath::PATH)
@@ -906,16 +976,12 @@ mod tests {
             .site_pkg_dir("pkg")
             .build();
 
-        let app = test::init_service(
-            NtexApp::new()
-                .state(options.clone())
-                .route(
-                    "/{tail:.*}",
-                    file_and_error_handler(|_opts: LeptosOptions| {
-                        view! { <h1>"Not Found Shell"</h1> }
-                    }),
-                ),
-        )
+        let app = test::init_service(NtexApp::new().state(options.clone()).route(
+            "/{tail:.*}",
+            file_and_error_handler(|_opts: LeptosOptions| {
+                view! { <h1>"Not Found Shell"</h1> }
+            }),
+        ))
         .await;
 
         let req = test::TestRequest::with_uri("/hello.txt").to_request();
@@ -930,6 +996,123 @@ mod tests {
         let body = test::read_body(resp).await;
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Not Found Shell"));
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    #[ntex::test]
+    async fn file_and_error_handler_file_hit_applies_context_response_options() {
+        use crate::file_and_error_handler_with_context;
+
+        let site_root = temp_site_root("file_handler_context");
+        std::fs::create_dir_all(&site_root).unwrap();
+        std::fs::write(site_root.join("hello.txt"), "world!").unwrap();
+
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_file_handler_context")
+            .site_root(site_root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+
+        let app = test::init_service(NtexApp::new().state(options.clone()).route(
+            "/{tail:.*}",
+            file_and_error_handler_with_context(
+                || {
+                    let res = use_context::<crate::ResponseOptions>()
+                        .expect("ResponseOptions should be provided on file hits");
+                    res.insert_header(
+                        ntex::http::header::HeaderName::from_static("x-file-hit"),
+                        ntex::http::header::HeaderValue::from_static("yes"),
+                    );
+                },
+                |_opts: LeptosOptions| view! { <h1>"Not Found Shell"</h1> },
+            ),
+        ))
+        .await;
+
+        let resp =
+            test::call_service(&app, test::TestRequest::with_uri("/hello.txt").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-file-hit")
+                .and_then(|v| v.to_str().ok()),
+            Some("yes")
+        );
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    #[ntex::test]
+    async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
+        use crate::file_and_error_handler;
+
+        let site_root = temp_site_root("file_handler_br");
+        std::fs::create_dir_all(&site_root).unwrap();
+        std::fs::write(site_root.join("app.js"), "console.log('plain');").unwrap();
+        std::fs::write(site_root.join("app.js.br"), "br-bytes").unwrap();
+
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_file_handler_br")
+            .site_root(site_root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+
+        let app = test::init_service(NtexApp::new().state(options.clone()).route(
+            "/{tail:.*}",
+            file_and_error_handler(|_opts: LeptosOptions| {
+                view! { <h1>"Not Found Shell"</h1> }
+            }),
+        ))
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/app.js")
+                .header(ntex::http::header::ACCEPT_ENCODING, "br")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(ntex::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("br")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(ntex::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript")
+        );
+        let vary = resp
+            .headers()
+            .get(ntex::http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(vary.contains("Accept-Encoding"));
+        let body = test::read_body(resp).await;
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "br-bytes");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/app.js")
+                .header(ntex::http::header::ACCEPT_ENCODING, "br;q=0, *;q=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(ntex::http::header::CONTENT_ENCODING)
+                .is_none()
+        );
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "console.log('plain');"
+        );
 
         let _ = std::fs::remove_dir_all(&site_root);
     }
@@ -977,7 +1160,10 @@ mod tests {
             StatusCode::OK,
             "traversal must not return 200, got body = {text:?}"
         );
-        assert!(!text.contains("SECRET"), "traversal leaked: body = {text:?}");
+        assert!(
+            !text.contains("SECRET"),
+            "traversal leaked: body = {text:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -1067,10 +1253,8 @@ mod tests {
         std::fs::write(parent.join("outside.txt"), "OUTSIDE").unwrap();
         let site_root = parent.join("public");
         std::fs::create_dir_all(&site_root).unwrap();
-        let _ = std::os::unix::fs::symlink(
-            parent.join("outside.txt"),
-            site_root.join("escape.txt"),
-        );
+        let _ =
+            std::os::unix::fs::symlink(parent.join("outside.txt"), site_root.join("escape.txt"));
 
         let app = traversal_app!(&site_root);
         let req = test::TestRequest::with_uri("/escape.txt").to_request();
@@ -1097,18 +1281,13 @@ mod tests {
 
         generator.generate(&options).await;
 
-        let app = test::init_service(NtexApp::new().state(options.clone()).configure(
-            |cfg| {
-                register_leptos_routes(cfg, routes.clone(), StaticApp);
-            },
-        ))
+        let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), StaticApp);
+        }))
         .await;
 
-        let get_resp = test::call_service(
-            &app,
-            test::TestRequest::with_uri("/").to_request(),
-        )
-        .await;
+        let get_resp =
+            test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
         assert_eq!(get_resp.status(), StatusCode::OK);
         let get_headers = get_resp.headers().clone();
 
@@ -1141,13 +1320,9 @@ mod tests {
 
         generator.generate(&options).await;
 
-        let app = test::init_service(
-            NtexApp::new()
-                .state(options.clone())
-                .configure(|cfg| {
-                    register_leptos_routes(cfg, routes.clone(), StaticApp);
-                }),
-        )
+        let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), StaticApp);
+        }))
         .await;
 
         let req = test::TestRequest::with_uri("/").to_request();
@@ -1157,6 +1332,42 @@ mod tests {
         let body = test::read_body(resp).await;
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Static Home"));
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    #[ntex::test]
+    async fn static_route_cached_headers_are_replayed_more_than_once() {
+        let site_root = temp_site_root("static_headers");
+        let (routes, generator) = generate_route_list_with_ssg(StaticHeaderApp);
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_static_headers")
+            .site_root(site_root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+
+        generator.generate(&options).await;
+
+        let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
+        }))
+        .await;
+
+        for _ in 0..3 {
+            let resp =
+                test::call_service(&app, test::TestRequest::with_uri("/headers").to_request())
+                    .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            assert_eq!(
+                resp.headers()
+                    .get("x-static-cache")
+                    .and_then(|v| v.to_str().ok()),
+                Some("preserved")
+            );
+            let body = test::read_body(resp).await;
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("Static Headers"));
+        }
 
         let _ = std::fs::remove_dir_all(&site_root);
     }
@@ -1175,8 +1386,7 @@ mod tests {
         let found = get_server_fn_service(EchoName::PATH, &ntex::http::Method::POST);
         assert!(found.is_some());
 
-        let not_found =
-            get_server_fn_service(EchoName::PATH, &ntex::http::Method::GET);
+        let not_found = get_server_fn_service(EchoName::PATH, &ntex::http::Method::GET);
         assert!(not_found.is_none());
 
         let missing = get_server_fn_service("/api/does_not_exist", &ntex::http::Method::POST);
@@ -1282,14 +1492,12 @@ mod tests {
             .await
             .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Close(Some(reason)) => {
                 assert_eq!(reason.code, CloseCode::Size);
             }
-            other => panic!(
-                "expected Close(Size) on oversized Binary frame, got {other:?}"
-            ),
+            other => panic!("expected Close(Size) on oversized Binary frame, got {other:?}"),
         }
     }
 
@@ -1299,10 +1507,9 @@ mod tests {
     async fn websocket_text_frame_echoed() {
         register_explicit::<EchoWebsocket>();
 
-        let srv = test::server(async || {
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-        })
-        .await;
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
+                .await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -1315,7 +1522,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Binary(bytes) => {
                 let echoed: String = deserialize_ws_ok(&bytes);
@@ -1355,14 +1562,12 @@ mod tests {
             .await
             .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Close(Some(reason)) => {
                 assert_eq!(reason.code, CloseCode::Size);
             }
-            other => panic!(
-                "expected Close(Size) on oversized Text frame, got {other:?}"
-            ),
+            other => panic!("expected Close(Size) on oversized Text frame, got {other:?}"),
         }
     }
 
@@ -1371,20 +1576,21 @@ mod tests {
     async fn websocket_ping_receives_pong() {
         register_explicit::<EchoWebsocket>();
 
-        let srv = test::server(async || {
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-        })
-        .await;
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
+                .await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
         let rx = conn.receiver();
 
-        sink.send(ws::Message::Ping(ntex::util::Bytes::from_static(b"ping-data")))
-            .await
-            .unwrap();
+        sink.send(ws::Message::Ping(ntex::util::Bytes::from_static(
+            b"ping-data",
+        )))
+        .await
+        .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Pong(data) => {
                 assert_eq!(&data[..], b"ping-data");
@@ -1395,6 +1601,35 @@ mod tests {
         sink.send(ws::Message::Close(None)).await.unwrap();
     }
 
+    #[ntex::test]
+    async fn websocket_configured_subprotocol_is_not_echoed_unless_offered() {
+        use crate::LeptosServerFnConfig;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 1024,
+                    ws_channel_buffer: 16,
+                    ws_subprotocol: Some("graphql-ws"),
+                })
+                .route("/api/{tail:.*}", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        assert!(
+            conn.response()
+                .headers()
+                .get(ntex::http::header::SEC_WEBSOCKET_PROTOCOL)
+                .is_none(),
+            "server must not echo a subprotocol that the client did not offer"
+        );
+
+        conn.sink().send(ws::Message::Close(None)).await.unwrap();
+    }
+
     /// A Close frame must be echoed back.
     #[ntex::test]
     async fn websocket_close_is_echoed() {
@@ -1402,10 +1637,9 @@ mod tests {
 
         register_explicit::<EchoWebsocket>();
 
-        let srv = test::server(async || {
-            NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
-        })
-        .await;
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
+                .await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -1418,7 +1652,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frame = rx.recv().await.unwrap().unwrap();
+        let frame = recv_ws_frame(&rx).await;
         match frame {
             ws::Frame::Close(Some(reason)) => {
                 assert_eq!(reason.code, CloseCode::Normal);
@@ -1440,7 +1674,30 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         let body = test::read_body(resp).await;
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(!text.contains("SECRET"), "dotfile in subdirectory must not be served");
+        assert!(
+            !text.contains("SECRET"),
+            "dotfile in subdirectory must not be served"
+        );
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
+    #[ntex::test]
+    async fn traversal_encoded_slash_dotfile_rejected() {
+        let site_root = temp_site_root("dotfile_encoded_slash");
+        std::fs::create_dir_all(site_root.join("subdir")).unwrap();
+        std::fs::write(site_root.join("subdir/.env"), "SECRET=encoded").unwrap();
+
+        let app = traversal_app!(&site_root);
+
+        let req = test::TestRequest::with_uri("/subdir%2F.env").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !text.contains("SECRET=encoded"),
+            "encoded slash must not bypass dotfile filtering"
+        );
 
         let _ = std::fs::remove_dir_all(&site_root);
     }
@@ -1467,9 +1724,9 @@ mod tests {
     #[ntex::test]
     async fn handle_response_inner_renders_shell() {
         use crate::handle_response_inner;
-        use leptos_integration_utils::{BoxedFnOnce, PinnedStream};
         use futures::StreamExt;
         use futures::stream::once as stream_once;
+        use leptos_integration_utils::{BoxedFnOnce, PinnedStream};
 
         let app = test::init_service(NtexApp::new().route(
             "/hrinner",

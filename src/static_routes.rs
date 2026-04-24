@@ -1,5 +1,5 @@
-//! Static (SSG) route generation and the catch-all
-//! [`handle_static_route`] used by [`LeptosRoutes`](crate::LeptosRoutes).
+//! Static (SSG) route generation and the internal catch-all route used by
+//! [`LeptosRoutes`](crate::LeptosRoutes).
 //!
 //! Hosts [`StaticRouteGenerator`] (which writes every
 //! [`SsrMode::Static`](leptos_router::SsrMode) route to disk), the
@@ -14,28 +14,28 @@ use leptos::{
     prelude::expect_context,
     reactive::{computed::ScopedFuture, owner::Owner},
 };
-use leptos_integration_utils::{ExtendResponse, PinnedFuture, build_response, static_file_path};
+use leptos_integration_utils::{PinnedFuture, build_response};
 use leptos_meta::ServerMetaContext;
 use leptos_router::{
     RouteList,
     static_routes::{RegenerationFn, ResolvedStaticPath},
 };
 use ntex::http::StatusCode;
-use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use ntex::web::error::StateExtractorError;
+use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use or_poisoned::OrPoisoned;
 use std::{
     collections::HashMap,
     fs,
     future::Future,
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{LazyLock, RwLock},
 };
 
 use crate::render::{async_stream_builder, provide_contexts};
 use crate::request::Request;
-use crate::response::{NtexResponse, ResponseOptions};
+use crate::response::{NtexResponse, ResponseOptions, ResponseParts};
 use crate::routes::ensure_executor_initialized;
 
 /// Allows generating prerendered static HTML for every [`SsrMode::Static`](leptos_router::SsrMode)
@@ -77,7 +77,12 @@ impl StaticRouteGenerator {
             }
         };
 
-        let (owner, stream) = build_response(app_fn.clone(), additional_context, async_stream_builder, false);
+        let (owner, stream) = build_response(
+            app_fn.clone(),
+            additional_context,
+            async_stream_builder,
+            false,
+        );
         let sc = owner.shared_context().unwrap();
 
         async move {
@@ -116,20 +121,19 @@ impl StaticRouteGenerator {
                     additional_context();
                     Box::pin(ScopedFuture::new(routes.generate_static_files(
                         move |path: &ResolvedStaticPath| {
-                            Self::render_route(path.to_string(), app_fn.clone(), additional_context.clone())
+                            Self::render_route(
+                                path.to_string(),
+                                app_fn.clone(),
+                                additional_context.clone(),
+                            )
                         },
                         move |path: &ResolvedStaticPath, owner: &Owner, html: String| {
                             let options = options.clone();
                             let path = path.to_owned();
                             let response_options = owner.with(use_context);
                             async move {
-                                write_static_route(
-                                    &options,
-                                    response_options,
-                                    path.as_ref(),
-                                    html,
-                                )
-                                .await
+                                write_static_route(&options, response_options, path.as_ref(), html)
+                                    .await
                             }
                         },
                         was_404,
@@ -154,7 +158,7 @@ impl StaticRouteGenerator {
 /// both expose `/index.html`), entries collide — the last writer wins.
 /// Mirrors `leptos_actix` behaviour; in practice apps run a single
 /// `LeptosOptions` instance per process and the collision is theoretical.
-static STATIC_HEADERS: LazyLock<RwLock<HashMap<String, ResponseOptions>>> =
+static STATIC_HEADERS: LazyLock<RwLock<HashMap<String, ResponseParts>>> =
     LazyLock::new(Default::default);
 
 fn was_404(owner: &Owner) -> bool {
@@ -163,12 +167,76 @@ fn was_404(owner: &Owner) -> bool {
     status == Some(StatusCode::NOT_FOUND)
 }
 
-fn static_path(options: &LeptosOptions, path: &str) -> String {
-    if path != "/" && path.ends_with('/') {
-        static_file_path(options, &format!("{path}index"))
-    } else {
-        static_file_path(options, path)
+fn static_path(options: &LeptosOptions, path: &str) -> Option<PathBuf> {
+    let mut normalized = path.to_string();
+    if normalized != "/" && normalized.ends_with('/') {
+        normalized.push_str("index");
     }
+
+    let trimmed = normalized.trim_start_matches('/');
+    let logical = if trimmed.is_empty() { "index" } else { trimmed };
+    let mut parts = Vec::new();
+    for segment in logical.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        let decoded = percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .ok()?;
+        let segment = decoded.as_ref();
+        if segment == "."
+            || segment == ".."
+            || segment.starts_with('.')
+            || segment.contains('\0')
+            || segment.contains('/')
+            || segment.contains('\\')
+        {
+            return None;
+        }
+        parts.push(segment.to_string());
+    }
+
+    let last = parts.last_mut()?;
+    last.push_str(".html");
+
+    let mut rel = PathBuf::new();
+    for part in parts {
+        rel.push(part);
+    }
+    if !rel.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(part) if !part.to_string_lossy().starts_with('.')
+        )
+    }) {
+        return None;
+    }
+    Some(Path::new(&*options.site_root).join(rel))
+}
+
+fn validate_static_parent(root: &Path, file_path: &Path) -> Result<(), io::Error> {
+    fs::create_dir_all(root)?;
+    let canon_root = root.canonicalize()?;
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "static path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let canon_parent = parent.canonicalize()?;
+    if !canon_parent.starts_with(&canon_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "static route path escapes site_root",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_static_file(root: &Path, file_path: &Path) -> Option<PathBuf> {
+    let canon_root = root.canonicalize().ok()?;
+    let canon_target = file_path.canonicalize().ok()?;
+    canon_target
+        .starts_with(&canon_root)
+        .then_some(canon_target)
 }
 
 async fn write_static_route(
@@ -177,21 +245,27 @@ async fn write_static_route(
     path: &str,
     html: String,
 ) -> Result<(), io::Error> {
-    if let Some(options) = response_options {
-        STATIC_HEADERS.write().or_poisoned().insert(path.to_string(), options);
-    }
+    let snapshot = response_options.map(|options| options.0.read().or_poisoned().clone());
 
-    let file_path = static_path(options, path);
+    let file_path = static_path(options, path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid static route path"))?;
+    let root = PathBuf::from(&*options.site_root);
     ntex::rt::spawn_blocking(move || {
-        let path = Path::new(&file_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, html)?;
+        validate_static_parent(&root, &file_path)?;
+        fs::write(file_path, html)?;
         Ok::<(), io::Error>(())
     })
     .await
-    .map_err(io::Error::other)?
+    .map_err(io::Error::other)??;
+
+    if let Some(snapshot) = snapshot {
+        STATIC_HEADERS
+            .write()
+            .or_poisoned()
+            .insert(path.to_string(), snapshot);
+    }
+
+    Ok(())
 }
 
 pub(crate) fn handle_static_route<IV, Err>(
@@ -212,19 +286,24 @@ where
         async move {
             let options = options.get_ref().clone();
             let orig_path = req.uri().path().to_string();
-            let path = static_path(&options, &orig_path);
-            let path_buf = Path::new(&path).to_path_buf();
+            let Some(path_buf) = static_path(&options, &orig_path) else {
+                return HttpResponse::NotFound().finish();
+            };
+            let root = PathBuf::from(&*options.site_root);
 
-            // `Path::exists()` is a synchronous `stat(2)` — keep it off
-            // the arbiter so the io loop isn't blocked on a slow FS
-            // (NFS, FUSE, etc.). Mirrors the `spawn_blocking` usage in
-            // `write_static_route` and the `NamedFile::open` below.
-            let check_path = path_buf.clone();
-            let exists = ntex::rt::spawn_blocking(move || check_path.exists())
-                .await
-                .unwrap_or(false);
+            let opened = ntex::rt::spawn_blocking({
+                let root = root.clone();
+                let path_buf = path_buf.clone();
+                move || {
+                    validate_static_file(&root, &path_buf)
+                        .and_then(|path| ntex_files::NamedFile::open(path).ok())
+                }
+            })
+            .await
+            .ok()
+            .flatten();
 
-            let (response_options, html) = if !exists {
+            let (response_options, html, opened) = if opened.is_none() {
                 let path = ResolvedStaticPath::new(&orig_path);
                 let (owner, html) = path
                     .build(
@@ -240,23 +319,24 @@ where
                             let path = path.to_owned();
                             let response_options = owner.with(use_context);
                             async move {
-                                write_static_route(
-                                    &options,
-                                    response_options,
-                                    path.as_ref(),
-                                    html,
-                                )
-                                .await
+                                write_static_route(&options, response_options, path.as_ref(), html)
+                                    .await
                             }
                         },
                         was_404,
                         regenerate,
                     )
                     .await;
-                (owner.with(use_context::<ResponseOptions>), html)
+                (
+                    owner
+                        .with(use_context::<ResponseOptions>)
+                        .map(|options| options.0.read().or_poisoned().clone()),
+                    html,
+                    None,
+                )
             } else {
                 let headers = STATIC_HEADERS.read().or_poisoned().get(&orig_path).cloned();
-                (headers, None)
+                (headers, None, opened)
             };
 
             // `SsrMode::Static` routes always emit HTML, so we hardcode
@@ -270,21 +350,13 @@ where
             // `leptos_actix` / `leptos_axum` behavior.
             let mut res = NtexResponse(match html {
                 Some(html) => HttpResponse::Ok().content_type("text/html").body(html),
-                None => {
-                    let opened = ntex::rt::spawn_blocking(move || {
-                        ntex_files::NamedFile::open(&path_buf)
-                    })
-                    .await;
-                    match opened {
-                        Ok(Ok(named)) => named.into_response(&req),
-                        Ok(Err(err)) => HttpResponse::InternalServerError().body(err.to_string()),
-                        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
-                    }
-                }
+                None => opened
+                    .map(|named| named.into_response(&req))
+                    .unwrap_or_else(|| HttpResponse::InternalServerError().finish()),
             });
 
             if let Some(options) = response_options {
-                res.extend_response(&options);
+                res.extend_response_parts(options);
             }
 
             res.take()
@@ -295,9 +367,33 @@ where
     // unusable for multi-method routes because `take_guards` converts
     // it into an AND-combined MethodGuard on the owning Resource.
     Route::<Err>::new()
-        .guard(
-            ntex::web::guard::Any(ntex::web::guard::Get())
-                .or(ntex::web::guard::Head()),
-        )
+        .guard(ntex::web::guard::Any(ntex::web::guard::Get()).or(ntex::web::guard::Head()))
         .to(handler)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> LeptosOptions {
+        LeptosOptions::builder()
+            .output_name("leptos_ntex_static_path_test")
+            .site_root("/tmp/leptos_ntex_static_path_test")
+            .site_pkg_dir("pkg")
+            .build()
+    }
+
+    #[test]
+    fn static_path_rejects_parent_segments() {
+        let options = options();
+        assert!(static_path(&options, "/static/../outside").is_none());
+        assert!(static_path(&options, "/static/%2e%2e/outside").is_none());
+    }
+
+    #[test]
+    fn static_path_rejects_encoded_separators_and_dotfiles() {
+        let options = options();
+        assert!(static_path(&options, "/static/subdir%2F.env").is_none());
+        assert!(static_path(&options, "/static/.env").is_none());
+    }
 }

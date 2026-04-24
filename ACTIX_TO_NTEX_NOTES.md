@@ -42,9 +42,13 @@ does; all of them adapted to ntex types:
   Found`. Uses `ntex_files::NamedFile` for the hit path so MIME, ETag,
   and Last-Modified are automatic. Actix's SSR integration doesn't
   ship an equivalent helper.
-- **`site_pkg_dir_service(options)`.** Ready-to-use
-  `ntex_files::Files` service for `options.site_pkg_dir` under
-  `options.site_root`, analogous to axum's `ServeDir` wrapper.
+- **`site_pkg_dir_service(options)`.** Ready-to-use ntex scope for
+  `options.site_pkg_dir` under `options.site_root`, analogous to
+  axum's `ServeDir` wrapper. Both this helper and the catch-all
+  `file_and_error_handler` serve adjacent `.br` / `.gz` variants when
+  the request advertises support, while delegating MIME, ETag,
+  Last-Modified, ranges, and conditional requests to
+  `ntex_files::NamedFile`.
 - **`PinnedHtmlStream`.** Public type alias
   `Pin<Box<dyn Stream<Item = io::Result<NBytes>> + Send>>`.
 - **`generate_request_and_parts(req, payload) -> (NtexRequest,
@@ -89,9 +93,10 @@ Public API that has no counterpart in either `leptos_actix` or
 - **Per-method server-fn routing.** When registered through
   `leptos_routes*`, every `(path, method)` gets its own `Route` with
   a method filter so a wrong method is rejected at the router level
-  (405). The catch-all `handle_server_fns()` still returns 400 from
-  inside the dispatcher — that matches actix's historical behaviour
-  and is documented.
+  (ntex may surface this as 404 or 405 depending on resource matching).
+  The catch-all `handle_server_fns()` returns `405 Method Not Allowed`
+  with `Allow` when the path is known but the method is wrong; unknown
+  paths still return 400 with the migration-oriented diagnostic.
 
 ## What had to change for ntex
 
@@ -191,8 +196,9 @@ Two paths, chosen at registration time:
 Both paths share `dispatch_server_fn(...)`, which sets up the reactive
 `Owner`, provided contexts (`Request`, `ResponseOptions`), the
 referrer-based 302 fallback for HTML form submissions, and the
-`Location` header merge from `ResponseOptions` (multi-valued headers
-are preserved via `HeaderMap::get_all`).
+`Location` header merge from `ResponseOptions` (singleton response
+headers replace earlier values; `Set-Cookie` and other repeatable
+headers still append).
 
 ## Payload limits and 413
 
@@ -255,10 +261,11 @@ path through `safe_subpath`, which:
 - splits the URI on `/` and percent-decodes each segment before any
   comparison (so `%2e%2e` cannot bypass the filter);
 - rejects `..`, dotfiles (`.env`, `.htaccess`), embedded NUL bytes,
-  and — on Windows — backslashes;
+  forward slashes or backslashes that appear after percent-decoding
+  a segment;
 - requires every resulting path component to be
-  `Component::Normal`, which blocks absolute-path smuggling
-  (`/etc/passwd` becoming `Path::join`-ed into the wrong root);
+  `Component::Normal` and not hidden, which blocks absolute-path
+  smuggling and encoded separator tricks such as `%2F.env`;
 - canonicalizes both the candidate path and `site_root` and requires
   the candidate to stay under the canonical root, which defeats
   symlink-escape.
@@ -292,12 +299,6 @@ islands-router = ["leptos/islands-router"]
 - `LeptosRoutes for App<...>` carries more verbose type bounds than
   actix; the `register_leptos_routes(cfg, ...)` shortcut is the
   ergonomic escape hatch.
-- `ntex_files::FilesError` is not re-exported publicly, so the bound
-  `Err::Container: From<FilesError>` on `site_pkg_dir_service` cannot
-  be expressed explicitly — users instantiating it with a non-default
-  `Err` hit this and must either use `ntex::web::DefaultError` for
-  that subtree or construct `ntex_files::Files::new(...)` manually
-  with their own error plumbing.
 - `Request::Drop` leaks an `Rc` increment on cross-thread drops
   instead of panicking. Actix does not have an equivalent trade-off
   because `actix_web::HttpRequest` is `Send`.

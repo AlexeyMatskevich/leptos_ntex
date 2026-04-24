@@ -3,10 +3,7 @@
 
 use ntex::http::Method as HttpMethod;
 use or_poisoned::OrPoisoned;
-use server_fn::{
-    Protocol, ServerFn, ServerFnTraitObj,
-    middleware::BoxedService,
-};
+use server_fn::{Protocol, ServerFn, ServerFnTraitObj, middleware::BoxedService};
 use std::{
     collections::HashMap,
     sync::{LazyLock, RwLock},
@@ -38,8 +35,8 @@ pub(crate) static REGISTERED_SERVER_FUNCTIONS: LazyServerFnMap<NtexRequest, Ntex
 /// Explicitly registers a server function with this integration.
 ///
 /// On native targets you normally do not need to call this — the
-/// `#[server]` macro emits an `inventory::submit!` entry that
-/// [`initialize_server_fn_map!`] picks up at startup, so every
+/// `#[server]` macro emits an `inventory::submit!` entry that this
+/// crate picks up at startup, so every
 /// `#[server(server = NtexServerFnBackend)]` function registers itself
 /// automatically. Call this function only on platforms where `inventory`
 /// does not work (wasm/edge runtimes like Cloudflare Workers or Deno
@@ -75,9 +72,7 @@ pub fn server_fn_paths() -> impl Iterator<Item = (&'static str, HttpMethod)> {
         .read()
         .or_poisoned()
         .iter()
-        .flat_map(|(path, entries)| {
-            entries.iter().map(move |(m, _)| (*path, m.clone()))
-        })
+        .flat_map(|(path, entries)| entries.iter().map(move |(m, _)| (*path, m.clone())))
         .collect();
     paths.into_iter()
 }
@@ -92,6 +87,18 @@ pub(crate) fn lookup_server_fn(
         .iter()
         .find(|(m, _)| m == method)
         .map(|(_, f)| f.clone())
+}
+
+pub(crate) fn server_fn_methods(path: &str) -> Vec<HttpMethod> {
+    let mut methods = Vec::new();
+    if let Some(entries) = REGISTERED_SERVER_FUNCTIONS.read().or_poisoned().get(path) {
+        for (method, _) in entries {
+            if !methods.contains(method) {
+                methods.push(method.clone());
+            }
+        }
+    }
+    methods
 }
 
 /// Looks up the service for the server function registered at the given

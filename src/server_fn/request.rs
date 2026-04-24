@@ -95,14 +95,10 @@ where
             let (req, payload) = self.0.take();
             let limit = server_fn_config(&req).payload_limit;
             let bytes = collect_payload(&req, payload, limit).await.map_err(|e| {
-                Error::from_server_fn_error(
-                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
-                )
+                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Args(e.to_string()))
             })?;
-            String::from_utf8(bytes.to_vec()).map_err(|e| {
-                Error::from_server_fn_error(
-                    server_fn::error::ServerFnErrorErr::Args(e.to_string()),
-                )
+            String::from_utf8(Vec::from(bytes)).map_err(|e| {
+                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Args(e.to_string()))
             })
         })
     }
@@ -116,9 +112,8 @@ where
         // stash the `PayloadTooLarge` marker on `req.extensions_mut()`
         // so the outer ntex handler can translate the stream's error
         // frame into a 413 response body.
-        let stream = futures::stream::unfold(
-            Some((req, payload, 0usize, limit)),
-            |state| async move {
+        let stream =
+            futures::stream::unfold(Some((req, payload, 0usize, limit)), |state| async move {
                 let (req, mut payload, so_far, limit) = state?;
                 let item = payload.recv().await?;
                 match item {
@@ -148,8 +143,7 @@ where
                         Some((Err(err), None))
                     }
                 }
-            },
-        );
+            });
         Ok(SendWrapper::new(stream))
     }
 
@@ -197,16 +191,16 @@ where
         self,
     ) -> impl Future<
         Output = Result<
-        (
-            impl Stream<Item = Result<SfBytes, SfBytes>> + Send + 'static,
-            impl Sink<SfBytes> + Send + 'static,
-            Self::WebsocketResponse,
-        ),
-        Error,
+            (
+                impl Stream<Item = Result<SfBytes, SfBytes>> + Send + 'static,
+                impl Sink<SfBytes> + Send + 'static,
+                Self::WebsocketResponse,
+            ),
+            Error,
         >,
     > + Send {
-        use std::{cell::RefCell, rc::Rc};
         use ntex::ws::{CloseCode, CloseReason};
+        use std::{cell::RefCell, rc::Rc};
 
         #[derive(Copy, Clone)]
         enum FragmentKind {
@@ -219,6 +213,9 @@ where
 
             let config = server_fn_config(&request);
             let payload_limit = config.payload_limit;
+            let ws_subprotocol = config.ws_subprotocol.filter(|protocol| {
+                web::ws::subprotocols(&request).any(|offered| offered == *protocol)
+            });
             let (response_stream_tx, response_stream_rx) =
                 mpsc::channel::<Result<SfBytes, SfBytes>>(config.ws_channel_buffer);
             let (response_sink_tx, response_sink_rx) =
@@ -227,7 +224,7 @@ where
 
             let response = web::ws::start::<_, _, &str, web::Error>(
                 request,
-                config.ws_subprotocol,
+                ws_subprotocol,
                 ntex::service::fn_factory_with_config(move |sink: web::ws::WsSink| {
                     let response_stream_tx = response_stream_tx.clone();
                     let response_sink_rx = response_sink_rx.clone();

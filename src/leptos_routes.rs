@@ -4,8 +4,8 @@
 
 use leptos::{IntoView, context::provide_context};
 use leptos_router::SsrMode;
-use ntex::web::{App, ErrorRenderer, ServiceConfig};
 use ntex::web::error::StateExtractorError;
+use ntex::web::{App, ErrorRenderer, ServiceConfig};
 use std::collections::HashSet;
 
 use crate::render::{
@@ -123,47 +123,49 @@ where
                     )
                 } else {
                     self.route(
-                            path,
-                            match mode {
-                                SsrMode::OutOfOrder => render_app_to_stream_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                ),
-                                SsrMode::PartiallyBlocked => render_app_to_stream_with_context_and_replace_blocks(
+                        path,
+                        match mode {
+                            SsrMode::OutOfOrder => render_app_to_stream_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            SsrMode::PartiallyBlocked => {
+                                render_app_to_stream_with_context_and_replace_blocks(
                                     additional_context_and_method.clone(),
                                     app_fn.clone(),
                                     method,
                                     true,
-                                ),
-                                SsrMode::InOrder => render_app_to_stream_in_order_with_context(
+                                )
+                            }
+                            SsrMode::InOrder => render_app_to_stream_in_order_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            SsrMode::Async => render_app_async_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            // `SsrMode` is `#[non_exhaustive]`; fall
+                            // back to the out-of-order stream renderer
+                            // for any future variant so we never panic
+                            // at runtime if Leptos adds a new mode.
+                            _ => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "unknown SsrMode {:?}, falling back to OutOfOrder",
+                                    mode
+                                );
+                                render_app_to_stream_with_context(
                                     additional_context_and_method.clone(),
                                     app_fn.clone(),
                                     method,
-                                ),
-                                SsrMode::Async => render_app_async_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                ),
-                                // `SsrMode` is `#[non_exhaustive]`; fall
-                                // back to the out-of-order stream renderer
-                                // for any future variant so we never panic
-                                // at runtime if Leptos adds a new mode.
-                                _ => {
-                                    #[cfg(feature = "tracing")]
-                                    tracing::warn!(
-                                        "unknown SsrMode {:?}, falling back to OutOfOrder",
-                                        mode
-                                    );
-                                    render_app_to_stream_with_context(
-                                        additional_context_and_method.clone(),
-                                        app_fn.clone(),
-                                        method,
-                                    )
-                                }
-                            },
-                        )
+                                )
+                            }
+                        },
+                    )
                 };
             }
         }
@@ -241,49 +243,50 @@ where
                         ),
                     );
                 } else {
-                    router = router
-                        .route(
-                            path,
-                            match mode {
-                                SsrMode::OutOfOrder => render_app_to_stream_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                ),
-                                SsrMode::PartiallyBlocked => render_app_to_stream_with_context_and_replace_blocks(
+                    router = router.route(
+                        path,
+                        match mode {
+                            SsrMode::OutOfOrder => render_app_to_stream_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            SsrMode::PartiallyBlocked => {
+                                render_app_to_stream_with_context_and_replace_blocks(
                                     additional_context_and_method.clone(),
                                     app_fn.clone(),
                                     method,
                                     true,
-                                ),
-                                SsrMode::InOrder => render_app_to_stream_in_order_with_context(
+                                )
+                            }
+                            SsrMode::InOrder => render_app_to_stream_in_order_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            SsrMode::Async => render_app_async_with_context(
+                                additional_context_and_method.clone(),
+                                app_fn.clone(),
+                                method,
+                            ),
+                            // `SsrMode` is `#[non_exhaustive]`; fall
+                            // back to the out-of-order stream renderer
+                            // for any future variant so we never panic
+                            // at runtime if Leptos adds a new mode.
+                            _ => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "unknown SsrMode {:?}, falling back to OutOfOrder",
+                                    mode
+                                );
+                                render_app_to_stream_with_context(
                                     additional_context_and_method.clone(),
                                     app_fn.clone(),
                                     method,
-                                ),
-                                SsrMode::Async => render_app_async_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                ),
-                                // `SsrMode` is `#[non_exhaustive]`; fall
-                                // back to the out-of-order stream renderer
-                                // for any future variant so we never panic
-                                // at runtime if Leptos adds a new mode.
-                                _ => {
-                                    #[cfg(feature = "tracing")]
-                                    tracing::warn!(
-                                        "unknown SsrMode {:?}, falling back to OutOfOrder",
-                                        mode
-                                    );
-                                    render_app_to_stream_with_context(
-                                        additional_context_and_method.clone(),
-                                        app_fn.clone(),
-                                        method,
-                                    )
-                                }
-                            },
-                        );
+                                )
+                            }
+                        },
+                    );
                 }
             }
         }

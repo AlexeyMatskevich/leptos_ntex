@@ -59,12 +59,13 @@ where
         data: impl Stream<Item = Result<SfBytes, SfBytes>> + Send + 'static,
     ) -> Result<Self, E> {
         let pinned = Box::pin(data.map(|data| {
-            data.map(|b| NBytes::copy_from_slice(&b)).map_err(|e| {
-                io::Error::other(String::from_utf8_lossy(&e).to_string())
-            })
+            data.map(|b| NBytes::copy_from_slice(&b))
+                .map_err(|e| io::Error::other(String::from_utf8_lossy(&e).to_string()))
         }));
         Ok(Self(SendWrapper::new(
-            HttpResponse::Ok().content_type(content_type).streaming(pinned),
+            HttpResponse::Ok()
+                .content_type(content_type)
+                .streaming(pinned),
         )))
     }
 }
@@ -80,7 +81,9 @@ impl Res for NtexServerResponse {
 
     fn content_type(&mut self, content_type: &str) {
         if let Ok(content_type) = HeaderValue::from_str(content_type) {
-            self.0.headers_mut().insert(header::CONTENT_TYPE, content_type);
+            self.0
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
         }
     }
 

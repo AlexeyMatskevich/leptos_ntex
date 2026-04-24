@@ -5,17 +5,10 @@
 //! generator and the file-fallback handler.
 
 use futures::{StreamExt, stream::once};
-use leptos::{
-    IntoView,
-    context::provide_context,
-    hydration::IslandsRouterNavigation,
-};
+use leptos::{IntoView, context::provide_context, hydration::IslandsRouterNavigation};
 use leptos_integration_utils::{BoxedFnOnce, ExtendResponse, PinnedFuture, PinnedStream};
 use leptos_meta::ServerMetaContext;
-use leptos_router::{
-    Method, location::RequestUrl,
-    components::provide_server_redirect,
-};
+use leptos_router::{Method, components::provide_server_redirect, location::RequestUrl};
 use ntex::web::{ErrorRenderer, HttpRequest, HttpResponse, Route};
 use send_wrapper::SendWrapper;
 
@@ -107,10 +100,7 @@ where
     // Resource (see ntex/web/route.rs:35-43), which makes it unusable
     // for multi-method matching — use `Any(..).or(..)` instead.
     let route = if matches!(method, Method::Get) {
-        route.guard(
-            ntex::web::guard::Any(ntex::web::guard::Get())
-                .or(ntex::web::guard::Head()),
-        )
+        route.guard(ntex::web::guard::Any(ntex::web::guard::Get()).or(ntex::web::guard::Head()))
     } else {
         route.method(ntex_method(method))
     };
@@ -147,8 +137,8 @@ where
 {
     ensure_executor_initialized();
     Box::pin(SendWrapper::new(async move {
-        let is_island_router_navigation = cfg!(feature = "islands-router")
-            && req.headers().contains_key("Islands-Router");
+        let is_island_router_navigation =
+            cfg!(feature = "islands-router") && req.headers().contains_key("Islands-Router");
         let res_options = ResponseOptions::default();
         let (meta_context, meta_output) = ServerMetaContext::new();
 
@@ -188,7 +178,7 @@ where
 /// ## Provided Context Types
 /// - [`ResponseOptions`]
 /// - [`Request`]
-/// - [`ServerMetaContext`](leptos_meta::ServerMetaContext)
+/// - [`ServerMetaContext`]
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(level = "trace", fields(error), skip_all)
@@ -257,12 +247,7 @@ where
     Err: ErrorRenderer,
     IV: IntoView + 'static,
 {
-    render_app_to_stream_with_context_and_replace_blocks(
-        additional_context,
-        app_fn,
-        method,
-        false,
-    )
+    render_app_to_stream_with_context_and_replace_blocks(additional_context, app_fn, method, false)
 }
 
 /// Variant of [`render_app_to_stream_with_context`] that additionally
