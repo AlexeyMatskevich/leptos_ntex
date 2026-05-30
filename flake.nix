@@ -31,7 +31,6 @@
             python3
 
             nixd
-            uv
             nodejs_22
             bun
           ];

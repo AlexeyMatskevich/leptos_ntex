@@ -159,7 +159,10 @@ impl ExtendResponse for NtexResponse {
 /// either sets a `302 Found` (for plain `<form>` submissions) or emits a
 /// custom [`REDIRECT_HEADER`] that the Leptos client picks up to perform a
 /// client-side navigation while still letting the server fn return its
-/// payload. The `Location` header is always set.
+/// payload. The `Location` header is set whenever `path` is a valid HTTP
+/// header value; a `path` carrying bytes that are illegal in a header value
+/// (CR, LF, NUL, other control bytes) is logged and ignored — no `Location`,
+/// no status change — rather than panicking.
 ///
 /// Must be called while a [`Request`] and a [`ResponseOptions`] are present
 /// in the current reactive context — i.e. from inside a route handler or a
@@ -170,10 +173,23 @@ impl ExtendResponse for NtexResponse {
 )]
 pub fn redirect(path: &str) {
     if let (Some(req), Some(res)) = (use_context::<Request>(), use_context::<ResponseOptions>()) {
-        res.insert_header(
-            header::LOCATION,
-            HeaderValue::from_str(path).expect("failed to create header"),
-        );
+        // The path is app-controlled (e.g. `<Redirect>` or a `?next=`
+        // parameter) and may contain bytes that are not valid in an HTTP
+        // header value (CR, LF, NUL, other control bytes). `from_str`
+        // rejecting those is what prevents header injection — but turning
+        // that rejection into a panic would let a crafted redirect target
+        // abort the request handler. Degrade gracefully instead, matching
+        // the conservative `NtexServerResponse::redirect` sibling.
+        let Ok(location) = HeaderValue::from_str(path) else {
+            let msg =
+                "redirect() called with a path that is not a valid header value; Location not set.";
+            #[cfg(feature = "tracing")]
+            tracing::warn!("{msg}");
+            #[cfg(not(feature = "tracing"))]
+            eprintln!("{msg}");
+            return;
+        };
+        res.insert_header(header::LOCATION, location);
 
         let accepts_html = req
             .headers()

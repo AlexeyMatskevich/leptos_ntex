@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["leptos", "ntex", "ssr", "web", "integration"]
 categories = ["web-programming", "web-programming::http-server"]
 authors = ["Aleksey Matskevich"]
-exclude = ["ACTIX_TO_NTEX_NOTES.md", "scripts/", "flake.nix", "flake.lock", ".zed/", ".serena/", ".venv/"]
+exclude = ["ACTIX_TO_NTEX_NOTES.md", "scripts/", "flake.nix", "flake.lock", ".zed/", ".venv/"]
 
 [package.metadata.docs.rs]
 all-features = true

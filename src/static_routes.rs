@@ -158,6 +158,31 @@ impl StaticRouteGenerator {
 /// both expose `/index.html`), entries collide — the last writer wins.
 /// Mirrors `leptos_actix` behaviour; in practice apps run a single
 /// `LeptosOptions` instance per process and the collision is theoretical.
+///
+/// ⚠ **The captured status/headers are not durable; the HTML body is.**
+/// The rendered page is written to disk, but the [`ResponseOptions`]
+/// snapshot lives only in this in-memory map. A serving process that never
+/// calls [`StaticRouteGenerator::generate`] — e.g. when prerendered
+/// artifacts are produced by a separate build/CI step and only served at
+/// runtime — starts with an empty map. A [`SsrMode::Static`](leptos_router::SsrMode)
+/// route that set a custom non-error status (say `201 Created`) or custom
+/// headers during generation is then served as a bare `200 OK` with those
+/// dropped, until the path is regenerated on a cache miss in this process.
+/// To preserve custom status/headers across restarts, run `generate()` in
+/// the serving process at startup. Mirrors `leptos_actix`.
+///
+/// ⚠ **No eviction.** Entries are only ever inserted, never removed. A
+/// `SsrMode::Static` route registered with a `Param`/`Splat` segment is
+/// matched by every distinct request URL, and each successfully rendered
+/// path inserts a permanent entry here (and writes one `.html` file under
+/// `site_root`). Growth is therefore bounded by the number of distinct
+/// static paths served, not by a fixed cap — for the usual case of a
+/// handful of concrete static routes this is negligible, but a wildcard
+/// static route exposed to high-cardinality or adversarial traffic grows
+/// without bound. Eviction is deliberately *not* implemented: a disk hit
+/// sources status/headers exclusively from this map, so dropping an entry
+/// whose `.html` still exists would silently regress that route to a bare
+/// `200`. Mirrors `leptos_actix` / `leptos_axum` (which share this design).
 static STATIC_HEADERS: LazyLock<RwLock<HashMap<String, ResponseParts>>> =
     LazyLock::new(Default::default);
 
@@ -327,27 +352,46 @@ where
                         regenerate,
                     )
                     .await;
-                (
-                    owner
-                        .with(use_context::<ResponseOptions>)
-                        .map(|options| options.0.read().or_poisoned().clone()),
-                    html,
-                    None,
-                )
+                let response_options = owner
+                    .with(use_context::<ResponseOptions>)
+                    .map(|options| options.0.read().or_poisoned().clone());
+                // On a successful render `ResolvedStaticPath::build` writes
+                // the page to disk and returns `None` (the body lives on
+                // disk, not in memory), so re-open the freshly written file
+                // and serve it. On a 404/error render it returns `Some(html)`
+                // and skips the disk write, so we keep the in-memory body.
+                // Without this re-open the `html == None` arm below would fall
+                // through to a 500 on the first request to an un-pregenerated
+                // static route. Mirrors `leptos_axum` (`ServeDir`) and
+                // `leptos_actix` (`NamedFile::open`).
+                let reopened = if html.is_none() {
+                    let root = root.clone();
+                    let path_buf = path_buf.clone();
+                    ntex::rt::spawn_blocking(move || {
+                        validate_static_file(&root, &path_buf)
+                            .and_then(|path| ntex_files::NamedFile::open(path).ok())
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                (response_options, html, reopened)
             } else {
                 let headers = STATIC_HEADERS.read().or_poisoned().get(&orig_path).cloned();
                 (headers, None, opened)
             };
 
-            // `SsrMode::Static` routes always emit HTML, so we hardcode
-            // `text/html` on the regeneration path (where the body is held
-            // in memory). On a cache hit we open the on-disk file via
-            // `NamedFile`, which derives MIME from the extension and adds
-            // `Last-Modified`/`ETag`. A custom `RegenerationFn` that
-            // returns non-HTML bytes would get `text/html` on the first
-            // (regenerating) request and the correct MIME thereafter — in
-            // practice Leptos's SSG only produces HTML, so this matches
-            // `leptos_actix` / `leptos_axum` behavior.
+            // `Some(html)` only happens on a 404/error render that `build`
+            // chose not to cache — emit it directly with the hardcoded
+            // `text/html` (Leptos's SSG only produces HTML). Every other
+            // path (cache hit, or a successful regeneration we just
+            // re-opened) serves the on-disk file via `NamedFile`, which
+            // derives MIME from the extension and adds `Last-Modified` /
+            // `ETag`. A 500 here now means the file genuinely could not be
+            // opened after a successful write, not the expected
+            // success-path (which previously fell through to a bogus 500).
             let mut res = NtexResponse(match html {
                 Some(html) => HttpResponse::Ok().content_type("text/html").body(html),
                 None => opened
