@@ -542,3 +542,100 @@ fn close_too_big(limit: usize) -> web::ws::Message {
         description: Some(format!("message exceeds limit of {limit} bytes")),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lets_expect::lets_expect;
+    use ntex::web::test;
+    use server_fn::error::ServerFnError;
+
+    // ----- NtexRequest accessors: header / query / content-type / accept -
+    // The request-side getters the server-fn runtime reads to pick a codec
+    // and decode the body. Each must report the EXACT value present on the
+    // wire and `None` when the field is absent — a collapse to a constant
+    // (`""`, `"xyzzy"`, `None`, `Some`) would feed the runtime a wrong or
+    // missing value. A concrete error type pins the generic `Req` impl.
+    type E = ServerFnError;
+
+    fn request_with(uri: &str, headers: &[(&str, &str)]) -> NtexRequest {
+        let mut builder = test::TestRequest::with_uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        NtexRequest::from(builder.to_http_parts())
+    }
+
+    fn header_value(headers: &[(&str, &str)]) -> Option<String> {
+        request_with("/", headers)
+            .header("x-probe")
+            .map(|value| value.into_owned())
+    }
+
+    fn query(uri: &str) -> Option<String> {
+        let req = request_with(uri, &[]);
+        <NtexRequest as Req<E, E, E>>::as_query(&req).map(str::to_owned)
+    }
+
+    fn content_type(headers: &[(&str, &str)]) -> Option<String> {
+        let req = request_with("/", headers);
+        <NtexRequest as Req<E, E, E>>::to_content_type(&req).map(|value| value.into_owned())
+    }
+
+    fn accept(headers: &[(&str, &str)]) -> Option<String> {
+        let req = request_with("/", headers);
+        <NtexRequest as Req<E, E, E>>::accepts(&req).map(|value| value.into_owned())
+    }
+
+    lets_expect! {
+        expect(header_value(headers)) as the_request_header {
+            let headers: &[(&str, &str)] = &[("x-probe", "probe-value")];
+
+            to returns_the_exact_header_value { equal(Some("probe-value".to_string())) }
+
+            when the_header_is_absent {
+                let headers: &[(&str, &str)] = &[];
+                to returns_none { be_none }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(query(uri)) as the_request_query {
+            let uri = "/path?foo=bar&baz=1";
+
+            to returns_the_raw_query_string { equal(Some("foo=bar&baz=1".to_string())) }
+
+            when there_is_no_query {
+                let uri = "/path";
+                to returns_none { be_none }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(content_type(headers)) as the_request_content_type {
+            let headers: &[(&str, &str)] = &[("Content-Type", "application/json")];
+
+            to reads_the_content_type_header { equal(Some("application/json".to_string())) }
+
+            when the_content_type_is_absent {
+                let headers: &[(&str, &str)] = &[];
+                to returns_none { be_none }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(accept(headers)) as the_request_accept {
+            let headers: &[(&str, &str)] = &[("Accept", "text/html")];
+
+            to reads_the_accept_header { equal(Some("text/html".to_string())) }
+
+            when the_accept_header_is_absent {
+                let headers: &[(&str, &str)] = &[];
+                to returns_none { be_none }
+            }
+        }
+    }
+}

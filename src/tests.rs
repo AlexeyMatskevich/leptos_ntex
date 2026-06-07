@@ -156,6 +156,82 @@ fn unit_shell() -> impl IntoView {
     }
 }
 
+// A view that reads an async `Resource` under `<Suspense>`. The whole point
+// is that the three streaming modes render its `<Suspense>` DIFFERENTLY:
+//   * OutOfOrder: emits the FALLBACK in the shell, then streams the resolved
+//     fragment out of order (so the body contains BOTH the fallback marker
+//     and an out-of-order replacement chunk).
+//   * InOrder / Async: block until the resource resolves, so the body has the
+//     RESOLVED content in place and NO fallback marker.
+// Deleting the InOrder/Async match arm falls back to the OutOfOrder renderer,
+// which a fallback-marker assertion then catches.
+#[component]
+fn SuspendedView() -> impl IntoView {
+    let data = Resource::new(
+        || (),
+        |_| async move {
+            // A real delay so the resource is still pending when the shell
+            // renders. OutOfOrder then streams the shell + fallback first and
+            // the resolved fragment later; InOrder/Async block for the value.
+            ntex::time::sleep(ntex::time::Millis(50)).await;
+            String::from("RESOLVED-CONTENT")
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <span>"FALLBACK-MARKER"</span> }>
+            {move || Suspend::new(async move {
+                let value = data.await;
+                view! { <span>{value}</span> }
+            })}
+        </Suspense>
+    }
+}
+
+#[component]
+fn SuspenseApp() -> impl IntoView {
+    provide_meta_context();
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <p>"Not Found"</p> }>
+                    <Route path=path!("/out") ssr=SsrMode::OutOfOrder view=SuspendedView/>
+                    <Route path=path!("/in") ssr=SsrMode::InOrder view=SuspendedView/>
+                    <Route path=path!("/async") ssr=SsrMode::Async view=SuspendedView/>
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
+#[component]
+fn NestedApp() -> impl IntoView {
+    provide_meta_context();
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <p>"Not Found"</p> }>
+                    <Route path=path!("/outer/inner") view=|| view! { <h1>"Nested"</h1> } />
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
+fn suspense_shell() -> impl IntoView {
+    view! {
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="utf-8"/>
+                <MetaTags/>
+            </head>
+            <body>
+                <SuspenseApp/>
+            </body>
+        </html>
+    }
+}
+
 #[server(
     name = EchoName,
     prefix = "/api",
@@ -433,6 +509,215 @@ mod tests {
         }
     }
 
+    // ----- content_length_exceeds preflight: boundary spec --------------
+    // The 413 preflight that rejects an oversize body declared up-front via
+    // `Content-Length`, WITHOUT reading it. The boundary is the crux: a body
+    // of *exactly* `limit` bytes does NOT "exceed" the limit (the predicate
+    // is strict `>`), so the preflight must let it through — only `limit + 1`
+    // and above are rejected. A missing or unparseable header is not a size
+    // declaration, so the preflight stays out of the way and returns false.
+    fn content_length_preflight(content_length: Option<&str>, limit: usize) -> bool {
+        let mut req = test::TestRequest::default();
+        if let Some(value) = content_length {
+            req = req.header(header::CONTENT_LENGTH, value);
+        }
+        crate::config::content_length_exceeds(&req.to_http_request(), limit)
+    }
+
+    lets_expect! {
+        expect(content_length_preflight(content_length, limit)) as the_preflight {
+            let limit = 1024usize;
+            let content_length: Option<&str> = Some("2048");
+
+            to rejects_an_oversize_declaration { be_true }
+
+            when the_declared_length_is_below_the_limit {
+                let content_length = Some("1023");
+                to allows_the_body { be_false }
+            }
+
+            when the_declared_length_is_exactly_the_limit {
+                let content_length = Some("1024");
+                to allows_the_body { be_false }
+            }
+
+            when the_declared_length_is_one_byte_over_the_limit {
+                let content_length = Some("1025");
+                to rejects_the_body { be_true }
+            }
+
+            when no_content_length_is_declared {
+                let content_length: Option<&str> = None;
+                to stays_out_of_the_way { be_false }
+            }
+
+            when the_content_length_is_not_a_number {
+                let content_length = Some("not-a-number");
+                to stays_out_of_the_way { be_false }
+            }
+        }
+    }
+
+    // ----- DEFAULT_PAYLOAD_LIMIT: pins the documented 2 MiB default ------
+    // Matches ntex's own `PayloadConfig` default. A regression in the
+    // constant expression (e.g. a dropped factor) changes the limit silently.
+    lets_expect! {
+        expect(crate::DEFAULT_PAYLOAD_LIMIT) as the_default_payload_limit {
+            to is_two_mebibytes { equal(2 * 1024 * 1024) }
+        }
+    }
+
+    // ----- ResponseParts::insert_header: overwrite semantics ------------
+    // `insert_header` must REPLACE any previous value for the same key
+    // (unlike `append_header`). A no-op regression drops the header entirely.
+    fn response_parts_header_values(inserts: &[&str]) -> Vec<String> {
+        let name = header::HeaderName::from_static("x-test");
+        let mut parts = crate::ResponseParts::default();
+        for value in inserts {
+            parts.insert_header(name.clone(), header::HeaderValue::from_str(value).unwrap());
+        }
+        parts
+            .headers
+            .get_all(&name)
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect()
+    }
+
+    lets_expect! {
+        expect(response_parts_header_values(inserts)) as response_parts_headers {
+            let inserts: &[&str] = &["first"];
+
+            to records_the_inserted_header { equal(vec!["first".to_string()]) }
+
+            when the_same_key_is_inserted_twice {
+                let inserts: &[&str] = &["first", "second"];
+                to keeps_only_the_latest_value { equal(vec!["second".to_string()]) }
+            }
+        }
+    }
+
+    // ----- ResponseOptions::overwrite: wholesale replacement ------------
+    // `overwrite` swaps the entire inner `ResponseParts`, so a previously set
+    // status is replaced by the incoming one (including back to `None`).
+    fn status_after_overwrite(replacement: Option<StatusCode>) -> Option<StatusCode> {
+        let options = crate::ResponseOptions::default();
+        options.set_status(StatusCode::OK);
+        options.overwrite(crate::ResponseParts {
+            status: replacement,
+            ..Default::default()
+        });
+        options.0.read().unwrap().status
+    }
+
+    lets_expect! {
+        expect(status_after_overwrite(replacement)) as overwriting_response_parts {
+            let replacement: Option<StatusCode> = Some(StatusCode::IM_A_TEAPOT);
+
+            to replaces_the_previously_set_status { equal(Some(StatusCode::IM_A_TEAPOT)) }
+
+            when the_replacement_carries_no_status {
+                let replacement: Option<StatusCode> = None;
+                to clears_the_previously_set_status { equal(None) }
+            }
+        }
+    }
+
+    // ----- render::ntex_method: exhaustive leptos→ntex method map -------
+    // Every `leptos_router::Method` variant maps to its ntex counterpart;
+    // a collapse to `Method::default()` (GET) would misroute POST/PUT/etc.
+    lets_expect! {
+        expect(crate::render::ntex_method(method)) as the_mapped_ntex_method {
+            let method = leptos_router::Method::Get;
+
+            to maps_get { equal(ntex::http::Method::GET) }
+
+            when the_method_is_post {
+                let method = leptos_router::Method::Post;
+                to maps_post { equal(ntex::http::Method::POST) }
+            }
+
+            when the_method_is_put {
+                let method = leptos_router::Method::Put;
+                to maps_put { equal(ntex::http::Method::PUT) }
+            }
+
+            when the_method_is_delete {
+                let method = leptos_router::Method::Delete;
+                to maps_delete { equal(ntex::http::Method::DELETE) }
+            }
+
+            when the_method_is_patch {
+                let method = leptos_router::Method::Patch;
+                to maps_patch { equal(ntex::http::Method::PATCH) }
+            }
+        }
+    }
+
+    // ----- NtexRouteListing getters: mode() and methods() ---------------
+    // The getters must report the values the listing was built with, not the
+    // type defaults (a collapse to `SsrMode::default()` / `[Method::Get]`
+    // would silently re-mode and re-method every route).
+    fn sample_listing() -> crate::NtexRouteListing {
+        crate::NtexRouteListing::new(
+            "/sample".to_string(),
+            leptos_router::SsrMode::Async,
+            [leptos_router::Method::Post],
+            Vec::new(),
+        )
+    }
+
+    lets_expect! {
+        expect(sample_listing().mode()) as the_listing_mode {
+            to reports_the_configured_mode { equal(leptos_router::SsrMode::Async) }
+        }
+    }
+
+    lets_expect! {
+        expect(sample_listing().methods().collect::<Vec<_>>()) as the_listing_methods {
+            to reports_the_configured_methods { equal(vec![leptos_router::Method::Post]) }
+        }
+    }
+
+    // ----- generate_route_list exclusion + path rendering ---------------
+    // Two behaviours in one spec over the public route-list API:
+    //   * every produced path carries its leading slash (the `to_ntex_path`
+    //     segment-separator logic), and
+    //   * an excluded path is dropped from the *active* listings (the
+    //     `retain(!excluded)` filter).
+    // `StaticApp` registers exactly `/` and `/about`.
+    fn active_paths_after_excluding(excluded: &[&str]) -> Vec<String> {
+        let excluded = if excluded.is_empty() {
+            None
+        } else {
+            Some(excluded.iter().map(|s| s.to_string()).collect())
+        };
+        let mut paths = crate::generate_route_list_with_exclusions(StaticApp, excluded)
+            .into_iter()
+            .filter(|listing| !listing.exclude)
+            .map(|listing| listing.path().to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    lets_expect! {
+        expect(active_paths_after_excluding(excluded)) as the_active_route_paths {
+            let excluded: &[&str] = &[];
+
+            to lists_every_route_with_a_leading_slash {
+                equal(vec!["/".to_string(), "/about".to_string()])
+            }
+
+            when a_route_is_excluded {
+                let excluded: &[&str] = &["/about"];
+                to drops_the_excluded_route_from_the_active_set {
+                    equal(vec!["/".to_string()])
+                }
+            }
+        }
+    }
+
     #[ntex::test]
     async fn renders_root_route() {
         register_explicit::<EchoName>();
@@ -506,6 +791,37 @@ mod tests {
         let body = test::read_body(resp).await;
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Hello, Alice"));
+    }
+
+    /// The `&mut ServiceConfig` impl registers server functions ITSELF (its
+    /// `server_fn_paths()` loop, guarded by `!excluded.contains(path)`), so a
+    /// server fn must resolve through `register_leptos_routes` ALONE — WITHOUT
+    /// a separate `handle_server_fns()` catch-all. `handles_server_fn_post`
+    /// above mounts that catch-all, which masks this registration path; here we
+    /// drop it. Inverting the guard (`delete !`) would register only excluded
+    /// paths, leaving this non-excluded server fn unrouted → 404.
+    #[ntex::test]
+    async fn service_config_registers_server_fns_without_a_catch_all() {
+        register_explicit::<EchoName>();
+        let routes = generate_route_list(UnitApp);
+        let app = test::init_service(NtexApp::new().configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), unit_shell);
+        }))
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri(EchoName::PATH)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .set_payload("name=Bob")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Hello, Bob"));
     }
 
     #[ntex::test]
@@ -881,6 +1197,244 @@ mod tests {
         }
     }
 
+    // ----- WebSocket payload-limit BOUNDARY -----------------------------
+    // The existing oversize tests send well past the limit, so they cannot
+    // distinguish `len > limit` from `len >= limit`. These send a payload of
+    // *exactly* `payload_limit` bytes: it is within the limit (the check is
+    // strict `>`), so it must be DELIVERED, not closed with `Size`. A
+    // 13-char string serializes to a 16-byte server-fn frame (1 ok-marker +
+    // `"<13 chars>"`), matched to a 16-byte limit.
+
+    /// Unfragmented binary frame exactly at the limit is echoed, not closed.
+    #[ntex::test]
+    async fn websocket_unfragmented_binary_exactly_at_limit_is_delivered() {
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(crate::LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let message = "a".repeat(13);
+        let payload = serialize_ws_ok(&message);
+        assert_eq!(payload.len(), 16, "payload must sit exactly on the limit");
+
+        sink.send(ws::Message::Binary(payload.into()))
+            .await
+            .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, message);
+            }
+            other => panic!("expected the at-limit message echoed, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// Unfragmented text frame exactly at the limit is echoed, not closed.
+    #[ntex::test]
+    async fn websocket_unfragmented_text_exactly_at_limit_is_delivered() {
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(crate::LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let message = "a".repeat(13);
+        let payload = serialize_ws_ok(&message);
+        assert_eq!(payload.len(), 16);
+        let text = ntex::util::ByteString::try_from(payload).unwrap();
+
+        sink.send(ws::Message::Text(text)).await.unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, message);
+            }
+            other => panic!("expected the at-limit text message echoed, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// A single opening fragment (`FirstBinary`) exactly at the limit is
+    /// accepted; the terminal `Last` frame then completes the message at the
+    /// limit too. Pins the `>` vs `>=` checks on First* and Last.
+    #[ntex::test]
+    async fn websocket_first_fragment_exactly_at_limit_is_delivered() {
+        use ntex::ws::Item;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(crate::LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let message = "a".repeat(13);
+        let payload = serialize_ws_ok(&message);
+        assert_eq!(payload.len(), 16);
+
+        // Whole payload in the opening fragment (len == limit), then an empty
+        // terminal frame (cumulative len == limit).
+        sink.send(ws::Message::Continuation(Item::FirstBinary(payload.into())))
+            .await
+            .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(Vec::new().into())))
+            .await
+            .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, message);
+            }
+            other => panic!("expected the at-limit fragmented message echoed, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// A message reassembled across `Continue` to exactly the limit must be
+    /// delivered. The cumulative size hits the limit on the `Continue` frame.
+    #[ntex::test]
+    async fn websocket_reassembled_continuation_exactly_at_limit_is_delivered() {
+        use ntex::ws::Item;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(crate::LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let message = "a".repeat(13);
+        let payload = serialize_ws_ok(&message);
+        assert_eq!(payload.len(), 16);
+
+        // First(8) + Continue(8): cumulative hits 16 exactly on the Continue.
+        sink.send(ws::Message::Continuation(Item::FirstBinary(
+            payload[0..8].to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Continue(
+            payload[8..16].to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(Vec::new().into())))
+            .await
+            .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, message);
+            }
+            other => panic!("expected the at-limit reassembled message echoed, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// An opening TEXT fragment (`FirstText`) exactly at the limit is
+    /// accepted (the `FirstText` size guard mirrors `FirstBinary`).
+    #[ntex::test]
+    async fn websocket_first_text_fragment_exactly_at_limit_is_delivered() {
+        use ntex::ws::Item;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(crate::LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let message = "a".repeat(13);
+        let payload = serialize_ws_ok(&message);
+        assert_eq!(payload.len(), 16);
+
+        // `Item::FirstText` carries raw `Bytes` (the text-vs-binary kind is
+        // tracked by the frame opcode, not the payload type).
+        sink.send(ws::Message::Continuation(Item::FirstText(payload.into())))
+            .await
+            .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(Vec::new().into())))
+            .await
+            .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, message);
+            }
+            other => panic!("expected the at-limit text fragment echoed, got {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
     #[ntex::test]
     async fn static_route_generator_writes_html() {
         let site_root = temp_site_root("static");
@@ -937,6 +1491,104 @@ mod tests {
         let body = test::read_body(resp).await;
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Async"));
+    }
+
+    /// A multi-segment route path keeps a `/` separator BETWEEN segments.
+    /// Multi-segment paths arrive as separate `Static` segments WITHOUT
+    /// leading slashes (a lone `/about` is stored whole, but `/outer/inner`
+    /// splits), so the separator-insertion in `to_ntex_path` is load-bearing:
+    /// dropping the `!raw.is_empty()` or `!raw.starts_with('/')` guard
+    /// collapses `/outer/inner` into `outerinner`.
+    #[test]
+    fn nested_route_path_keeps_segment_separators() {
+        let paths = generate_route_list(NestedApp)
+            .into_iter()
+            .map(|r| r.path().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/outer/inner".to_string()]);
+    }
+
+    // ----- SSR streaming mode is observable in the body ------------------
+    // A `<Suspense>` over a still-pending resource renders differently per
+    // mode: OutOfOrder streams the shell + fallback first (the body carries
+    // BOTH the fallback marker and an out-of-order replacement template);
+    // InOrder/Async block for the resolved value (the body has it in place
+    // and NO fallback marker). Deleting the InOrder/Async match arm falls
+    // back to the OutOfOrder renderer, which these assertions catch — across
+    // both the `App` and the `&mut ServiceConfig` implementations.
+    async fn suspense_body_via_app_impl(path: &str) -> String {
+        use crate::LeptosRoutes;
+        let routes = generate_route_list(SuspenseApp);
+        let app = test::init_service(NtexApp::new().leptos_routes(routes, suspense_shell)).await;
+        let req = test::TestRequest::with_uri(path).to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn suspense_body_via_service_config(path: &str) -> String {
+        let routes = generate_route_list(SuspenseApp);
+        let app = test::init_service(NtexApp::new().configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), suspense_shell);
+        }))
+        .await;
+        let req = test::TestRequest::with_uri(path).to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[ntex::test]
+    async fn in_order_mode_blocks_for_the_resource_via_app_impl() {
+        let html = suspense_body_via_app_impl("/in").await;
+        assert!(
+            html.contains("RESOLVED-CONTENT"),
+            "resolved value must be present"
+        );
+        assert!(
+            !html.contains("FALLBACK-MARKER"),
+            "InOrder must block for the resource, not stream the OOO fallback"
+        );
+    }
+
+    #[ntex::test]
+    async fn in_order_mode_blocks_for_the_resource_via_service_config() {
+        let html = suspense_body_via_service_config("/in").await;
+        assert!(html.contains("RESOLVED-CONTENT"));
+        assert!(
+            !html.contains("FALLBACK-MARKER"),
+            "InOrder (ServiceConfig) must block for the resource"
+        );
+    }
+
+    #[ntex::test]
+    async fn async_mode_blocks_for_the_resource_via_app_impl() {
+        let html = suspense_body_via_app_impl("/async").await;
+        assert!(html.contains("RESOLVED-CONTENT"));
+        assert!(
+            !html.contains("FALLBACK-MARKER"),
+            "Async must resolve everything before sending, not stream the fallback"
+        );
+    }
+
+    #[ntex::test]
+    async fn async_mode_blocks_for_the_resource_via_service_config() {
+        let html = suspense_body_via_service_config("/async").await;
+        assert!(html.contains("RESOLVED-CONTENT"));
+        assert!(
+            !html.contains("FALLBACK-MARKER"),
+            "Async (ServiceConfig) must resolve everything before sending"
+        );
+    }
+
+    #[ntex::test]
+    async fn out_of_order_mode_streams_the_fallback_shell() {
+        let html = suspense_body_via_app_impl("/out").await;
+        assert!(
+            html.contains("FALLBACK-MARKER"),
+            "OutOfOrder must stream the shell + fallback before the resolved fragment"
+        );
+        assert!(html.contains("RESOLVED-CONTENT"));
     }
 
     /// RFC 9110 §9.3.2: HEAD must mirror GET's status and headers.

@@ -3,3 +3,6 @@
 .mcp.json
 .claude/
 .venv/
+/mutants.out
+/mutants.out.old
+MUTATION_TRIAGE.md

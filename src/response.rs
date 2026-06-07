@@ -497,6 +497,15 @@ mod tests {
                 to does_not_accept_html { be_false }
             }
 
+            // type == text, subtype != html: only the SUBTYPE guard fires.
+            // The `application/json` case above has BOTH type and subtype
+            // differ, so it cannot tell `type != text || subtype != html`
+            // apart from `&&` — this text/non-html range is the one that can.
+            when the_range_is_text_but_not_html {
+                let accept = "text/plain";
+                to does_not_accept_html { be_false }
+            }
+
             when the_value_only_contains_an_html_substring {
                 let accept = "application/x-text/html-fake";
                 to does_not_accept_html { be_false }

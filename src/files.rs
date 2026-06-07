@@ -411,12 +411,17 @@ mod tests {
     // stays rejected. Exercises the guard through the real `canonicalize()`
     // (a throwaway site root is built per leaf, holding the two probe files).
     fn resolves_under_root(path: &str) -> bool {
+        // Unique per call: a nanosecond timestamp alone collides when several
+        // of these leaves run concurrently (the clock resolution is coarser
+        // than the spawn interval), so two threads would share one temp root
+        // and race each other's create/remove. A process-scoped atomic
+        // counter makes the path unique regardless of timing.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "leptos_ntex_safe_subpath_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "leptos_ntex_safe_subpath_{}_{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(root.join(".well-known")).unwrap();
         std::fs::write(root.join(".well-known/security.txt"), "ok").unwrap();
@@ -446,6 +451,64 @@ mod tests {
             when a_traversal_hides_behind_well_known {
                 let path = "/.well-known/../.env";
                 to is_rejected { be_false }
+            }
+        }
+    }
+
+    // ----- accepted_encodings: Accept-Encoding negotiation spec ---------
+    // Parses the request's `Accept-Encoding` into the (br, gzip) pair that
+    // selects a precompressed sibling. Each token is matched case-insensitively
+    // with its q-weight honoured; `*` enables both, an explicit `q=0` refuses,
+    // and an UNRELATED token (`deflate`) must enable NEITHER — the case a
+    // `== "*"` → `!= "*"` slip would wrongly route into the wildcard branch.
+    fn accepted(accept_encoding: Option<&str>) -> (bool, bool) {
+        let mut req = ntex::web::test::TestRequest::default();
+        if let Some(value) = accept_encoding {
+            req = req.header(header::ACCEPT_ENCODING, value);
+        }
+        let encodings = accepted_encodings(&req.to_http_request());
+        (encodings.br, encodings.gzip)
+    }
+
+    lets_expect! {
+        expect(accepted(accept_encoding)) as the_accepted_encodings {
+            let accept_encoding: Option<&str> = Some("br, gzip");
+
+            to enables_both_when_both_are_offered { equal((true, true)) }
+
+            when no_accept_encoding_is_sent {
+                let accept_encoding: Option<&str> = None;
+                to enables_neither { equal((false, false)) }
+            }
+
+            when only_brotli_is_offered {
+                let accept_encoding = Some("br");
+                to enables_brotli_alone { equal((true, false)) }
+            }
+
+            when only_gzip_is_offered {
+                let accept_encoding = Some("gzip");
+                to enables_gzip_alone { equal((false, true)) }
+            }
+
+            when a_wildcard_is_offered {
+                let accept_encoding = Some("*");
+                to enables_both { equal((true, true)) }
+            }
+
+            when an_unrelated_encoding_is_offered {
+                let accept_encoding = Some("deflate");
+                to enables_neither { equal((false, false)) }
+            }
+
+            when brotli_is_explicitly_refused {
+                let accept_encoding = Some("br;q=0, gzip");
+                to enables_gzip_only { equal((false, true)) }
+            }
+
+            when the_wildcard_is_refused {
+                let accept_encoding = Some("*;q=0");
+                to enables_neither { equal((false, false)) }
             }
         }
     }
