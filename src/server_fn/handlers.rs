@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::config::{PayloadTooLarge, content_length_exceeds, server_fn_config};
 use crate::request::Request;
-use crate::response::{NtexResponse, ResponseOptions};
+use crate::response::{NtexResponse, ResponseOptions, accept_header_includes_html};
 use crate::routes::ensure_executor_initialized;
 use crate::server_fn::registry::{get_server_fn_service, server_fn_methods};
 use crate::server_fn::request::NtexRequest;
@@ -50,7 +50,7 @@ pub(crate) async fn dispatch_server_fn(
                     .headers()
                     .get(header::ACCEPT)
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("text/html"))
+                    .map(accept_header_includes_html)
                     .unwrap_or(false);
                 let raw_referrer = req.headers().get(header::REFERER).cloned();
                 let referrer = raw_referrer

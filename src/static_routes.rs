@@ -25,10 +25,10 @@ use ntex::web::error::StateExtractorError;
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use or_poisoned::OrPoisoned;
 use std::{
-    collections::HashMap,
     fs,
     future::Future,
     io,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{LazyLock, RwLock},
 };
@@ -171,20 +171,42 @@ impl StaticRouteGenerator {
 /// To preserve custom status/headers across restarts, run `generate()` in
 /// the serving process at startup. Mirrors `leptos_actix`.
 ///
-/// ⚠ **No eviction.** Entries are only ever inserted, never removed. A
-/// `SsrMode::Static` route registered with a `Param`/`Splat` segment is
-/// matched by every distinct request URL, and each successfully rendered
-/// path inserts a permanent entry here (and writes one `.html` file under
-/// `site_root`). Growth is therefore bounded by the number of distinct
-/// static paths served, not by a fixed cap — for the usual case of a
-/// handful of concrete static routes this is negligible, but a wildcard
-/// static route exposed to high-cardinality or adversarial traffic grows
-/// without bound. Eviction is deliberately *not* implemented: a disk hit
-/// sources status/headers exclusively from this map, so dropping an entry
-/// whose `.html` still exists would silently regress that route to a bare
-/// `200`. Mirrors `leptos_actix` / `leptos_axum` (which share this design).
-static STATIC_HEADERS: LazyLock<RwLock<HashMap<String, ResponseParts>>> =
-    LazyLock::new(Default::default);
+/// ⚠ **Bounded LRU cache.** Once the cache is full the least-recently-used
+/// entry is evicted (default 1024 entries; override with the
+/// `LEPTOS_STATIC_HEADERS_CACHE_SIZE` environment variable — a missing,
+/// unparseable, or zero value falls back to the default). This caps memory: a
+/// `SsrMode::Static` route registered with a `Param`/`Splat` segment is matched
+/// by every distinct request URL, and each successfully rendered path would
+/// otherwise insert a *permanent* entry here (and write one `.html` under
+/// `site_root`) — a wildcard static route exposed to high-cardinality or
+/// adversarial traffic would grow this map without bound. Eviction is graceful
+/// for the body — the `.html` is still served from disk — but the evicted path
+/// then serves that `.html` as a bare `200 OK`. Regeneration only runs when the
+/// file is *absent*, so an evicted entry whose `.html` is still on disk is
+/// **not** repopulated — its custom status/headers stay dropped until the
+/// process restarts or the file is removed (the same bare-`200` degradation as
+/// a process that never ran `generate()`, now also reachable at runtime under
+/// cache pressure). The official `leptos_axum` integration adopted the same
+/// bounded `lru::LruCache`; `leptos_actix` remains unbounded.
+static STATIC_HEADERS: LazyLock<RwLock<lru::LruCache<String, ResponseParts>>> =
+    LazyLock::new(|| {
+        let capacity = std::env::var(STATIC_HEADERS_CAPACITY_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(NonZeroUsize::new)
+            .unwrap_or(STATIC_HEADERS_DEFAULT_CAPACITY);
+        RwLock::new(lru::LruCache::new(capacity))
+    });
+
+/// Default upper bound on the number of per-path [`ResponseParts`] entries
+/// cached for static routes (see [`STATIC_HEADERS`]).
+const STATIC_HEADERS_DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
+    Some(capacity) => capacity,
+    None => unreachable!(),
+};
+
+/// Environment variable that overrides [`STATIC_HEADERS_DEFAULT_CAPACITY`].
+const STATIC_HEADERS_CAPACITY_ENV: &str = "LEPTOS_STATIC_HEADERS_CACHE_SIZE";
 
 fn was_404(owner: &Owner) -> bool {
     let resp = owner.with(|| expect_context::<ResponseOptions>());
@@ -287,7 +309,7 @@ async fn write_static_route(
         STATIC_HEADERS
             .write()
             .or_poisoned()
-            .insert(path.to_string(), snapshot);
+            .put(path.to_string(), snapshot);
     }
 
     Ok(())
@@ -379,13 +401,20 @@ where
                 };
                 (response_options, html, reopened)
             } else {
-                let headers = STATIC_HEADERS.read().or_poisoned().get(&orig_path).cloned();
+                // `LruCache::get` updates recency, so it needs a write lock.
+                let headers = STATIC_HEADERS
+                    .write()
+                    .or_poisoned()
+                    .get(&orig_path)
+                    .cloned();
                 (headers, None, opened)
             };
 
             // `Some(html)` only happens on a 404/error render that `build`
-            // chose not to cache — emit it directly with the hardcoded
-            // `text/html` (Leptos's SSG only produces HTML). Every other
+            // chose not to cache — emit it as an explicit `404` with the
+            // hardcoded `text/html` (Leptos's SSG only produces HTML); a custom
+            // status the app set still overrides this via the captured
+            // `ResponseParts` applied below. Every other
             // path (cache hit, or a successful regeneration we just
             // re-opened) serves the on-disk file via `NamedFile`, which
             // derives MIME from the extension and adds `Last-Modified` /
@@ -393,7 +422,9 @@ where
             // opened after a successful write, not the expected
             // success-path (which previously fell through to a bogus 500).
             let mut res = NtexResponse(match html {
-                Some(html) => HttpResponse::Ok().content_type("text/html").body(html),
+                Some(html) => HttpResponse::NotFound()
+                    .content_type("text/html")
+                    .body(html),
                 None => opened
                     .map(|named| named.into_response(&req))
                     .unwrap_or_else(|| HttpResponse::InternalServerError().finish()),
@@ -439,5 +470,23 @@ mod tests {
         let options = options();
         assert!(static_path(&options, "/static/subdir%2F.env").is_none());
         assert!(static_path(&options, "/static/.env").is_none());
+    }
+
+    #[test]
+    fn static_headers_cache_is_bounded() {
+        let mut cache: lru::LruCache<String, ResponseParts> =
+            lru::LruCache::new(STATIC_HEADERS_DEFAULT_CAPACITY);
+        let capacity = STATIC_HEADERS_DEFAULT_CAPACITY.get();
+
+        for i in 0..(capacity + 10) {
+            cache.put(format!("/post/{i}"), ResponseParts::default());
+        }
+
+        // never grows past capacity
+        assert_eq!(cache.len(), capacity);
+        // the earliest-inserted entries have been evicted
+        assert!(cache.get(&"/post/0".to_string()).is_none());
+        // a recently-inserted entry is still present
+        assert!(cache.get(&format!("/post/{}", capacity + 9)).is_some());
     }
 }

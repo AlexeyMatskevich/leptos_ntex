@@ -23,9 +23,16 @@ bytes = "1.11.1"
 futures = "0.3.31"
 hydration_context = "0.3.0"
 leptos = { version = "0.8.19", features = ["ssr", "nonce"] }
+# NOTE: `NtexResponse::from_app` (src/response.rs) is a frozen near-verbatim
+# copy of this version's `ExtendResponse::from_app`, diverging only to clean up
+# the reactive Owner on `Drop` (owner-leak stopgap, leptos-rs/leptos#4739).
+# When bumping this dependency, re-diff that override against the new source and
+# delete it once upstream ships the `Drop`-based cleanup.
 leptos_integration_utils = "0.8.8"
 leptos_meta = { version = "0.8.6", features = ["ssr", "nonce"] }
 leptos_router = { version = "0.8.13", features = ["ssr"] }
+lru = "0.18"
+mime = "0.3"
 ntex = "3.7.2"
 ntex-files = "3.2.0"
 percent-encoding = "2.3"

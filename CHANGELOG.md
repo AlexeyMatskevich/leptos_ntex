@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bounded the per-process static-route header/status cache (`STATIC_HEADERS`)
+  with an LRU (default 1024 entries, override via the
+  `LEPTOS_STATIC_HEADERS_CACHE_SIZE` environment variable). A `SsrMode::Static`
+  route with a `Param`/`Splat` segment previously inserted a permanent entry
+  per distinct path served, so a wildcard static route under high-cardinality
+  or adversarial traffic grew the map without bound. Mirrors the bounded
+  `lru::LruCache` adopted by `leptos_axum`. **Trade-off:** once an entry is
+  evicted, the still-on-disk `.html` is served as a bare `200 OK` with its
+  captured custom status/headers dropped and not repopulated (regeneration only
+  runs when the file is absent) — large pre-generated sites that exceed the
+  cache size should raise `LEPTOS_STATIC_HEADERS_CACHE_SIZE`.
+
+### Added
+
+- `LEPTOS_STATIC_HEADERS_CACHE_SIZE` environment variable to size the
+  static-route header cache.
+
+### Fixed
+
+- The reactive `Owner` for a streaming SSR response is now cleaned up when the
+  client disconnects mid-response, not only on full stream drain — the previous
+  trailing-stream-item cleanup leaked the owner (and everything it held) on
+  early disconnect. Implemented as a local `Drop`-based stopgap over
+  `leptos_integration_utils` 0.8.8's `from_app`, with a thread-affinity guard
+  (the reactive teardown runs only on the body's origin thread; an off-thread
+  drop leaks instead of risking a cross-thread cleanup panic, mirroring the
+  `Request` wrapper). Tracks leptos-rs/leptos#4739; removed once upstream ships
+  the `Drop`-based cleanup.
+- `redirect()` and server-function content negotiation now parse the `Accept`
+  header with the `mime` crate instead of a `contains("text/html")` substring
+  test, so `text/html;q=0` (explicit refusal) and unrelated ranges that merely
+  contain the substring (e.g. `application/x-text/html-fake`) are no longer
+  treated as accepting HTML. **Behaviour change:** `Accept: text/html;q=0` now
+  takes the non-HTML path. Mirrors the same fix in `leptos_axum` / `leptos_actix`.
+- `SsrMode::Static` 404 responses set the `404` status explicitly on the
+  rendered-error path rather than relying on the captured `ResponseOptions` to
+  carry it (an app-set status still overrides). Defensive — already correct in
+  practice.
+
 ## [0.4.2] - 2026-05-30
 
 ### Fixed
