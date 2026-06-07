@@ -155,10 +155,29 @@ impl ExtendResponse for NtexResponse {
     fn set_default_content_type(&mut self, content_type: &str) {
         let headers = self.0.headers_mut();
         if !headers.contains_key(header::CONTENT_TYPE) {
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(content_type).unwrap(),
-            );
+            // `content_type` is a `&str`, so it may not be a valid header value
+            // (e.g. an embedded NUL byte). Skip the header rather than
+            // unwrapping, which would panic and take down the worker — the same
+            // degrade-gracefully posture as `redirect()` below, and the same
+            // fix shipped for `leptos_actix` / `leptos_axum`
+            // (leptos-rs/leptos#4755). The sole in-crate caller passes a
+            // literal, so this is defensive, but it removes the foot-gun for
+            // any future dynamic caller.
+            match HeaderValue::from_str(content_type) {
+                Ok(value) => {
+                    headers.insert(header::CONTENT_TYPE, value);
+                }
+                Err(_) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        "skipped default Content-Type: {content_type:?} is not a valid header value"
+                    );
+                    #[cfg(not(feature = "tracing"))]
+                    eprintln!(
+                        "skipped default Content-Type: {content_type:?} is not a valid header value"
+                    );
+                }
+            }
         }
     }
 
@@ -610,6 +629,61 @@ mod tests {
             when the_body_is_dropped_off_its_origin_thread {
                 let drop_site = DropSite::OffOriginThread;
                 to skips_reactive_cleanup_and_leaks_instead_of_panicking { be_false }
+            }
+        }
+    }
+
+    // ----- set_default_content_type: set valid, skip invalid ------------
+    // The default content type is applied only when none is set yet, from a
+    // `&str` that may not be a valid header value. A valid value is inserted;
+    // an invalid one (embedded NUL) must be skipped, NOT unwrapped — the
+    // unwrap would panic the worker. Observe the resulting CONTENT_TYPE.
+    // The invalid value's NUL is built at runtime here rather than written as
+    // a `"\0"` literal in the `lets_expect!` body below: a NUL token in the
+    // macro input trips rust-analyzer's proc-macro server (real rustc compiles
+    // it fine), so keeping it out preserves the IDE experience.
+    fn content_type_after_default(preset: Option<&str>, valid: bool) -> Option<String> {
+        let mut builder = HttpResponse::Ok();
+        if let Some(content_type) = preset {
+            builder.content_type(content_type);
+        }
+        let mut res = NtexResponse(builder.finish());
+        let value = if valid {
+            "text/html; charset=utf-8".to_string()
+        } else {
+            format!("text/html{}bad", '\0')
+        };
+        res.set_default_content_type(&value);
+        res.0
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    lets_expect! {
+        expect(content_type_after_default(preset, valid)) {
+            // default: nothing set yet, a valid value -> it is applied
+            let preset: Option<&str> = None;
+            let valid = true;
+
+            to sets_the_default_when_none_is_present {
+                equal(Some("text/html; charset=utf-8".to_string()))
+            }
+
+            when the_value_is_not_a_valid_header_value {
+                let valid = false;
+                to skips_the_header_instead_of_panicking { be_none }
+            }
+
+            // The guard short-circuits before parsing, so an app-set content
+            // type must survive regardless of the default's validity — the
+            // method only fills in a *missing* one.
+            when a_content_type_is_already_present {
+                let preset = Some("application/json");
+                to leaves_the_existing_content_type_unchanged {
+                    equal(Some("application/json".to_string()))
+                }
             }
         }
     }

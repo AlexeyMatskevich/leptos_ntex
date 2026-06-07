@@ -30,7 +30,10 @@ use std::{
     io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{LazyLock, RwLock},
+    sync::{
+        LazyLock, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::render::{async_stream_builder, provide_contexts};
@@ -150,14 +153,16 @@ impl StaticRouteGenerator {
 }
 
 /// Per-process cache of [`ResponseOptions`] captured when a static route
-/// is first rendered, keyed by the URL path. Read on cache hits to replay
-/// the original status/headers alongside the on-disk HTML.
+/// is first rendered, keyed by the resolved on-disk file path (via
+/// [`static_header_key`]) so aliased URLs that normalize to the same `.html`
+/// — e.g. `/blog/` and `/blog/index` — share one entry. Read on cache hits to
+/// replay the original status/headers alongside the on-disk HTML.
 ///
-/// ⚠ **Scope is the entire process.** If an application hosts multiple
-/// [`LeptosOptions`] with overlapping route paths (e.g. two sites that
-/// both expose `/index.html`), entries collide — the last writer wins.
-/// Mirrors `leptos_actix` behaviour; in practice apps run a single
-/// `LeptosOptions` instance per process and the collision is theoretical.
+/// ⚠ **Scope is the entire process.** The key includes the `site_root`, so
+/// distinct [`LeptosOptions`] with different roots do not collide; two
+/// instances sharing a `site_root` and route path still would — the last
+/// writer wins. Mirrors `leptos_actix` behaviour; in practice apps run a
+/// single `LeptosOptions` instance per process and the collision is theoretical.
 ///
 /// ⚠ **The captured status/headers are not durable; the HTML body is.**
 /// The rendered page is written to disk, but the [`ResponseOptions`]
@@ -287,6 +292,111 @@ fn validate_static_file(root: &Path, file_path: &Path) -> Option<PathBuf> {
         .then_some(canon_target)
 }
 
+/// Process-local counter that makes each atomic-write temp file name unique
+/// without a high-resolution clock (a nanosecond timestamp can collide under
+/// parallelism — see the temp-path flakiness fixed in this crate's tests).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `contents` to `file_path` by writing a sibling temp file
+/// in the same directory and renaming it over the target.
+///
+/// A plain `fs::write` truncates the target and then writes, so a crash or a
+/// concurrent reader mid-write can observe a truncated or empty file — and the
+/// serve path only checks that the file *exists* (`NamedFile::open`), not that
+/// it is intact, so it would happily serve the partial. `rename(2)` within a
+/// directory is atomic on the same filesystem, so a reader sees either the old
+/// file or the fully-written new one, never a partial.
+///
+/// `leptos-rs/leptos#4755` ships this as `leptos_integration_utils::
+/// write_file_atomic` (behind an `fs` feature), but it is not in the published
+/// `leptos_integration_utils` 0.8.8 this crate depends on, so this is a local
+/// equivalent. Mirrors the atomic-write fix in `leptos_actix` / `leptos_axum`.
+///
+/// The parent directory is assumed to already exist (the caller runs
+/// [`validate_static_parent`] first); the temp file is created alongside the
+/// target so the rename stays on one filesystem.
+fn write_file_atomic(file_path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "static path has no parent"))?;
+    let file_name = file_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Dot-prefixed so it is hidden from naive listings and would be rejected by
+    // the dotfile guard if ever requested; pid + counter keep it collision-free
+    // across concurrent writers.
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    // RAII: remove the temp on any early return OR panic between here and a
+    // successful rename, so a failed or interrupted write never leaks a scratch
+    // file into the served directory. `fs::rename` consumes the temp on
+    // success, after which the guard is disarmed (nothing left to remove).
+    let mut guard = TempFileGuard {
+        path: Some(tmp_path.clone()),
+    };
+    fs::write(&tmp_path, contents)?;
+    fs::rename(&tmp_path, file_path)?;
+    guard.disarm();
+    Ok(())
+}
+
+/// Removes its temp file on drop unless [disarmed](TempFileGuard::disarm), so a
+/// failed or panicking [`write_file_atomic`] leaves no scratch file behind —
+/// including if the surrounding blocking task unwinds mid-write.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Number of stripes for the static-route write lock.
+const STATIC_WRITE_STRIPES: usize = 32;
+
+/// Striped write locks serializing concurrent regenerations of the SAME static
+/// path, so its on-disk file and the [`STATIC_HEADERS`] snapshot captured for
+/// it always come from one render (closing the file/headers desync a per-path
+/// race could otherwise leave). A FIXED set of mutexes — NOT a per-path map,
+/// which would reintroduce exactly the unbounded growth the `STATIC_HEADERS`
+/// LRU bounds. Distinct paths may share a stripe; that only serializes two
+/// unrelated writes occasionally (harmless) and never corrupts.
+static STATIC_WRITE_LOCKS: LazyLock<[Mutex<()>; STATIC_WRITE_STRIPES]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+
+/// Returns the write stripe for an on-disk `file_path` (same resolved file →
+/// same stripe). Keyed on the *resolved* path rather than the request URL, so
+/// aliased URLs that [`static_path`] normalizes to the same `.html` (e.g.
+/// `/x/` and `/x/index`) serialize against each other instead of racing on the
+/// one file they share.
+fn static_write_lock(file_path: &Path) -> &'static Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file_path.hash(&mut hasher);
+    &STATIC_WRITE_LOCKS[(hasher.finish() as usize) % STATIC_WRITE_STRIPES]
+}
+
+/// The [`STATIC_HEADERS`] key for a resolved on-disk file. Keyed on the
+/// resolved path (which two aliased URLs normalizing to the same `.html`
+/// share), NOT the request URL, so the write and serve sides agree and aliases
+/// resolve to one entry. Both sides MUST derive the key through this helper —
+/// hence it exists rather than inlining the conversion twice.
+fn static_header_key(file_path: &Path) -> String {
+    file_path.to_string_lossy().into_owned()
+}
+
 async fn write_static_route(
     options: &LeptosOptions,
     response_options: Option<ResponseOptions>,
@@ -299,19 +409,31 @@ async fn write_static_route(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid static route path"))?;
     let root = PathBuf::from(&*options.site_root);
     ntex::rt::spawn_blocking(move || {
+        // Hold the per-file stripe across BOTH the atomic rename and the header
+        // snapshot `put`, so two concurrent regenerations writing the same file
+        // cannot interleave rename and cache update. The stripe AND the cache
+        // key are both keyed on the resolved `file_path` (not the URL), so
+        // aliased URLs that normalize to one `.html` serialize and share a
+        // single cache entry. A sync lock on the blocking thread — it never
+        // crosses an await (the ntex worker has already offloaded here).
+        // Recover from a poisoned stripe rather than `or_poisoned`'s panic: the
+        // mutex guards `()`, so a prior panicking holder leaves no inconsistent
+        // state and must not cascade into later writers.
+        let _write_guard = static_write_lock(&file_path)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_static_parent(&root, &file_path)?;
-        fs::write(file_path, html)?;
+        write_file_atomic(&file_path, html.as_bytes())?;
+        if let Some(snapshot) = snapshot {
+            STATIC_HEADERS
+                .write()
+                .or_poisoned()
+                .put(static_header_key(&file_path), snapshot);
+        }
         Ok::<(), io::Error>(())
     })
     .await
     .map_err(io::Error::other)??;
-
-    if let Some(snapshot) = snapshot {
-        STATIC_HEADERS
-            .write()
-            .or_poisoned()
-            .put(path.to_string(), snapshot);
-    }
 
     Ok(())
 }
@@ -403,10 +525,13 @@ where
                 (response_options, html, reopened)
             } else {
                 // `LruCache::get` updates recency, so it needs a write lock.
+                // Key on the resolved file (matching the write side), so an
+                // alias of the URL that produced this `.html` still finds the
+                // captured headers.
                 let headers = STATIC_HEADERS
                     .write()
                     .or_poisoned()
-                    .get(&orig_path)
+                    .get(&static_header_key(&path_buf))
                     .cloned();
                 (headers, None, opened)
             };
@@ -631,5 +756,103 @@ mod tests {
         ) as the_most_recently_inserted_entry {
             to is_retained { be_true }
         }
+    }
+
+    // ----- write_file_atomic: full write, atomic replace, no temp leak --
+    // A static page must be written atomically: the target appears with its
+    // full contents or not at all, an overwrite fully replaces, and no scratch
+    // temp file is left in the served directory. An in-place `fs::write`
+    // truncates first, so a crash or a concurrent reader mid-write could
+    // observe an empty/partial file (the serve path checks existence, not
+    // integrity). The unique temp dir is keyed on pid + a process-local
+    // counter — NOT a nanosecond clock, which collides under parallel runs.
+    #[test]
+    fn write_file_atomic_replaces_fully_and_leaves_no_temp() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("leptos_ntex_atomic_{}_{seq}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("page.html");
+
+        let first: &[u8] = b"<html><body>hello</body></html>";
+        write_file_atomic(&target, first).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), first);
+
+        // an overwrite atomically replaces the contents in place
+        let second: &[u8] = b"<html><body>updated and rather longer</body></html>";
+        write_file_atomic(&target, second).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), second);
+
+        // no `.tmp.` scratch file is left behind in the served directory
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // The Err path + `TempFileGuard` cleanup — the point of the guard: when the
+    // rename fails *after* the temp is written, `write_file_atomic` must return
+    // `Err` AND leave no scratch temp behind. A deterministic rename failure is
+    // forced by making the target an existing directory (`rename(file, dir)`
+    // fails with EISDIR), so the temp exists before the failure and the guard's
+    // `Drop` is what must remove it.
+    #[test]
+    fn write_file_atomic_on_failure_returns_err_and_cleans_temp() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "leptos_ntex_atomic_fail_{}_{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // target is a directory -> the rename of the temp over it fails
+        let target = dir.join("page.html");
+        fs::create_dir_all(&target).unwrap();
+
+        assert!(write_file_atomic(&target, b"<html></html>").is_err());
+
+        // the guard removed the temp -> no `.tmp.` scratch file remains
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+        // and the target was left untouched
+        assert!(target.is_dir());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // The write stripe and the `STATIC_HEADERS` key are both keyed on the
+    // resolved file, not the request URL — so two *aliased* URLs that normalize
+    // to the same `.html` (`/blog/` and `/blog/index`) serialize against each
+    // other AND share one cache entry (no file/header desync across aliases).
+    // Distinct files MAY still share a stripe (harmless false contention), so
+    // we deliberately do not assert they differ.
+    #[test]
+    fn aliased_urls_share_one_stripe_and_cache_entry() {
+        let opts = options();
+
+        // stripe is stable for a given resolved file
+        let direct = static_path(&opts, "/blog/post-1").unwrap();
+        assert!(std::ptr::eq(
+            static_write_lock(&direct),
+            static_write_lock(&direct),
+        ));
+
+        // aliased URLs -> same resolved file -> same stripe AND same cache key
+        let via_slash = static_path(&opts, "/blog/").unwrap();
+        let via_index = static_path(&opts, "/blog/index").unwrap();
+        assert_eq!(via_slash, via_index);
+        assert!(std::ptr::eq(
+            static_write_lock(&via_slash),
+            static_write_lock(&via_index),
+        ));
+        assert_eq!(static_header_key(&via_slash), static_header_key(&via_index));
     }
 }

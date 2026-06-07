@@ -64,6 +64,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rendered-error path rather than relying on the captured `ResponseOptions` to
   carry it (an app-set status still overrides). Defensive — already correct in
   practice.
+- The default `Content-Type` header is no longer set via
+  `HeaderValue::from_str(..).unwrap()`: a content type that is not a valid
+  header value (e.g. an embedded NUL byte) is now skipped with a warning instead
+  of panicking the worker. The sole in-crate caller passes a literal, so this is
+  defensive, but it removes the foot-gun and mirrors the same hardening in
+  `leptos_actix` / `leptos_axum` (leptos-rs/leptos#4755).
+- `SsrMode::Static` pages are now written to disk atomically — to a sibling
+  temp file, then `rename`d over the target — instead of an in-place `fs::write`
+  that truncates first. A crash or a concurrent reader mid-write could otherwise
+  observe a truncated or empty `.html`, which the serve path (checking only that
+  the file exists, not that it is intact) would then serve. Mirrors the
+  atomic-write fix in `leptos_actix` / `leptos_axum`; upstream adds a
+  `leptos_integration_utils::write_file_atomic` for this (leptos-rs/leptos#4755),
+  not yet in the published 0.8.8, so this ships as a local equivalent. The temp
+  file is removed on any failure or panic (an RAII guard), and concurrent
+  regenerations of the *same* path are serialized by a fixed, bounded set of
+  striped locks — so two concurrent regenerations of a path can't persist a
+  mismatched file/header pair, without reintroducing a per-path map that could
+  grow without bound.
+- An unknown future `SsrMode` variant (the type is `#[non_exhaustive]`) is now
+  served as a logged `500 Internal Server Error` instead of being silently
+  rendered as out-of-order. **Behaviour change:** a route whose SSR mode this
+  integration cannot render now fails loud rather than degrading to the
+  out-of-order streamer. No current mode is affected —
+  `OutOfOrder`/`InOrder`/`Async`/`PartiallyBlocked`/`Static` all have dedicated
+  handling; only a variant added by a future `leptos_router` would hit this.
+  Mirrors `leptos_actix` (leptos-rs/leptos#4755).
 
 ## [0.4.2] - 2026-05-30
 

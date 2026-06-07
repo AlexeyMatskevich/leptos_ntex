@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use crate::render::{
     render_app_async_with_context, render_app_to_stream_in_order_with_context,
     render_app_to_stream_with_context, render_app_to_stream_with_context_and_replace_blocks,
+    unsupported_ssr_mode_route,
 };
 use crate::routes::NtexRouteListing;
 use crate::server_fn::handlers::handle_specific_server_fn_with_context;
@@ -148,22 +149,12 @@ where
                                 app_fn.clone(),
                                 method,
                             ),
-                            // `SsrMode` is `#[non_exhaustive]`; fall
-                            // back to the out-of-order stream renderer
-                            // for any future variant so we never panic
-                            // at runtime if Leptos adds a new mode.
-                            _ => {
-                                #[cfg(feature = "tracing")]
-                                tracing::warn!(
-                                    "unknown SsrMode {:?}, falling back to OutOfOrder",
-                                    mode
-                                );
-                                render_app_to_stream_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                )
-                            }
+                            // `SsrMode` is `#[non_exhaustive]`; serve a typed
+                            // 500 for any future variant this integration does
+                            // not know how to render, rather than silently
+                            // mis-rendering it as OutOfOrder or panicking the
+                            // worker. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
+                            ref mode => unsupported_ssr_mode_route(method, mode),
                         },
                     )
                 };
@@ -269,22 +260,12 @@ where
                                 app_fn.clone(),
                                 method,
                             ),
-                            // `SsrMode` is `#[non_exhaustive]`; fall
-                            // back to the out-of-order stream renderer
-                            // for any future variant so we never panic
-                            // at runtime if Leptos adds a new mode.
-                            _ => {
-                                #[cfg(feature = "tracing")]
-                                tracing::warn!(
-                                    "unknown SsrMode {:?}, falling back to OutOfOrder",
-                                    mode
-                                );
-                                render_app_to_stream_with_context(
-                                    additional_context_and_method.clone(),
-                                    app_fn.clone(),
-                                    method,
-                                )
-                            }
+                            // `SsrMode` is `#[non_exhaustive]`; serve a typed
+                            // 500 for any future variant this integration does
+                            // not know how to render, rather than silently
+                            // mis-rendering it as OutOfOrder or panicking the
+                            // worker. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
+                            ref mode => unsupported_ssr_mode_route(method, mode),
                         },
                     );
                 }

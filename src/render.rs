@@ -8,7 +8,7 @@ use futures::{StreamExt, stream::once};
 use leptos::{IntoView, context::provide_context, hydration::IslandsRouterNavigation};
 use leptos_integration_utils::{BoxedFnOnce, ExtendResponse, PinnedFuture, PinnedStream};
 use leptos_meta::ServerMetaContext;
-use leptos_router::{Method, components::provide_server_redirect, location::RequestUrl};
+use leptos_router::{Method, SsrMode, components::provide_server_redirect, location::RequestUrl};
 use ntex::web::{ErrorRenderer, HttpRequest, HttpResponse, Route};
 use send_wrapper::SendWrapper;
 
@@ -67,6 +67,41 @@ pub(crate) fn ntex_method(method: Method) -> ntex::http::Method {
         Method::Delete => ntex::http::Method::DELETE,
         Method::Patch => ntex::http::Method::PATCH,
     }
+}
+
+/// Builds an ntex [`Route`] that serves `500 Internal Server Error` for an
+/// [`SsrMode`] this integration does not know how to render.
+///
+/// [`SsrMode`] is `#[non_exhaustive]`, so the rendering `match` in
+/// [`LeptosRoutes`](crate::LeptosRoutes) needs a catch-all arm. Rather than
+/// silently rendering an unknown future variant as out-of-order — which could
+/// emit subtly wrong output — or panicking the worker with `unreachable!()`,
+/// log and serve a typed 500. Mirrors `unsupported_ssr_mode_route` in
+/// `leptos_actix` (leptos-rs/leptos#4755).
+///
+/// HEAD is bound alongside GET (as the render routes are, via the
+/// AND-combining-`.method()` caveat documented in [`handle_response`]), so a
+/// HEAD to such a route also 500s rather than 404ing — a small, intentional
+/// divergence from the PR's GET-only registration that keeps HEAD handling
+/// uniform across this integration.
+pub(crate) fn unsupported_ssr_mode_route<Err>(method: Method, mode: &SsrMode) -> Route<Err>
+where
+    Err: ErrorRenderer,
+{
+    #[cfg(feature = "tracing")]
+    tracing::error!("unsupported SSR mode {mode:?} for this route; serving 500");
+    #[cfg(not(feature = "tracing"))]
+    eprintln!("unsupported SSR mode {mode:?} for this route; serving 500");
+
+    let route = Route::<Err>::new();
+    let route = if matches!(method, Method::Get) {
+        route.guard(ntex::web::guard::Any(ntex::web::guard::Get()).or(ntex::web::guard::Head()))
+    } else {
+        route.method(ntex_method(method))
+    };
+    route.to(|| async {
+        HttpResponse::InternalServerError().body("This rendering mode is not supported.")
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -355,4 +390,64 @@ where
     IV: IntoView + 'static,
 {
     handle_response(method, additional_context, app_fn, async_stream_builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ntex::http::StatusCode;
+    use ntex::web::{App, test};
+
+    // A future `SsrMode` this integration cannot render must serve a typed 500
+    // — not panic the worker via `unreachable!()`, and not silently mis-render
+    // as OutOfOrder. `SsrMode::Async` stands in for "a variant the dispatch's
+    // dedicated arms don't handle"; the route this helper builds is the
+    // catch-all a new `#[non_exhaustive]` variant falls through to. Mirrors
+    // `leptos_actix` (leptos-rs/leptos#4755).
+    #[ntex::test]
+    async fn unsupported_ssr_mode_serves_500() {
+        let app = test::init_service(App::new().route(
+            "/",
+            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
+        ))
+        .await;
+
+        let req = test::TestRequest::get().uri("/").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // HEAD must reach the same 500: the helper binds GET+HEAD for a `Method::Get`
+    // route (an intentional divergence from the PR's GET-only registration), so
+    // a HEAD must not fall through to 404/405. Pins that divergence.
+    #[ntex::test]
+    async fn unsupported_ssr_mode_serves_500_for_head() {
+        let app = test::init_service(App::new().route(
+            "/",
+            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
+        ))
+        .await;
+
+        let req = test::TestRequest::default()
+            .method(ntex::http::Method::HEAD)
+            .uri("/")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // A non-GET route exercises the other branch (`.method(ntex_method(method))`)
+    // and must serve the 500 on its own method.
+    #[ntex::test]
+    async fn unsupported_ssr_mode_serves_500_for_non_get_method() {
+        let app = test::init_service(App::new().route(
+            "/",
+            unsupported_ssr_mode_route(Method::Post, &SsrMode::Async),
+        ))
+        .await;
+
+        let req = test::TestRequest::post().uri("/").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
