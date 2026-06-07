@@ -231,6 +231,7 @@ mod tests {
         register_leptos_routes,
     };
     use leptos::config::LeptosOptions;
+    use lets_expect::lets_expect;
     use ntex::http::{StatusCode, header};
     use ntex::web::ws;
     use ntex::web::{App as NtexApp, test};
@@ -272,68 +273,164 @@ mod tests {
         std::env::temp_dir().join(format!("leptos_ntex_{name}_{nonce}"))
     }
 
-    #[test]
-    fn server_fn_config_builder_sets_expected_values() {
-        let config = crate::LeptosServerFnConfig::new()
-            .with_payload_limit(4096)
-            .with_ws_channel_buffer(32)
-            .with_ws_subprotocol("graphql-ws");
+    // ----- LeptosServerFnConfig builder: exhaustive spec ----------------
+    // Object-interface spec for the const builder. The behavioural content
+    // the old single-case test missed: each setter overrides ONLY its own
+    // field (leaving the siblings at the crate defaults), and `Default`
+    // agrees with `new()`. `LeptosServerFnConfig` derives no `PartialEq`,
+    // so each field is asserted individually via `have(...)`.
+    lets_expect! {
+        expect(config) as the_server_fn_config {
+            let config = crate::LeptosServerFnConfig::new();
 
-        assert_eq!(config.payload_limit, 4096);
-        assert_eq!(config.ws_channel_buffer, 32);
-        assert_eq!(config.ws_subprotocol, Some("graphql-ws"));
+            to starts_from_the_crate_defaults {
+                have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
+                have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                have(ws_subprotocol) be_none,
+            }
+
+            when built_through_the_default_trait {
+                let config = crate::LeptosServerFnConfig::default();
+                to matches_new {
+                    have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
+                    have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                    have(ws_subprotocol) be_none,
+                }
+            }
+
+            when only_the_payload_limit_is_overridden {
+                let config = crate::LeptosServerFnConfig::new().with_payload_limit(4096);
+                to changes_the_payload_limit_alone {
+                    have(payload_limit) equal(4096),
+                    have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                    have(ws_subprotocol) be_none,
+                }
+            }
+
+            when only_the_ws_channel_buffer_is_overridden {
+                let config = crate::LeptosServerFnConfig::new().with_ws_channel_buffer(32);
+                to changes_the_channel_buffer_alone {
+                    have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
+                    have(ws_channel_buffer) equal(32),
+                    have(ws_subprotocol) be_none,
+                }
+            }
+
+            when only_the_ws_subprotocol_is_overridden {
+                let config = crate::LeptosServerFnConfig::new().with_ws_subprotocol("graphql-ws");
+                to changes_the_subprotocol_alone {
+                    have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
+                    have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                    have(ws_subprotocol) equal(Some("graphql-ws")),
+                }
+            }
+
+            when every_field_is_overridden {
+                let config = crate::LeptosServerFnConfig::new()
+                    .with_payload_limit(4096)
+                    .with_ws_channel_buffer(32)
+                    .with_ws_subprotocol("graphql-ws");
+                to applies_all_three_overrides {
+                    have(payload_limit) equal(4096),
+                    have(ws_channel_buffer) equal(32),
+                    have(ws_subprotocol) equal(Some("graphql-ws")),
+                }
+            }
+        }
     }
 
-    #[test]
-    fn singleton_response_headers_replace_existing_values() {
+    // ----- NtexResponse::extend_response_parts header merge: exhaustive -
+    // When merging captured `ResponseParts` into the response, a *singleton*
+    // header (the `should_replace_header` set — Cache-Control, Location,
+    // ETag, …, here represented by Cache-Control) must REPLACE any existing
+    // value, while a multi-value header (e.g. Set-Cookie) must APPEND,
+    // keeping both. The old test covered only the replace direction; the
+    // append direction was the missing negative. The assertion pins the
+    // exact resulting value vector, not mere presence.
+    fn reconcile_header(key: header::HeaderName, existing: &str, incoming: &str) -> Vec<String> {
         let mut response = crate::response::NtexResponse(
             ntex::web::HttpResponse::Ok()
-                .header(header::CACHE_CONTROL, "public, max-age=60")
-                .header(header::EXPIRES, "Wed, 21 Oct 2015 07:28:00 GMT")
-                .header(header::CONTENT_DISPOSITION, "inline")
+                .header(key.clone(), existing)
                 .finish(),
         );
         let mut parts = crate::ResponseParts::default();
         parts.append_header(
-            header::CACHE_CONTROL,
-            ntex::http::header::HeaderValue::from_static("no-store"),
+            key.clone(),
+            header::HeaderValue::from_str(incoming).unwrap(),
         );
-        parts.append_header(
-            header::CONTENT_DISPOSITION,
-            ntex::http::header::HeaderValue::from_static("attachment"),
-        );
-        parts.append_header(
-            header::EXPIRES,
-            ntex::http::header::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
-        );
-
         response.extend_response_parts(parts);
-        let response = response.take();
+        response
+            .take()
+            .headers()
+            .get_all(key)
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect()
+    }
 
-        assert_eq!(
-            response
-                .headers()
-                .get_all(header::CACHE_CONTROL)
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>(),
-            vec!["no-store"]
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get_all(header::CONTENT_DISPOSITION)
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>(),
-            vec!["attachment"]
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get_all(header::EXPIRES)
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>(),
-            vec!["Thu, 01 Jan 1970 00:00:00 GMT"]
-        );
+    lets_expect! {
+        expect(reconcile_header(key, existing, incoming)) as the_reconciled_header {
+            let key = header::CACHE_CONTROL;
+            let existing = "public, max-age=60";
+            let incoming = "no-store";
+
+            to replaces_the_previous_singleton_value { equal(vec!["no-store".to_string()]) }
+
+            // Pin the other singleton match arms the original test covered, so
+            // a regression deleting only `EXPIRES` or `CONTENT_DISPOSITION`
+            // from `should_replace_header` is still caught (each is a distinct
+            // arm — not subsumed by the Cache-Control representative).
+            when the_singleton_header_is_expires {
+                let key = header::EXPIRES;
+                let existing = "Wed, 21 Oct 2015 07:28:00 GMT";
+                let incoming = "Thu, 01 Jan 1970 00:00:00 GMT";
+                to replaces_the_previous_value {
+                    equal(vec!["Thu, 01 Jan 1970 00:00:00 GMT".to_string()])
+                }
+            }
+
+            when the_singleton_header_is_content_disposition {
+                let key = header::CONTENT_DISPOSITION;
+                let existing = "inline";
+                let incoming = "attachment";
+                to replaces_the_previous_value { equal(vec!["attachment".to_string()]) }
+            }
+
+            when the_header_permits_multiple_values {
+                let key = header::SET_COOKIE;
+                let existing = "session=abc";
+                let incoming = "theme=dark";
+                to appends_and_keeps_both_values {
+                    equal(vec!["session=abc".to_string(), "theme=dark".to_string()])
+                }
+            }
+        }
+    }
+
+    // ----- extend_response_parts status override: exhaustive spec -------
+    // A captured `Some(status)` overrides the response status; `None` leaves
+    // it untouched. The old test exercised neither.
+    fn status_after_extend(override_status: Option<StatusCode>) -> StatusCode {
+        let mut response = crate::response::NtexResponse(ntex::web::HttpResponse::Ok().finish());
+        let parts = crate::ResponseParts {
+            status: override_status,
+            ..Default::default()
+        };
+        response.extend_response_parts(parts);
+        response.take().status()
+    }
+
+    lets_expect! {
+        expect(status_after_extend(override_status)) as the_extended_status {
+            let override_status: Option<StatusCode> = None;
+
+            to leaves_the_existing_status_unchanged { equal(StatusCode::OK) }
+
+            when a_status_override_is_present {
+                let override_status = Some(StatusCode::CREATED);
+                to applies_the_overridden_status { equal(StatusCode::CREATED) }
+            }
+        }
     }
 
     #[ntex::test]
@@ -343,7 +440,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(|cfg| {
                     register_leptos_routes(cfg, routes.clone(), unit_shell);
                 }),
@@ -366,7 +463,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(|cfg| {
                     register_leptos_routes(cfg, routes.clone(), unit_shell);
                 }),
@@ -389,7 +486,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(|cfg| {
                     register_leptos_routes(cfg, routes.clone(), unit_shell);
                 }),
@@ -418,7 +515,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(|cfg| {
                     register_leptos_routes(cfg, routes.clone(), unit_shell);
                 }),
@@ -448,7 +545,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(|cfg| {
                     register_leptos_routes(cfg, routes.clone(), unit_shell);
                 }),
@@ -530,7 +627,7 @@ mod tests {
     async fn server_fn_html_form_falls_back_to_same_origin_referrer() {
         register_explicit::<EchoName>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(EchoName::PATH)
@@ -553,7 +650,7 @@ mod tests {
     async fn server_fn_html_form_does_not_fallback_to_different_port_referrer() {
         register_explicit::<EchoName>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(EchoName::PATH)
@@ -573,7 +670,7 @@ mod tests {
     async fn server_fn_html_form_does_not_fallback_to_protocol_relative_referrer() {
         register_explicit::<EchoName>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(EchoName::PATH)
@@ -593,7 +690,7 @@ mod tests {
     async fn server_fn_html_form_does_not_fallback_to_different_scheme_referrer() {
         register_explicit::<EchoName>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(EchoName::PATH)
@@ -617,8 +714,7 @@ mod tests {
         register_explicit::<EchoWebsocket>();
 
         let srv =
-            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
-                .await;
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -649,8 +745,7 @@ mod tests {
         register_explicit::<EchoWebsocket>();
 
         let srv =
-            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
-                .await;
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -706,7 +801,7 @@ mod tests {
                     ws_channel_buffer: 16,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
         })
         .await;
 
@@ -756,7 +851,7 @@ mod tests {
                     ws_channel_buffer: 16,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
         })
         .await;
 
@@ -928,7 +1023,7 @@ mod tests {
         let routes = generate_route_list(UnitApp);
         let app = test::init_service(
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .leptos_routes(routes, unit_shell),
         )
         .await;
@@ -942,32 +1037,57 @@ mod tests {
         assert!(html.contains("Leptos over ntex"));
     }
 
+    // ----- executor one-shot initialization: regression pins -----------
+    // Two process-global, monotonic one-shot invariants. The executor state
+    // is shared across the whole test binary, so these pin *runtime
+    // independence* and a *stable result pair* (which arm is observed
+    // depends on test order and cannot be set by a `when`), not a fixed
+    // value. `any_spawner::ExecutorError` derives no `PartialEq`, so the
+    // pair is matched with `match_pattern!`, not `equal`. Manual-Red is weak
+    // for both (the code structurally avoids the failure modes) — these lock
+    // in the current invariants rather than acting as rich behavioural specs.
+
+    // A trivial app whose route walk must not require a ntex arbiter.
+    #[component]
+    fn Empty() -> impl IntoView {
+        provide_meta_context();
+        view! { <h1>"empty"</h1> }
+    }
+
     // Invariant: `ensure_executor_initialized()` must not depend on a
     // running ntex arbiter — SSG and library-mode callers invoke public
     // entry points (like `generate_route_list`) without booting a ntex
-    // runtime. A plain `#[test]` (no `#[ntex::test]`) enforces this.
-    #[test]
-    fn executor_init_is_safe_without_ntex_system() {
-        #[component]
-        fn Empty() -> impl IntoView {
-            provide_meta_context();
-            view! { <h1>"empty"</h1> }
-        }
+    // runtime. The `lets_expect!`-generated test is a plain `#[test]` (no
+    // `#[ntex::test]`), so it runs off any ntex system and enforces this.
+    fn generate_routes_without_a_ntex_runtime() {
         let _routes = crate::generate_route_list(Empty);
         let _routes2 = crate::generate_route_list(Empty);
     }
 
-    #[test]
-    fn try_init_executor_is_idempotent_and_reports_conflicts() {
-        let first = crate::try_init_executor();
-        let second = crate::try_init_executor();
-        match (first, second) {
-            (Ok(()), Ok(())) => {}
-            (
-                Err(any_spawner::ExecutorError::AlreadySet),
-                Err(any_spawner::ExecutorError::AlreadySet),
-            ) => {}
-            other => panic!("executor init result should be stable, got {other:?}"),
+    lets_expect! {
+        expect(generate_routes_without_a_ntex_runtime()) as executor_initialization {
+            to not_panic
+        }
+    }
+
+    // Invariant: `try_init_executor()` is idempotent — two consecutive calls
+    // return the same outcome (both `Ok`, or both `AlreadySet`); they can
+    // never disagree. The subject is the ATOMIC pair, because the property
+    // is a relationship between the two calls and `lets_expect` re-runs the
+    // subject once per `to` block.
+    lets_expect! {
+        expect((crate::try_init_executor(), crate::try_init_executor())) as repeated_executor_init {
+            to produces_a_stable_result_pair {
+                match_pattern!(
+                    (Ok(()), Ok(()))
+                        | (
+                            Err(any_spawner::ExecutorError::AlreadySet),
+                            Err(any_spawner::ExecutorError::AlreadySet),
+                        )
+                ),
+                not_match_pattern!((Ok(()), Err(_))),
+                not_match_pattern!((Err(_), Ok(()))),
+            }
         }
     }
 
@@ -986,7 +1106,7 @@ mod tests {
                     ws_channel_buffer: 32,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns()),
+                .route("/api/{tail}*", handle_server_fns()),
         )
         .await;
 
@@ -1021,7 +1141,7 @@ mod tests {
                     ws_channel_buffer: 32,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns()),
+                .route("/api/{tail}*", handle_server_fns()),
         )
         .await;
 
@@ -1048,7 +1168,7 @@ mod tests {
                     ws_channel_buffer: 32,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns()),
+                .route("/api/{tail}*", handle_server_fns()),
         )
         .await;
 
@@ -1070,7 +1190,7 @@ mod tests {
     async fn singleton_location_header_is_replaced_through_res_options() {
         register_explicit::<MultiLocation>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(MultiLocation::PATH)
@@ -1094,7 +1214,7 @@ mod tests {
     async fn extract_helper_reads_request_path() {
         register_explicit::<ProbePath>();
         let app =
-            test::init_service(NtexApp::new().route("/api/{tail:.*}", handle_server_fns())).await;
+            test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let req = test::TestRequest::post()
             .uri(ProbePath::PATH)
@@ -1125,7 +1245,7 @@ mod tests {
             .build();
 
         let app = test::init_service(NtexApp::new().state(options.clone()).route(
-            "/{tail:.*}",
+            "/{tail}*",
             file_and_error_handler(|_opts: LeptosOptions| {
                 view! { <h1>"Not Found Shell"</h1> }
             }),
@@ -1148,6 +1268,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&site_root);
     }
 
+    /// The catch-all must reach the handler for *nested* paths (multi-segment),
+    /// which the actix `/{tail:.*}` idiom did not in ntex — only `/{tail}*`
+    /// does. Pins: a nested asset and an RFC 8615 `.well-known/*` file are
+    /// served, while a nested dotfile stays hidden and a deep miss renders the
+    /// 404 shell.
+    #[ntex::test]
+    async fn file_and_error_handler_serves_nested_paths_and_well_known() {
+        use crate::file_and_error_handler;
+
+        let site_root = temp_site_root("nested_paths");
+        std::fs::create_dir_all(site_root.join("assets/css")).unwrap();
+        std::fs::create_dir_all(site_root.join(".well-known/acme-challenge")).unwrap();
+        std::fs::write(site_root.join("assets/css/app.css"), "body{color:red}").unwrap();
+        std::fs::write(
+            site_root.join(".well-known/acme-challenge/token"),
+            "acme-proof",
+        )
+        .unwrap();
+        std::fs::write(site_root.join(".env"), "API_KEY=secret").unwrap();
+
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_nested_paths")
+            .site_root(site_root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+
+        let app = test::init_service(NtexApp::new().state(options.clone()).route(
+            "/{tail}*",
+            file_and_error_handler(|_opts: LeptosOptions| view! { <h1>"Not Found Shell"</h1> }),
+        ))
+        .await;
+
+        // Nested static asset (2 segments) is served.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/assets/css/app.css").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "body{color:red}");
+
+        // RFC 8615 well-known asset (3 segments, leading dot) is served.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/.well-known/acme-challenge/token").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "acme-proof");
+
+        // An ordinary dotfile is still hidden (renders the 404 shell).
+        let resp =
+            test::call_service(&app, test::TestRequest::with_uri("/.env").to_request()).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("API_KEY"), "dotfile leaked: {html}");
+
+        // A nested miss falls back to the shell, not a bare router 404.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/deep/missing/page").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = test::read_body(resp).await;
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("Not Found Shell"),
+            "nested miss must reach the handler and render the shell"
+        );
+
+        let _ = std::fs::remove_dir_all(&site_root);
+    }
+
     #[ntex::test]
     async fn file_and_error_handler_file_hit_applies_context_response_options() {
         use crate::file_and_error_handler_with_context;
@@ -1163,7 +1361,7 @@ mod tests {
             .build();
 
         let app = test::init_service(NtexApp::new().state(options.clone()).route(
-            "/{tail:.*}",
+            "/{tail}*",
             file_and_error_handler_with_context(
                 || {
                     let res = use_context::<crate::ResponseOptions>()
@@ -1208,7 +1406,7 @@ mod tests {
             .build();
 
         let app = test::init_service(NtexApp::new().state(options.clone()).route(
-            "/{tail:.*}",
+            "/{tail}*",
             file_and_error_handler(|_opts: LeptosOptions| {
                 view! { <h1>"Not Found Shell"</h1> }
             }),
@@ -1297,7 +1495,7 @@ mod tests {
                 .site_pkg_dir("pkg")
                 .build();
             test::init_service(NtexApp::new().state(options).route(
-                "/{tail:.*}",
+                "/{tail}*",
                 file_and_error_handler(|_opts: LeptosOptions| {
                     view! { <h1>"Shell"</h1> }
                 }),
@@ -1621,7 +1819,7 @@ mod tests {
                     ws_channel_buffer: 32,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns()),
+                .route("/api/{tail}*", handle_server_fns()),
         )
         .await;
 
@@ -1654,7 +1852,7 @@ mod tests {
                     ws_channel_buffer: 32,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns()),
+                .route("/api/{tail}*", handle_server_fns()),
         )
         .await;
 
@@ -1691,7 +1889,7 @@ mod tests {
                     ws_channel_buffer: 16,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
         })
         .await;
 
@@ -1720,8 +1918,7 @@ mod tests {
         register_explicit::<EchoWebsocket>();
 
         let srv =
-            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
-                .await;
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -1761,7 +1958,7 @@ mod tests {
                     ws_channel_buffer: 16,
                     ..Default::default()
                 })
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
         })
         .await;
 
@@ -1789,8 +1986,7 @@ mod tests {
         register_explicit::<EchoWebsocket>();
 
         let srv =
-            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
-                .await;
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();
@@ -1826,7 +2022,7 @@ mod tests {
                     ws_channel_buffer: 16,
                     ws_subprotocol: Some("graphql-ws"),
                 })
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
         })
         .await;
 
@@ -1850,8 +2046,7 @@ mod tests {
         register_explicit::<EchoWebsocket>();
 
         let srv =
-            test::server(async || NtexApp::new().route("/api/{tail:.*}", handle_server_fns()))
-                .await;
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
         let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
         let sink = conn.sink();

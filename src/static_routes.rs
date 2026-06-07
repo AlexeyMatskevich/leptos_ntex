@@ -231,9 +231,9 @@ fn static_path(options: &LeptosOptions, path: &str) -> Option<PathBuf> {
             .decode_utf8()
             .ok()?;
         let segment = decoded.as_ref();
-        if segment == "."
-            || segment == ".."
-            || segment.starts_with('.')
+        // Blocks `.`, `..` and every dotfile, but lets the exact `.well-known`
+        // segment through (RFC 8615) — see `crate::files::is_blocked_dot_segment`.
+        if crate::files::is_blocked_dot_segment(segment)
             || segment.contains('\0')
             || segment.contains('/')
             || segment.contains('\\')
@@ -253,7 +253,8 @@ fn static_path(options: &LeptosOptions, path: &str) -> Option<PathBuf> {
     if !rel.components().all(|component| {
         matches!(
             component,
-            std::path::Component::Normal(part) if !part.to_string_lossy().starts_with('.')
+            std::path::Component::Normal(part)
+                if !crate::files::is_blocked_dot_segment(&part.to_string_lossy())
         )
     }) {
         return None;
@@ -449,44 +450,186 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lets_expect::lets_expect;
+
+    const TEST_SITE_ROOT: &str = "/tmp/leptos_ntex_static_path_test";
 
     fn options() -> LeptosOptions {
         LeptosOptions::builder()
             .output_name("leptos_ntex_static_path_test")
-            .site_root("/tmp/leptos_ntex_static_path_test")
+            .site_root(TEST_SITE_ROOT)
             .site_pkg_dir("pkg")
             .build()
     }
 
-    #[test]
-    fn static_path_rejects_parent_segments() {
-        let options = options();
-        assert!(static_path(&options, "/static/../outside").is_none());
-        assert!(static_path(&options, "/static/%2e%2e/outside").is_none());
+    /// The on-disk path `static_path` is expected to resolve `rel` to, under
+    /// the test `site_root`. `static_path` is pure (no filesystem access), so
+    /// the directory need not exist for these assertions.
+    fn under_site_root(rel: &str) -> Option<PathBuf> {
+        Some(Path::new(TEST_SITE_ROOT).join(rel))
     }
 
-    #[test]
-    fn static_path_rejects_encoded_separators_and_dotfiles() {
-        let options = options();
-        assert!(static_path(&options, "/static/subdir%2F.env").is_none());
-        assert!(static_path(&options, "/static/.env").is_none());
+    // ----- static_path: exhaustive spec --------------------------------
+    // A pure URL-path -> on-disk-path resolver with two jobs: resolve the
+    // happy path (append `.html`; map `/`, the empty path and trailing
+    // slashes to `index.html`) and REJECT every traversal / dotfile /
+    // smuggling shape. The old tests asserted only rejection (`None`); all
+    // eight `Some` leaves below — the `.html` suffixing and the index
+    // resolution — were previously unpinned, so a regression dropping
+    // `.html` or mangling the join would not have been caught.
+    lets_expect! {
+        expect(static_path(&options(), path)) as the_resolved_static_path {
+            let path = "/about";
+
+            to resolves_to_the_html_file { equal(under_site_root("about.html")) }
+
+            when the_path_is_the_site_root {
+                let path = "/";
+                to resolves_to_the_index_file { equal(under_site_root("index.html")) }
+            }
+
+            when the_path_is_empty {
+                let path = "";
+                to resolves_to_the_index_file { equal(under_site_root("index.html")) }
+            }
+
+            when the_path_has_a_trailing_slash {
+                let path = "/blog/";
+                to resolves_to_a_nested_index_file { equal(under_site_root("blog/index.html")) }
+            }
+
+            when the_path_has_redundant_leading_slashes {
+                let path = "//about";
+                to collapses_them_and_resolves_the_html_file {
+                    equal(under_site_root("about.html"))
+                }
+            }
+
+            when the_path_is_nested {
+                let path = "/blog/post-1";
+                to resolves_to_the_nested_html_file {
+                    equal(under_site_root("blog/post-1.html"))
+                }
+            }
+
+            when a_segment_is_percent_encoded {
+                let path = "/foo%20bar";
+                to decodes_the_segment_before_resolving { equal(under_site_root("foo bar.html")) }
+            }
+
+            when a_segment_decodes_to_non_ascii_utf8 {
+                let path = "/r%C3%A9sum%C3%A9";
+                to decodes_the_utf8_segment { equal(under_site_root("résumé.html")) }
+            }
+
+            when a_segment_is_the_current_directory {
+                let path = "/sub/./x";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_is_a_parent_traversal {
+                let path = "/static/../outside";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_is_an_encoded_parent_traversal {
+                let path = "/static/%2e%2e/outside";
+                to is_rejected { be_none }
+            }
+
+            when an_encoded_parent_traversal_is_uppercase {
+                let path = "/a/%2E%2E/b";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_is_a_dotfile {
+                let path = "/static/.env";
+                to is_rejected { be_none }
+            }
+
+            // RFC 8615: the exact `.well-known` segment is exempted from the
+            // dotfile guard (in both this resolver and the file fallback's
+            // `safe_subpath`), so ACME challenges / security.txt resolve. The
+            // exemption is narrow — see the two rejection leaves below.
+            when the_path_is_a_well_known_uri {
+                let path = "/.well-known/acme-challenge/token";
+                to resolves_under_well_known {
+                    equal(under_site_root(".well-known/acme-challenge/token.html"))
+                }
+            }
+
+            when a_dotfile_is_nested_inside_well_known {
+                let path = "/.well-known/.secret";
+                to is_still_rejected { be_none }
+            }
+
+            when a_traversal_hides_behind_well_known {
+                let path = "/.well-known/../etc/passwd";
+                to is_still_rejected { be_none }
+            }
+
+            when a_segment_contains_a_nul_byte {
+                let path = "/a\0b";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_encodes_a_path_separator {
+                let path = "/static/subdir%2F.env";
+                to is_rejected { be_none }
+            }
+
+            when an_encoded_separator_is_leading {
+                let path = "/%2Fetc";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_contains_a_backslash {
+                let path = "/a\\b";
+                to is_rejected { be_none }
+            }
+
+            when a_segment_is_not_valid_utf8_after_decoding {
+                let path = "/file%FFname";
+                to is_rejected { be_none }
+            }
+        }
     }
 
-    #[test]
-    fn static_headers_cache_is_bounded() {
-        let mut cache: lru::LruCache<String, ResponseParts> =
-            lru::LruCache::new(STATIC_HEADERS_DEFAULT_CAPACITY);
-        let capacity = STATIC_HEADERS_DEFAULT_CAPACITY.get();
-
-        for i in 0..(capacity + 10) {
+    // ----- static_headers LRU bounding: regression pin -----------------
+    // Pins the bounded-cache invariant: a wildcard SsrMode::Static route
+    // under high-cardinality traffic must not grow the per-path header map
+    // without limit. This pins `lru` (a dependency) eviction semantics at
+    // the crate's chosen capacity, so it stays a shallow 3-leaf regression
+    // pin, not a rich tree. `ResponseParts` has no `PartialEq`, so we assert
+    // on `len()` and non-mutating `peek` presence — never `get`, which would
+    // promote recency and perturb the very eviction order under test.
+    fn over_filled_cache() -> lru::LruCache<String, ResponseParts> {
+        let mut cache = lru::LruCache::new(STATIC_HEADERS_DEFAULT_CAPACITY);
+        for i in 0..(STATIC_HEADERS_DEFAULT_CAPACITY.get() + 10) {
             cache.put(format!("/post/{i}"), ResponseParts::default());
         }
+        cache
+    }
 
-        // never grows past capacity
-        assert_eq!(cache.len(), capacity);
-        // the earliest-inserted entries have been evicted
-        assert!(cache.get(&"/post/0".to_string()).is_none());
-        // a recently-inserted entry is still present
-        assert!(cache.get(&format!("/post/{}", capacity + 9)).is_some());
+    lets_expect! {
+        expect(over_filled_cache().len()) as the_overfilled_cache_size {
+            to never_grows_past_capacity { equal(STATIC_HEADERS_DEFAULT_CAPACITY.get()) }
+        }
+    }
+
+    lets_expect! {
+        expect(over_filled_cache().peek(&"/post/0".to_string()).is_some()) as the_earliest_entry {
+            to has_been_evicted { be_false }
+        }
+    }
+
+    lets_expect! {
+        expect(
+            over_filled_cache()
+                .peek(&format!("/post/{}", STATIC_HEADERS_DEFAULT_CAPACITY.get() + 9))
+                .is_some()
+        ) as the_most_recently_inserted_entry {
+            to is_retained { be_true }
+        }
     }
 }

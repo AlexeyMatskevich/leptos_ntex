@@ -46,7 +46,7 @@ where
     let prefix = format!("/{pkg_segment}");
     let dir = PathBuf::from(&*options.site_root).join(pkg_segment);
     ntex::web::scope(prefix.clone()).route(
-        "/{tail:.*}",
+        "/{tail}*",
         Route::<Err>::new()
             .guard(ntex::web::guard::Any(ntex::web::guard::Get()).or(ntex::web::guard::Head()))
             .to(move |req: HttpRequest| {
@@ -97,9 +97,18 @@ where
 /// # fn example(options: LeptosOptions) {
 /// let _app = NtexApp::new()
 ///     .state(options)
-///     .route("/{tail:.*}", file_and_error_handler::<_, ntex::web::DefaultError>(shell));
+///     .route("/{tail}*", file_and_error_handler::<_, ntex::web::DefaultError>(shell));
 /// # }
 /// ```
+///
+/// # Routing pattern
+///
+/// Register with the ntex tail pattern **`/{tail}*`**, not actix-web's
+/// `/{tail:.*}`. In ntex, `{name:.*}` matches only a *single* path segment, so
+/// `/{tail:.*}` would return `404` for every nested request — `/assets/app.css`,
+/// `/.well-known/acme-challenge/<token>`, a client-side-routed deep link —
+/// before this handler ever runs. `{tail}*` is ntex's cross-segment tail match
+/// and is required for this catch-all to see nested paths.
 pub fn file_and_error_handler<IV, Err>(
     shell: impl Fn(LeptosOptions) -> IV + 'static + Clone + Send,
 ) -> Route<Err>
@@ -109,6 +118,22 @@ where
     Err::Container: From<StateExtractorError>,
 {
     file_and_error_handler_with_context(|| {}, shell)
+}
+
+/// RFC 8615 well-known URI prefix. The dotfile guards in [`safe_subpath`] and
+/// in `static_path` (`crate::static_routes`) reject every decoded path segment
+/// beginning with `.` — so `.env`, `.htaccess`, and friends stay hidden —
+/// EXCEPT this exact segment, so ACME challenges and `security.txt` under
+/// `/.well-known/...` can be served. Only the literal `.well-known` segment is
+/// exempt: nested dotfiles (`/.well-known/.secret`) and `..` traversal
+/// (`/.well-known/../etc`) remain rejected.
+pub(crate) const WELL_KNOWN_SEGMENT: &str = ".well-known";
+
+/// Whether a decoded path segment beginning with `.` must be rejected by the
+/// dotfile guard. `.`, `..`, and every dotfile are blocked; only the exact
+/// [`WELL_KNOWN_SEGMENT`] is allowed through.
+pub(crate) fn is_blocked_dot_segment(segment: &str) -> bool {
+    segment.starts_with('.') && segment != WELL_KNOWN_SEGMENT
 }
 
 /// Resolves a URL path to a safe absolute filesystem path under `site_root`,
@@ -138,7 +163,9 @@ fn safe_subpath(canon_root: &Path, raw_path: &str) -> Option<PathBuf> {
         if s == "." {
             continue;
         }
-        if s == ".." || s.starts_with('.') || s.contains('\0') {
+        // Blocks `..` and every dotfile, but lets the exact `.well-known`
+        // segment through (RFC 8615) — see `is_blocked_dot_segment`.
+        if is_blocked_dot_segment(s) || s.contains('\0') {
             return None;
         }
         if s.contains('/') || s.contains('\\') {
@@ -149,11 +176,10 @@ fn safe_subpath(canon_root: &Path, raw_path: &str) -> Option<PathBuf> {
     // Reject anything the percent-decoded segment smuggled in (e.g. a
     // decoded absolute path or `..` lodged inside a segment). Only
     // `Component::Normal` is acceptable for a relative user-controlled
-    // path.
-    if !rel
-        .components()
-        .all(|c| matches!(c, Component::Normal(part) if !part.to_string_lossy().starts_with('.')))
-    {
+    // path; the same `.well-known` exemption applies here.
+    if !rel.components().all(|c| {
+        matches!(c, Component::Normal(part) if !is_blocked_dot_segment(&part.to_string_lossy()))
+    }) {
         return None;
     }
     let candidate = canon_root.join(&rel);
@@ -371,4 +397,56 @@ where
     Route::<Err>::new()
         .guard(ntex::web::guard::Any(ntex::web::guard::Get()).or(ntex::web::guard::Head()))
         .to(handler)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lets_expect::lets_expect;
+
+    // ----- safe_subpath dotfile guard: exhaustive spec -----------------
+    // The file-fallback path resolver. After narrowing the dotfile guard for
+    // RFC 8615, the exact `.well-known` segment resolves while every other
+    // dotfile, `..` traversal, and dotfile nested *inside* `.well-known`
+    // stays rejected. Exercises the guard through the real `canonicalize()`
+    // (a throwaway site root is built per leaf, holding the two probe files).
+    fn resolves_under_root(path: &str) -> bool {
+        let root = std::env::temp_dir().join(format!(
+            "leptos_ntex_safe_subpath_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".well-known")).unwrap();
+        std::fs::write(root.join(".well-known/security.txt"), "ok").unwrap();
+        std::fs::write(root.join(".env"), "secret").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+        let resolved = safe_subpath(&canon_root, path).is_some();
+        let _ = std::fs::remove_dir_all(&root);
+        resolved
+    }
+
+    lets_expect! {
+        expect(resolves_under_root(path)) as safe_subpath_resolution {
+            let path = "/.well-known/security.txt";
+
+            to serves_a_well_known_asset { be_true }
+
+            when the_path_is_an_ordinary_dotfile {
+                let path = "/.env";
+                to is_rejected { be_false }
+            }
+
+            when a_dotfile_is_nested_inside_well_known {
+                let path = "/.well-known/.secret";
+                to is_rejected { be_false }
+            }
+
+            when a_traversal_hides_behind_well_known {
+                let path = "/.well-known/../.env";
+                to is_rejected { be_false }
+            }
+        }
+    }
 }

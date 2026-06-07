@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The file fallback (`file_and_error_handler`) and `site_pkg_dir_service` now
+  serve **nested** (multi-segment) paths. ntex's `{name:.*}` route segment
+  matches only a single path segment, so the actix-derived `/{tail:.*}` tail
+  pattern silently returned `404` for every multi-segment request —
+  `/assets/app.css`, wasm-bindgen `pkg/snippets/.../*.js`, and client-routed
+  deep links — before the handler ever ran. The crate-internal
+  `site_pkg_dir_service` route now uses ntex's cross-segment tail pattern
+  `/{tail}*`. **Action required:** update your own catch-all registration from
+  `.route("/{tail:.*}", file_and_error_handler(...))` to
+  `.route("/{tail}*", ...)`; likewise `handle_server_fns` if any server-function
+  endpoint contains a slash.
+- The file fallback (`safe_subpath`) and the `SsrMode::Static` path resolver
+  (`static_path`) no longer reject the RFC 8615 `/.well-known/` prefix, so ACME
+  challenges and `security.txt` can be served. The dotfile guard still hides
+  `.env`, `.htaccess`, `..` traversal, NUL bytes, and dotfiles nested *inside*
+  `.well-known` (e.g. `/.well-known/.secret`) — only the exact `.well-known`
+  segment is exempt, so the security posture for ordinary dotfiles is unchanged.
 - The reactive `Owner` for a streaming SSR response is now cleaned up when the
   client disconnects mid-response, not only on full stream drain — the previous
   trailing-stream-item cleanup leaked the owner (and everything it held) on

@@ -38,7 +38,7 @@ pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
 ///         ws_channel_buffer: 512,
 ///         ws_subprotocol: Some("graphql-ws"),
 ///     })
-///     .route("/api/{tail:.*}", handle_server_fns());
+///     .route("/api/{tail}*", handle_server_fns());
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy)]

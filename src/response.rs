@@ -443,40 +443,126 @@ pub fn redirect(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lets_expect::lets_expect;
 
-    #[test]
-    fn accept_header_plain_navigation_is_html() {
-        // typical browser navigation
-        assert!(accept_header_includes_html(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        ));
-        assert!(accept_header_includes_html("text/html"));
-        assert!(accept_header_includes_html("text/html; charset=utf-8"));
-        assert!(accept_header_includes_html("text/html;q=0.1"));
+    // ----- accept_header_includes_html: exhaustive spec -----------------
+    // Domain-walk of a type-poor `&str -> bool`: the media range parses or
+    // not, its type/subtype is text/html or not, the `q` quality is
+    // absent / positive / zero / unparseable, and HTML may appear among
+    // several comma-separated ranges. Every leaf below is the behaviour
+    // decided from the HTTP `Accept` semantics, not read off the code.
+    lets_expect! {
+        expect(accept_header_includes_html(accept)) {
+            let accept = "text/html";
+
+            to accepts_a_plain_html_range { be_true }
+
+            when the_html_range_carries_a_charset {
+                let accept = "text/html; charset=utf-8";
+                to accepts_html { be_true }
+            }
+
+            when the_html_range_has_a_positive_quality {
+                let accept = "text/html;q=0.1";
+                to accepts_html { be_true }
+            }
+
+            when the_html_quality_is_zero {
+                let accept = "text/html;q=0";
+                to does_not_accept_html { be_false }
+
+                when the_zero_quality_is_written_as_a_decimal {
+                    let accept = "text/html;q=0.0";
+                    to does_not_accept_html { be_false }
+                }
+            }
+
+            when the_quality_value_is_unparseable {
+                let accept = "text/html;q=not-a-number";
+                to treats_an_unparseable_quality_as_accepting { be_true }
+            }
+
+            when html_appears_among_several_ranges {
+                let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+                to accepts_html { be_true }
+            }
+
+            when html_is_refused_and_only_non_html_remains {
+                let accept = "text/html;q=0, application/json";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_range_is_a_different_media_type {
+                let accept = "application/json";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_value_only_contains_an_html_substring {
+                let accept = "application/x-text/html-fake";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_range_is_a_wildcard {
+                let accept = "*/*";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_html_range_uses_uppercase_letters {
+                let accept = "TEXT/HTML";
+                to accepts_html_case_insensitively { be_true }
+            }
+
+            when html_is_not_the_first_range {
+                let accept = "application/json, text/html";
+                to scans_every_range_and_accepts_html { be_true }
+            }
+
+            when a_refused_html_range_precedes_an_accepted_one {
+                let accept = "text/html;q=0, text/html";
+                to keeps_scanning_past_the_refused_range { be_true }
+            }
+
+            when a_trailing_comma_leaves_an_empty_range {
+                let accept = "text/html,";
+                to ignores_the_empty_range_and_accepts_html { be_true }
+            }
+
+            when the_quality_is_negative {
+                let accept = "text/html;q=-0.5";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_accept_header_is_empty {
+                let accept = "";
+                to does_not_accept_html { be_false }
+            }
+
+            when the_accept_header_is_only_whitespace {
+                let accept = "   ";
+                to does_not_accept_html { be_false }
+            }
+        }
     }
 
-    #[test]
-    fn accept_header_explicit_refusal_is_not_html() {
-        // `q=0` means the client explicitly does not want HTML
-        assert!(!accept_header_includes_html(
-            "text/html;q=0, application/json"
-        ));
-        assert!(!accept_header_includes_html("text/html;q=0.0"));
+    // ----- OwnerCleanupStream::drop thread-affinity: exhaustive spec ----
+    // The body stream is dropped early (before it is drained), modelling a
+    // client disconnect. The single characteristic is *which thread* runs
+    // the drop: on its origin thread the reactive teardown is forced; off
+    // its origin thread it is skipped (the owner is `mem::forget`-leaked) to
+    // avoid a cross-thread cleanup panic. We observe the outcome through a
+    // `DropProbe` context value whose own `Drop` flips a flag iff the
+    // reactive teardown disposed it.
+
+    /// Which thread drops the body, relative to the one that built it.
+    enum DropSite {
+        OriginThread,
+        OffOriginThread,
     }
 
-    #[test]
-    fn accept_header_substring_is_not_html() {
-        // these contain the literal substring "text/html" but are not it
-        assert!(!accept_header_includes_html("application/x-text/html-fake"));
-        assert!(!accept_header_includes_html("application/json"));
-        assert!(!accept_header_includes_html("*/*"));
-    }
-
-    // Models a client disconnecting mid-response: the body stream is dropped
-    // before it is drained. `OwnerCleanupStream::drop` must force the reactive
-    // cleanup (on its origin thread) without panicking.
-    #[test]
-    fn owner_cleanup_stream_forces_cleanup_on_early_drop() {
+    /// Builds an `OwnerCleanupStream` over an `Owner` holding a drop-probe,
+    /// drops the (undrained) stream at `site`, and reports whether the
+    /// reactive teardown ran (i.e. whether the probe's `Drop` fired).
+    fn reactive_cleanup_runs_when_dropped_at(site: DropSite) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // A context value whose own `Drop` records that it ran. Forcing the
@@ -496,46 +582,26 @@ mod tests {
         // Build the body but drop it WITHOUT draining the stream.
         let stream =
             OwnerCleanupStream::new(futures::stream::iter(vec!["partial".to_string()]), owner);
-        drop(stream);
-
-        assert!(
-            cleaned.load(Ordering::SeqCst),
-            "OwnerCleanupStream::drop should force reactive cleanup on early drop"
-        );
-    }
-
-    // The thread-affinity guard: dropping the body on a thread other than the
-    // one that built it must NOT run the reactive teardown (which is
-    // thread-affine and would otherwise risk a panic). It must `mem::forget`
-    // the owner instead — so cleanup is skipped and no panic occurs.
-    #[test]
-    fn owner_cleanup_stream_skips_cleanup_on_off_thread_drop() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct DropProbe(Arc<AtomicBool>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
+        match site {
+            DropSite::OriginThread => drop(stream),
+            DropSite::OffOriginThread => std::thread::spawn(move || drop(stream))
+                .join()
+                .expect("off-thread drop must not panic"),
         }
 
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let owner = Owner::new();
-        owner.with(|| provide_context(DropProbe(cleaned.clone())));
+        cleaned.load(Ordering::SeqCst)
+    }
 
-        let stream =
-            OwnerCleanupStream::new(futures::stream::iter(vec!["partial".to_string()]), owner);
+    lets_expect! {
+        expect(reactive_cleanup_runs_when_dropped_at(drop_site)) {
+            let drop_site = DropSite::OriginThread;
 
-        // Drop the body on a *different* thread than the one that built it.
-        std::thread::spawn(move || drop(stream))
-            .join()
-            .expect("off-thread drop must not panic");
+            to forces_reactive_cleanup_on_early_drop { be_true }
 
-        // The guard must have skipped the forced cleanup (the owner is leaked
-        // via `mem::forget`), so the probe is still alive.
-        assert!(
-            !cleaned.load(Ordering::SeqCst),
-            "off-thread drop must skip reactive cleanup (leak, not cross-thread teardown)"
-        );
+            when the_body_is_dropped_off_its_origin_thread {
+                let drop_site = DropSite::OffOriginThread;
+                to skips_reactive_cleanup_and_leaks_instead_of_panicking { be_false }
+            }
+        }
     }
 }

@@ -201,7 +201,7 @@ fn oversize_response(limit: usize) -> HttpResponse {
 ///
 /// # fn main() -> std::io::Result<()> {
 /// web::server(|| async {
-///     NtexApp::new().route("/api/{tail:.*}", handle_server_fns())
+///     NtexApp::new().route("/api/{tail}*", handle_server_fns())
 /// })
 /// .bind(("127.0.0.1", 3000))?
 /// .run();

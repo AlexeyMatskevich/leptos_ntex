@@ -89,7 +89,7 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
         let routes = generate_route_list(App);
         async move {
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(move |cfg| {
                     register_leptos_routes(cfg, routes.clone(), shell);
                 })
@@ -126,8 +126,7 @@ async fn catchall_handle_server_fns_returns_405_on_method_mismatch() {
     register_explicit::<SumTwo>();
 
     let srv =
-        test::server(|| async { NtexApp::new().route("/api/{tail:.*}", handle_server_fns()) })
-            .await;
+        test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
 
     let resp = srv
         .request(ntex::http::Method::GET, srv.url(SumTwo::PATH))
@@ -200,7 +199,7 @@ async fn real_server_file_and_error_handler_serves_file_and_falls_back() {
         async move {
             NtexApp::new()
                 .state(options.clone())
-                .route("/{tail:.*}", file_and_error_handler(shell_with_options))
+                .route("/{tail}*", file_and_error_handler(shell_with_options))
         }
     })
     .await;
@@ -232,9 +231,16 @@ async fn real_server_file_and_error_handler_serves_file_and_falls_back() {
 async fn real_server_site_pkg_dir_service_registers() {
     let site_root = temp_site_root("pkg_service");
     let pkg_dir = site_root.join("pkg");
-    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::create_dir_all(pkg_dir.join("snippets/crate")).unwrap();
     std::fs::write(pkg_dir.join("app.js"), "console.log('hi');").unwrap();
     std::fs::write(pkg_dir.join("app.js.br"), "br-js").unwrap();
+    // wasm-bindgen emits JS snippets in nested dirs; the tail route must reach
+    // them (only `/{tail}*` matches multi-segment paths in ntex).
+    std::fs::write(
+        pkg_dir.join("snippets/crate/inline.js"),
+        "export const x = 1;",
+    )
+    .unwrap();
 
     let options = LeptosOptions::builder()
         .output_name("leptos_ntex_integration_pkg_service")
@@ -279,6 +285,22 @@ async fn real_server_site_pkg_dir_service_registers() {
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(text, "br-js");
 
+    // Nested snippet (2 segments under the scope) is reachable.
+    let resp = srv
+        .request(
+            ntex::http::Method::GET,
+            srv.url("/pkg/snippets/crate/inline.js"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
+    let body = resp.body().await.unwrap();
+    assert_eq!(
+        String::from_utf8(body.to_vec()).unwrap(),
+        "export const x = 1;"
+    );
+
     let _ = std::fs::remove_dir_all(&site_root);
 }
 
@@ -309,7 +331,7 @@ async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
         let routes = generate_route_list(App);
         async move {
             NtexApp::new()
-                .route("/api/{tail:.*}", handle_server_fns())
+                .route("/api/{tail}*", handle_server_fns())
                 .configure(move |cfg| {
                     register_leptos_routes(cfg, routes.clone(), shell);
                 })
@@ -356,8 +378,7 @@ async fn real_server_roundtrips_cbor_server_fn() {
     register_explicit::<SumCbor>();
 
     let srv =
-        test::server(|| async { NtexApp::new().route("/api/{tail:.*}", handle_server_fns()) })
-            .await;
+        test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
 
     // Encode `{a: 5, b: 9}` as a CBOR map with text keys. The `#[server]`
     // macro synthesises a struct `SumCbor { a: i32, b: i32 }` on the server

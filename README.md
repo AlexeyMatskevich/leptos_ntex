@@ -107,7 +107,7 @@ let _app = NtexApp::new()
         register_leptos_routes(cfg, routes.clone(), app);
     })
     .route(
-        "/{tail:.*}",
+        "/{tail}*",
         file_and_error_handler::<_, ntex::web::DefaultError>(shell),
     );
 # }
@@ -165,7 +165,7 @@ let _app = NtexApp::new()
             .with_ws_channel_buffer(512)
             .with_ws_subprotocol("graphql-ws"),
     )
-    .route("/api/{tail:.*}", handle_server_fns());
+    .route("/api/{tail}*", handle_server_fns());
 ```
 
 If you don't register a `LeptosServerFnConfig`, the defaults from
