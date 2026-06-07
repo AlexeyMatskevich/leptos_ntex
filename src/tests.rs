@@ -1098,6 +1098,104 @@ mod tests {
         sink.send(ws::Message::Close(None)).await.unwrap();
     }
 
+    /// RFC 6455 §5.4: fragmented **text** messages must be reassembled
+    /// before delivery — the mirror of the binary case above. Mutation
+    /// testing flagged the `FirstText` size guard (`request.rs`
+    /// `Item::FirstText`, `b.len() > payload_limit`): the at-limit text
+    /// test sends exactly `== limit`, where `>` and `<` agree (both
+    /// install), so it cannot pin the comparison's direction. A completing
+    /// message whose opening fragment is strictly UNDER the limit does —
+    /// the correct `>` installs it, while `<` would wrongly reject a normal
+    /// small fragment as overflow. This also drives the under-limit
+    /// `Continue`/`Last` accumulation guards.
+    #[ntex::test]
+    async fn websocket_server_fn_reassembles_fragmented_text() {
+        use ntex::ws::Item;
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv =
+            test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        // Three chunks, each well under the (default) limit. `Item::FirstText`
+        // carries raw bytes; the text kind is tracked by the opcode.
+        let full = serialize_ws_ok(&"fragmented-text-hello");
+        let (head, tail) = full.split_at(4);
+        let (mid, last) = tail.split_at(tail.len() / 2);
+
+        sink.send(ws::Message::Continuation(Item::FirstText(
+            head.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Continue(
+            mid.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+        sink.send(ws::Message::Continuation(Item::Last(last.to_vec().into())))
+            .await
+            .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(echoed, "fragmented-text-hello");
+            }
+            other => panic!("unexpected websocket frame: {other:?}"),
+        }
+
+        sink.send(ws::Message::Close(None)).await.unwrap();
+    }
+
+    /// The TEXT mirror of the oversized-opening-fragment test: a `FirstText`
+    /// fragment already past the limit must be rejected with `CloseCode::Size`
+    /// before any buffer is established, exactly as `FirstBinary` is. With the
+    /// at-limit and under-limit text tests this pins all three points of the
+    /// `FirstText` size axis (the binary axis was already complete).
+    #[ntex::test]
+    async fn websocket_server_fn_first_text_fragment_over_limit_closes_with_size() {
+        use crate::LeptosServerFnConfig;
+        use ntex::ws::{CloseCode, Item};
+
+        register_explicit::<EchoWebsocket>();
+
+        let srv = test::server(async || {
+            NtexApp::new()
+                .state(LeptosServerFnConfig {
+                    payload_limit: 16,
+                    ws_channel_buffer: 16,
+                    ..Default::default()
+                })
+                .route("/api/{tail}*", handle_server_fns())
+        })
+        .await;
+
+        let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+        let sink = conn.sink();
+        let rx = conn.receiver();
+
+        let oversize = [b'A'; 64];
+        sink.send(ws::Message::Continuation(Item::FirstText(
+            oversize.to_vec().into(),
+        )))
+        .await
+        .unwrap();
+
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Close(Some(reason)) => {
+                assert_eq!(reason.code, CloseCode::Size);
+            }
+            other => panic!("expected Close(Size) on oversized FirstText frame, got {other:?}"),
+        }
+    }
+
     /// An oversized opening fragment (`FirstBinary`/`FirstText`) must
     /// be rejected with `CloseCode::Size` *before* the buffer is
     /// established. A prior bug simply pushed the bytes into the buffer
