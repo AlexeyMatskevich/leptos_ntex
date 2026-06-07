@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-08
+
 ### Security
 
 - Bounded the per-process static-route header/status cache (`STATIC_HEADERS`)
@@ -91,6 +93,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OutOfOrder`/`InOrder`/`Async`/`PartiallyBlocked`/`Static` all have dedicated
   handling; only a variant added by a future `leptos_router` would hit this.
   Mirrors `leptos_actix` (leptos-rs/leptos#4755).
+
+### Changed
+
+- Refreshed the dependency lockfile within the existing semver ranges (no
+  `Cargo.toml` constraint changes). Most notably the ntex runtime stack moves
+  `ntex` 3.7.2 → 3.9.6 (with `ntex-bytes`, `ntex-io`, `ntex-h2`, `ntex-net`,
+  `ntex-rt`, `ntex-tls`, `ntex-util` bumped in step), alongside patch updates
+  across the transitive tree. The leptos stack and the deliberately pinned
+  `leptos_integration_utils` 0.8.8 are unchanged.
 
 ## [0.4.2] - 2026-05-30
 
@@ -331,7 +342,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.3.0...v0.4.0
