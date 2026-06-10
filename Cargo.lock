@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "leptos-ntex-unofficial"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "any_spawner",
  "bytes",

@@ -5,10 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-06-10
 
 ### Security
 
+- The initial buffer reserved for collecting a request body is now capped at
+  64 KiB. The declared `Content-Length` is client-controlled: previously any
+  in-limit declaration was reserved up-front in full, so N parallel
+  connections each declaring a large body and then trickling bytes could
+  reserve N × limit of memory before sending a single payload byte. The
+  buffer still grows on demand as real chunks arrive, so honest large uploads
+  pay only amortized reallocation — the payload limit itself is unchanged.
 - The HTML-form server-function referrer fallback now enforces its documented
   same-origin policy regardless of the request's `Accept` header. The
   same-origin check was previously gated on the strict `Accept` parser, but
@@ -23,6 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SsrMode::Static` on-demand regeneration now serves the freshly written
+  `.html` and its captured status/headers as one paired snapshot, opened and
+  read under the same per-file write stripe the writer holds. Previously the
+  regeneration branch applied the **request-local** `ResponseOptions` to a
+  file that was re-opened separately, so under concurrent first requests to
+  an ungenerated path a neighbour's freshly written body could ship under
+  this request's headers (e.g. a `x-`/`Link`/CSP header contradicting the
+  body it describes). The same race exists in the upstream `leptos_axum` /
+  `leptos_actix` regeneration paths and was reported as
+  leptos-rs/leptos#4772. **Known trade-off:** if the cached header entry is
+  evicted between the write and the paired re-open, the body is served with
+  default headers — a consistent pair beats a complete-but-mismatched one.
+- Precompressed asset selection (`.br`/`.gz` siblings) now honours
+  `Accept-Encoding` q-weights: `Accept-Encoding: gzip;q=1, br;q=0.1` now
+  serves the gzip sibling. Previously brotli won whenever it was acceptable
+  at all, regardless of the client's declared preference (brotli still wins
+  exact q-ties). A malformed q-value — outside the RFC 9110 `0..=1` range,
+  or non-numeric/non-finite — is ignored and that encoding's weight falls
+  back to `1.0`.
 - `SsrMode::Static`/dynamic routes registered with a `*splat` (catch-all)
   segment now match **nested** URLs. `generate_route_list` emitted the
   actix-style `{name:.*}` for splats, which matches only a single segment in
@@ -404,7 +430,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...HEAD
+[0.6.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.0...v0.4.1
