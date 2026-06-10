@@ -130,7 +130,12 @@ where
                             Some((Err(err), None))
                         } else {
                             Some((
-                                Ok(SfBytes::copy_from_slice(&b)),
+                                // Zero-copy hand-off of the ntex chunk: the
+                                // ntex `Bytes` owner is moved into the
+                                // `bytes::Bytes` shared box instead of being
+                                // memcpy'd. The owner is exactly this chunk,
+                                // so nothing extra is kept alive.
+                                Ok(SfBytes::from_owner(b)),
                                 Some((req, payload, next, limit)),
                             ))
                         }
@@ -344,7 +349,7 @@ where
                                             // receiver is gone, the WS
                                             // is about to close anyway.
                                             let _ = tx
-                                                .send(Ok(SfBytes::copy_from_slice(&bytes)))
+                                                .send(Ok(SfBytes::from_owner(bytes)))
                                                 .await;
                                             Ok(None)
                                         }
@@ -362,7 +367,7 @@ where
                                                 return Ok(Some(close_too_big(payload_limit)));
                                             }
                                             let _ = tx
-                                                .send(Ok(SfBytes::copy_from_slice(&text)))
+                                                .send(Ok(SfBytes::from_owner(text)))
                                                 .await;
                                             Ok(None)
                                         }
