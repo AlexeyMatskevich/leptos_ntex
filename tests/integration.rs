@@ -3,6 +3,14 @@
 //! public `leptos_ntex_unofficial` API from outside the crate (no `cfg(test)` access),
 //! so they catch visibility and API-shape regressions that the in-crate
 //! tests cannot.
+//!
+//! Note: these call `generate_route_list` directly, without the in-crate test
+//! suite's `ROUTE_GEN_VS_RENDER` serialization. That workaround guards the
+//! upstream `IS_SUPPRESSING_RESOURCE_LOAD` race, which only bites a render that
+//! first-polls a `Resource` during a concurrent generation window. This binary
+//! is a separate process (the lib static would not be shared anyway) and its
+//! `App` has no `<Suspense>`/`Resource`, so there is no victim render to
+//! protect here.
 
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
