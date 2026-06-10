@@ -66,6 +66,43 @@ fn StaticHeaderApp() -> impl IntoView {
     }
 }
 
+/// Static route whose every render stamps a fresh epoch number into BOTH the
+/// body and an `x-render-epoch` header, so a served response can be audited
+/// for body/header consistency: a body from render N must always arrive under
+/// the headers captured by render N. Drives the concurrent-regeneration
+/// pairing regression test in `tests/static_routes.rs`.
+#[component]
+fn StaticEpochApp() -> impl IntoView {
+    provide_meta_context();
+
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <h1>"Not Found"</h1> }>
+                    <Route
+                        path=path!("/epoch")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| {
+                            use std::sync::atomic::{AtomicU64, Ordering};
+                            static EPOCH: AtomicU64 = AtomicU64::new(0);
+                            let epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
+                            if let Some(res) = use_context::<crate::ResponseOptions>() {
+                                res.insert_header(
+                                    ntex::http::header::HeaderName::from_static("x-render-epoch"),
+                                    ntex::http::header::HeaderValue::from_str(&epoch.to_string())
+                                        .unwrap(),
+                                );
+                            }
+                            let marker = format!("epoch-{epoch}-marker");
+                            view! { <h1>{marker}</h1> }
+                        }
+                    />
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
 #[component]
 fn MixedApp() -> impl IntoView {
     provide_meta_context();

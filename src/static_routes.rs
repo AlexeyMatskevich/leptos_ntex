@@ -404,6 +404,49 @@ fn static_header_key(file_path: &Path) -> String {
     file_path.to_string_lossy().into_owned()
 }
 
+/// Opens the resolved on-disk file and reads its captured [`STATIC_HEADERS`]
+/// snapshot under the file's write stripe, so the body and the headers always
+/// come from ONE render epoch: the writer holds the same stripe across its
+/// atomic rename and its header `put`, so taking the stripe here guarantees
+/// never a body from render A paired with headers from render B. Used by BOTH
+/// the cache-hit path and the post-regeneration re-open — the pairing
+/// guarantee is structural, not duplicated. Blocking I/O + sync lock — only
+/// call from a blocking executor. The headers read uses a SHARED lock +
+/// `peek` (no recency bump) so cache hits never serialize every worker behind
+/// one global exclusive lock.
+///
+/// If the [`STATIC_HEADERS`] entry was LRU-evicted (or never written), the
+/// file is served with NO custom status/headers — including on the
+/// post-regeneration re-open, where this request's own render did capture a
+/// snapshot. Deliberate: falling back to the request-local snapshot there
+/// would reintroduce the cross-epoch pairing race this helper exists to
+/// close, and eviction ⇒ bare `200` is already the documented degradation of
+/// the bounded cache (see [`STATIC_HEADERS`]). A consistent pair beats a
+/// complete-but-possibly-mismatched one.
+fn open_paired_static_file(
+    root: &Path,
+    file_path: &Path,
+    header_key: &str,
+) -> (Option<ntex_files::NamedFile>, Option<ResponseParts>) {
+    // The stripe guards `()`, so recover from a poisoned holder instead of
+    // cascading its panic.
+    let _guard = static_write_lock(file_path)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let opened = validate_static_file(root, file_path)
+        .and_then(|path| ntex_files::NamedFile::open(path).ok());
+    let headers = if opened.is_some() {
+        STATIC_HEADERS
+            .read()
+            .or_poisoned()
+            .peek(header_key)
+            .cloned()
+    } else {
+        None
+    };
+    (opened, headers)
+}
+
 async fn write_static_route(
     options: &LeptosOptions,
     response_options: Option<ResponseOptions>,
@@ -473,36 +516,7 @@ where
                 let root = root.clone();
                 let path_buf = path_buf.clone();
                 let header_key = header_key.clone();
-                move || {
-                    // Serialize against a concurrent regeneration of THIS
-                    // file: the writer holds the same stripe across its
-                    // atomic rename AND its header `put`, so opening the
-                    // file and reading its captured headers under the stripe
-                    // guarantees both come from one render epoch — never a
-                    // body from render A paired with headers from render B.
-                    // The stripe guards `()`, so recover from a poisoned
-                    // holder instead of cascading its panic.
-                    let _guard = static_write_lock(&path_buf)
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let opened = validate_static_file(&root, &path_buf)
-                        .and_then(|path| ntex_files::NamedFile::open(path).ok());
-                    // Read the header snapshot with a SHARED lock + `peek`
-                    // (no recency bump), so serving a cached page never
-                    // serializes every worker behind one global exclusive
-                    // lock. `peek` borrows the key, so the hot hit path also
-                    // avoids re-allocating the key `String`.
-                    let headers = if opened.is_some() {
-                        STATIC_HEADERS
-                            .read()
-                            .or_poisoned()
-                            .peek(header_key.as_str())
-                            .cloned()
-                    } else {
-                        None
-                    };
-                    (opened, headers)
-                }
+                move || open_paired_static_file(&root, &path_buf, &header_key)
             })
             .await;
             let (opened, hit_headers) = match opened_join {
@@ -549,40 +563,49 @@ where
                         regenerate,
                     )
                     .await;
-                let response_options = owner
-                    .with(use_context::<ResponseOptions>)
-                    .map(|options| options.0.read().or_poisoned().clone());
                 // On a successful render `ResolvedStaticPath::build` writes
                 // the page to disk and returns `None` (the body lives on
                 // disk, not in memory), so re-open the freshly written file
-                // and serve it. On a 404/error render it returns `Some(html)`
-                // and skips the disk write, so we keep the in-memory body.
-                // Without this re-open the `html == None` arm below would fall
-                // through to a 500 on the first request to an un-pregenerated
-                // static route. Mirrors `leptos_axum` (`ServeDir`) and
-                // `leptos_actix` (`NamedFile::open`).
-                let reopened = if html.is_none() {
-                    let root = root.clone();
-                    let path_buf = path_buf.clone();
-                    match ntex::rt::spawn_blocking(move || {
-                        validate_static_file(&root, &path_buf)
-                            .and_then(|path| ntex_files::NamedFile::open(path).ok())
+                // and serve it — paired with the header snapshot under the
+                // file's write stripe (`open_paired_static_file`), exactly
+                // like the cache-hit path. This request's own render captured
+                // a snapshot too, but a CONCURRENT regeneration may overwrite
+                // the file between this request's write and its re-open;
+                // applying the locally captured headers to whatever body is
+                // on disk could then mix two render epochs (body from render
+                // B under headers from render A). The stripe-paired read
+                // always returns one epoch. On a 404/error render `build`
+                // returns `Some(html)` and skips the disk write (nothing is
+                // cached), so the in-memory body keeps the locally captured
+                // `ResponseOptions`. Without the re-open the `html == None`
+                // arm below would fall through to a 500 on the first request
+                // to an un-pregenerated static route. Mirrors `leptos_axum`
+                // (`ServeDir`) and `leptos_actix` (`NamedFile::open`).
+                if html.is_none() {
+                    let (reopened, paired_headers) = match ntex::rt::spawn_blocking({
+                        let root = root.clone();
+                        let path_buf = path_buf.clone();
+                        let header_key = header_key.clone();
+                        move || open_paired_static_file(&root, &path_buf, &header_key)
                     })
                     .await
                     {
-                        Ok(opened) => opened,
+                        Ok(pair) => pair,
                         Err(join_err) => {
                             crate::files::warn_blocking_join_failed(
                                 "static file re-open task",
                                 &join_err,
                             );
-                            None
+                            (None, None)
                         }
-                    }
+                    };
+                    (paired_headers, None, reopened)
                 } else {
-                    None
-                };
-                (response_options, html, reopened)
+                    let response_options = owner
+                        .with(use_context::<ResponseOptions>)
+                        .map(|options| options.0.read().or_poisoned().clone());
+                    (response_options, html, None)
+                }
             } else {
                 // Cache hit: body and headers were already paired under the
                 // stripe lock in the open task above (see `hit_headers`).

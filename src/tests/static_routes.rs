@@ -140,6 +140,76 @@ async fn static_route_on_demand_regeneration_serves_html() {
     let _ = std::fs::remove_dir_all(&site_root);
 }
 
+/// Concurrent on-demand regenerations of the SAME static path must never
+/// serve a body from one render under headers captured by another. Every
+/// render of `StaticEpochApp` stamps a fresh epoch into both the body and
+/// the `x-render-epoch` header; with the file initially absent, N parallel
+/// first requests all race down the regeneration branch (the documented
+/// stampede), each writing the file+header snapshot under the write stripe
+/// and then re-opening the file. A re-open that pairs the on-disk body with
+/// the REQUEST-LOCAL header snapshot (instead of reading both under the
+/// stripe) lets a neighbour's freshly written body ship under this
+/// request's older headers — the regression this pins down. The pairing
+/// invariant must hold for every interleaving, so the test is
+/// deterministic-green under the fix and only the broken pairing can flake
+/// it red.
+///
+/// One-sided by nature: a red PROVES the pairing bug, while a green is
+/// meaningful only while the stampede design lets renders overlap (no
+/// barrier forces all 16 requests past the missing-file check before the
+/// first write lands). Manual-Red evidence at introduction: against the
+/// pre-fix unpaired re-open this failed 17/20 runs; with the fix, 10/10
+/// green. If in-flight render dedup (single-flight) ever lands, only one
+/// epoch will exist and this test stays trivially green — correctly so,
+/// because the bug class is then designed away.
+#[ntex::test]
+async fn static_route_concurrent_regeneration_pairs_body_with_headers() {
+    let site_root = temp_site_root("static_epoch_race");
+    std::fs::create_dir_all(&site_root).unwrap();
+    let (routes, _generator) = gen_route_list_with_ssg(StaticEpochApp);
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_static_epoch")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    // Deliberately no `generate()`: the file must be missing so the initial
+    // requests take the regeneration branch concurrently.
+    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), StaticEpochApp);
+    }))
+    .await;
+
+    let responses = futures::future::join_all(
+        (0..16)
+            .map(|_| test::call_service(&app, test::TestRequest::with_uri("/epoch").to_request())),
+    )
+    .await;
+
+    for resp in responses {
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header_epoch = resp
+            .headers()
+            .get("x-render-epoch")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("every served static response must carry the captured header snapshot");
+        let body = test::read_body(resp).await;
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let body_epoch = html
+            .split("epoch-")
+            .nth(1)
+            .and_then(|tail| tail.split("-marker").next())
+            .expect("rendered body must contain the epoch marker");
+        assert_eq!(
+            body_epoch, header_epoch,
+            "body epoch and x-render-epoch header must come from one render"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
 #[ntex::test]
 async fn static_route_cached_headers_are_replayed_more_than_once() {
     let site_root = temp_site_root("static_headers");
