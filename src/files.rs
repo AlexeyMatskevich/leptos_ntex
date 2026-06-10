@@ -11,6 +11,7 @@ use ntex::http::{
 use ntex::web::error::StateExtractorError;
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use crate::render::{async_stream_builder, provide_contexts};
 use crate::request::Request;
@@ -45,6 +46,12 @@ where
     let pkg_segment = options.site_pkg_dir.trim_start_matches('/');
     let prefix = format!("/{pkg_segment}");
     let dir = PathBuf::from(&*options.site_root).join(pkg_segment);
+    // Canonicalize the served directory ONCE (lazily, on the first request
+    // that finds it on disk) and reuse it, instead of re-resolving the whole
+    // root realpath on every asset request. Same lifetime/symlink semantics
+    // as `ntex_files::Files::new`, which canonicalizes its base at
+    // construction: a deploy that swaps the root symlink needs a restart.
+    let canon_root: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
     ntex::web::scope(prefix.clone()).route(
         "/{tail}*",
         Route::<Err>::new()
@@ -52,6 +59,7 @@ where
             .to(move |req: HttpRequest| {
                 let dir = dir.clone();
                 let prefix = prefix.clone();
+                let canon_root = canon_root.clone();
                 async move {
                     let raw_path = req
                         .uri()
@@ -61,11 +69,14 @@ where
                         .to_owned();
                     let encodings = accepted_encodings(&req);
                     let opened = ntex::rt::spawn_blocking(move || {
-                        open_static_file(&dir, &raw_path, encodings)
+                        let canon_root = cached_canon_root(&canon_root, &dir)?;
+                        open_static_file(&canon_root, &raw_path, encodings)
                     })
                     .await
-                    .ok()
-                    .flatten();
+                    .unwrap_or_else(|join_err| {
+                        warn_blocking_join_failed("static asset open task", &join_err);
+                        None
+                    });
 
                     if let Some(opened) = opened {
                         let mut res = opened.file.into_response(&req);
@@ -250,13 +261,44 @@ fn canonical_under(canon_root: &Path, path: &Path) -> Option<PathBuf> {
     path.starts_with(canon_root).then_some(path)
 }
 
+/// Returns the canonicalized `dir`, resolving it at most once and caching it
+/// in `cache`. The root never changes for the life of the app, so re-running
+/// the full realpath walk on every request is pure waste; the per-request
+/// canonicalize of the *target* (in [`safe_subpath`]) is what actually
+/// enforces the symlink-escape guard and stays per-request. Blocking I/O —
+/// only call from a blocking executor. Caching is lazy because the directory
+/// may not exist when the service is built.
+fn cached_canon_root(cache: &OnceLock<PathBuf>, dir: &Path) -> Option<PathBuf> {
+    if let Some(canon) = cache.get() {
+        return Some(canon.clone());
+    }
+    let canon = dir.canonicalize().ok()?;
+    // A racing worker may win `set`. Return the STORED value rather than this
+    // call's `canon`, so every caller observes the one cached root even if the
+    // root symlink changed between two concurrent first-resolutions. `set`
+    // either stores `canon` or fails because a value is already present —
+    // either way the cache now holds exactly one root, so `get` yields it.
+    let _ = cache.set(canon);
+    cache.get().cloned()
+}
+
+/// Logs a `spawn_blocking` join failure (a panic in the blocking task, or the
+/// blocking pool shutting down) consistently with the rest of the crate — via
+/// `tracing` when the feature is on, else stderr — so a serve-path degradation
+/// (404 / regeneration / 500) is never completely silent.
+pub(crate) fn warn_blocking_join_failed(context: &str, err: &impl std::fmt::Display) {
+    #[cfg(feature = "tracing")]
+    tracing::error!("{context}: blocking task failed: {err}");
+    #[cfg(not(feature = "tracing"))]
+    eprintln!("{context}: blocking task failed: {err}");
+}
+
 fn open_static_file(
-    site_root: &Path,
+    canon_root: &Path,
     raw_path: &str,
     accepted_encodings: AcceptedEncodings,
 ) -> Option<OpenedStaticFile> {
-    let canon_root = site_root.canonicalize().ok()?;
-    let safe = safe_subpath(&canon_root, raw_path)?;
+    let safe = safe_subpath(canon_root, raw_path)?;
     let mime = safe
         .extension()
         .and_then(|ext| ext.to_str())
@@ -269,7 +311,7 @@ fn open_static_file(
         if !accepted {
             continue;
         }
-        if let Some(compressed) = canonical_under(&canon_root, &compressed_path(&safe, extension))
+        if let Some(compressed) = canonical_under(canon_root, &compressed_path(&safe, extension))
             && let Ok(mut file) = ntex_files::NamedFile::open(&compressed)
         {
             file = file.set_content_encoding(encoding);
@@ -322,21 +364,27 @@ where
     Err::Container: From<StateExtractorError>,
 {
     ensure_executor_initialized();
+    // Cache the canonical site root across requests (see `cached_canon_root`).
+    let canon_root: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
     let handler = move |req: HttpRequest, state: web::types::State<LeptosOptions>| {
         let shell = shell.clone();
         let additional_context = additional_context.clone();
         let options = state.get_ref().clone();
+        let canon_root = canon_root.clone();
         async move {
             let site_root = PathBuf::from(&*options.site_root);
             let uri_path = req.uri().path().to_owned();
 
             let encodings = accepted_encodings(&req);
             let opened = ntex::rt::spawn_blocking(move || {
-                open_static_file(&site_root, &uri_path, encodings)
+                let canon_root = cached_canon_root(&canon_root, &site_root)?;
+                open_static_file(&canon_root, &uri_path, encodings)
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or_else(|join_err| {
+                warn_blocking_join_failed("file fallback open task", &join_err);
+                None
+            });
 
             if let Some(opened) = opened {
                 let res_options = ResponseOptions::default();
