@@ -193,6 +193,13 @@ impl StaticRouteGenerator {
 /// a process that never ran `generate()`, now also reachable at runtime under
 /// cache pressure). The official `leptos_axum` integration adopted the same
 /// bounded `lru::LruCache`; `leptos_actix` remains unbounded.
+///
+/// Recency is updated on **writes** (`put` during regeneration), not on reads:
+/// the serve path uses a shared-lock `peek` so that every worker is not
+/// serialized behind one global exclusive lock per cache hit. A page that is
+/// served frequently but never re-rendered therefore ages by insertion order
+/// rather than access order — acceptable because eviction only costs the
+/// custom status/headers (the body keeps serving from disk).
 static STATIC_HEADERS: LazyLock<RwLock<lru::LruCache<String, ResponseParts>>> =
     LazyLock::new(|| {
         let capacity = std::env::var(STATIC_HEADERS_CAPACITY_ENV)
@@ -461,19 +468,64 @@ where
             };
             let root = PathBuf::from(&*options.site_root);
 
-            let opened = ntex::rt::spawn_blocking({
+            let header_key = static_header_key(&path_buf);
+            let opened_join = ntex::rt::spawn_blocking({
                 let root = root.clone();
                 let path_buf = path_buf.clone();
+                let header_key = header_key.clone();
                 move || {
-                    validate_static_file(&root, &path_buf)
-                        .and_then(|path| ntex_files::NamedFile::open(path).ok())
+                    // Serialize against a concurrent regeneration of THIS
+                    // file: the writer holds the same stripe across its
+                    // atomic rename AND its header `put`, so opening the
+                    // file and reading its captured headers under the stripe
+                    // guarantees both come from one render epoch — never a
+                    // body from render A paired with headers from render B.
+                    // The stripe guards `()`, so recover from a poisoned
+                    // holder instead of cascading its panic.
+                    let _guard = static_write_lock(&path_buf)
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let opened = validate_static_file(&root, &path_buf)
+                        .and_then(|path| ntex_files::NamedFile::open(path).ok());
+                    // Read the header snapshot with a SHARED lock + `peek`
+                    // (no recency bump), so serving a cached page never
+                    // serializes every worker behind one global exclusive
+                    // lock. `peek` borrows the key, so the hot hit path also
+                    // avoids re-allocating the key `String`.
+                    let headers = if opened.is_some() {
+                        STATIC_HEADERS
+                            .read()
+                            .or_poisoned()
+                            .peek(header_key.as_str())
+                            .cloned()
+                    } else {
+                        None
+                    };
+                    (opened, headers)
                 }
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let (opened, hit_headers) = match opened_join {
+                Ok(pair) => pair,
+                Err(join_err) => {
+                    crate::files::warn_blocking_join_failed("static file open task", &join_err);
+                    (None, None)
+                }
+            };
 
             let (response_options, html, opened) = if opened.is_none() {
+                // Known limitation (regeneration stampede): N concurrent
+                // requests to a still-missing `.html` each run a full SSR
+                // render here. The per-file stripe in `write_static_route`
+                // serializes only the DISK write, not the render, so the
+                // final on-disk state is always correct (last writer wins,
+                // writes are atomic) — the cost is duplicated CPU right after
+                // a cold start / manual delete. In-flight render dedup is
+                // intentionally NOT added: a correct version needs an async,
+                // per-path coordination primitive held across the render
+                // `.await` (a blocking lock across `.await` would risk the
+                // very deadlock class this crate guards against), and the
+                // degradation is transient and self-correcting.
                 let path = ResolvedStaticPath::new(&orig_path);
                 let (owner, html) = path
                     .build(
@@ -512,28 +564,29 @@ where
                 let reopened = if html.is_none() {
                     let root = root.clone();
                     let path_buf = path_buf.clone();
-                    ntex::rt::spawn_blocking(move || {
+                    match ntex::rt::spawn_blocking(move || {
                         validate_static_file(&root, &path_buf)
                             .and_then(|path| ntex_files::NamedFile::open(path).ok())
                     })
                     .await
-                    .ok()
-                    .flatten()
+                    {
+                        Ok(opened) => opened,
+                        Err(join_err) => {
+                            crate::files::warn_blocking_join_failed(
+                                "static file re-open task",
+                                &join_err,
+                            );
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
                 (response_options, html, reopened)
             } else {
-                // `LruCache::get` updates recency, so it needs a write lock.
-                // Key on the resolved file (matching the write side), so an
-                // alias of the URL that produced this `.html` still finds the
-                // captured headers.
-                let headers = STATIC_HEADERS
-                    .write()
-                    .or_poisoned()
-                    .get(&static_header_key(&path_buf))
-                    .cloned();
-                (headers, None, opened)
+                // Cache hit: body and headers were already paired under the
+                // stripe lock in the open task above (see `hit_headers`).
+                (hit_headers, None, opened)
             };
 
             // `Some(html)` only happens on a 404/error render that `build`
@@ -551,9 +604,22 @@ where
                 Some(html) => HttpResponse::NotFound()
                     .content_type("text/html")
                     .body(html),
-                None => opened
-                    .map(|named| named.into_response(&req))
-                    .unwrap_or_else(|| HttpResponse::InternalServerError().finish()),
+                None => opened.map(|named| named.into_response(&req)).unwrap_or_else(|| {
+                    // The file could not be opened even though the success
+                    // path either found a cache hit or just wrote it — log
+                    // before returning an otherwise-undiagnosable bare 500.
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(
+                        "static route {orig_path}: file {} could not be opened after render/write",
+                        path_buf.display()
+                    );
+                    #[cfg(not(feature = "tracing"))]
+                    eprintln!(
+                        "static route {orig_path}: file {} could not be opened after render/write",
+                        path_buf.display()
+                    );
+                    HttpResponse::InternalServerError().finish()
+                }),
             });
 
             if let Some(options) = response_options {
