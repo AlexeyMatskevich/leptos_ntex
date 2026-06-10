@@ -733,6 +733,53 @@ async fn websocket_ping_receives_pong() {
     sink.send(ws::Message::Close(None)).await.unwrap();
 }
 
+/// Positive sibling of the not-offered case below: when the client OFFERS
+/// the configured subprotocol, the 101 upgrade response must select it via
+/// `Sec-WebSocket-Protocol` (RFC 6455 §4.2.2). Without this leaf, a
+/// regression that stops echoing the configured subprotocol entirely would
+/// stay green — the negative sibling alone cannot catch it.
+#[ntex::test]
+async fn websocket_configured_subprotocol_is_echoed_when_offered() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 1024,
+                ws_channel_buffer: 16,
+                ws_subprotocol: Some("graphql-ws"),
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    // `TestServer::ws_at` offers no subprotocol, so build the client by hand
+    // with the configured protocol in its handshake.
+    let mut builder = ntex::ws::WsClient::builder(srv.url(EchoWebsocket::PATH));
+    builder
+        .address(srv.addr())
+        .timeout(ntex::time::Seconds(60))
+        .protocols(["graphql-ws"]);
+    let client = builder
+        .build(ntex::SharedCfg::new("ws-subprotocol-test"))
+        .await
+        .unwrap();
+    let conn = client.connect().await.unwrap();
+
+    assert_eq!(
+        conn.response()
+            .headers()
+            .get(ntex::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok()),
+        Some("graphql-ws"),
+        "server must select the configured subprotocol when the client offers it"
+    );
+
+    conn.sink().send(ws::Message::Close(None)).await.unwrap();
+}
+
 #[ntex::test]
 async fn websocket_configured_subprotocol_is_not_echoed_unless_offered() {
     use crate::LeptosServerFnConfig;
