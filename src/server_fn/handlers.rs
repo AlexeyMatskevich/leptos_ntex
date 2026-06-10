@@ -53,9 +53,19 @@ pub(crate) async fn dispatch_server_fn(
                     .map(accept_header_includes_html)
                     .unwrap_or(false);
                 let raw_referrer = req.headers().get(header::REFERER).cloned();
+                // The request is consumed by `service.run` below, so the
+                // origin used for the post-run Location checks is captured
+                // up front.
+                let (conn_scheme, conn_host) = {
+                    let connection = req.connection_info();
+                    (
+                        connection.scheme().to_string(),
+                        connection.host().to_string(),
+                    )
+                };
                 let referrer = raw_referrer
                     .as_ref()
-                    .and_then(|value| same_origin_referrer(&req, value));
+                    .and_then(|value| same_origin_location(&conn_scheme, &conn_host, value));
 
                 let mut res = service.run(NtexRequest::from((req, payload))).await;
 
@@ -68,7 +78,7 @@ pub(crate) async fn dispatch_server_fn(
                     });
 
                     if location_is_referrer {
-                        if let Some(referrer) = referrer {
+                        if let Some(referrer) = referrer.clone() {
                             *res.0.status_mut() = StatusCode::FOUND;
                             res.0.headers_mut().insert(header::LOCATION, referrer);
                         } else {
@@ -83,6 +93,28 @@ pub(crate) async fn dispatch_server_fn(
                     {
                         *res.0.status_mut() = StatusCode::FOUND;
                         res.0.headers_mut().insert(header::LOCATION, referrer);
+                    }
+                }
+
+                // Same-origin invariant for the server_fn-layer `Location`.
+                // The block above only repairs the EXACT referer echo, and
+                // it is gated on the strict `Accept` parser — but server_fn's
+                // own form-redirect fallback gates on a loose
+                // `contains("text/html")` check and rewrites the referer on
+                // the error path (appending the error query), so a
+                // referer-derived `Location` can reach this point in shapes
+                // the block above never sees (`Accept: text/html;q=0`, error
+                // URLs). Rather than chase every shape, enforce the
+                // documented policy wholesale: at this layer a redirect may
+                // only target the current origin. Application-level
+                // redirects via `redirect()`/`ResponseOptions` are applied
+                // in `extend_response` AFTER this check and stay untouched.
+                if let Some(location) = res.0.headers().get(header::LOCATION).cloned()
+                    && same_origin_location(&conn_scheme, &conn_host, &location).is_none()
+                {
+                    res.0.headers_mut().remove(header::LOCATION);
+                    if res.0.status().is_redirection() {
+                        *res.0.status_mut() = StatusCode::OK;
                     }
                 }
 
@@ -104,19 +136,26 @@ fn location_matches_referrer(location: &HeaderValue, referrer: &HeaderValue) -> 
     location == referrer || location.strip_suffix('?') == Some(referrer)
 }
 
-fn same_origin_referrer(req: &HttpRequest, referrer: &HeaderValue) -> Option<HeaderValue> {
-    let referrer = referrer.to_str().ok()?;
-    if referrer.starts_with('/') && !referrer.starts_with("//") {
-        return HeaderValue::from_str(referrer).ok();
+/// Accepts a `Location`/`Referer` value only when it stays on the current
+/// origin: either an origin-relative path (`/...`, but not the
+/// protocol-relative `//...`) or an absolute URI whose scheme and authority
+/// match the connection. Returns the same-origin path-and-query form, or
+/// `None` for everything else (cross-origin, protocol-relative,
+/// `javascript:`-style schemes, unparseable values).
+fn same_origin_location(
+    conn_scheme: &str,
+    conn_host: &str,
+    value: &HeaderValue,
+) -> Option<HeaderValue> {
+    let value = value.to_str().ok()?;
+    if value.starts_with('/') && !value.starts_with("//") {
+        return HeaderValue::from_str(value).ok();
     }
 
-    let uri = referrer.parse::<Uri>().ok()?;
+    let uri = value.parse::<Uri>().ok()?;
     let scheme = uri.scheme_str()?;
     let authority = uri.authority()?.as_str();
-    let connection_info = req.connection_info();
-    if !scheme.eq_ignore_ascii_case(connection_info.scheme())
-        || !authority.eq_ignore_ascii_case(connection_info.host())
-    {
+    if !scheme.eq_ignore_ascii_case(conn_scheme) || !authority.eq_ignore_ascii_case(conn_host) {
         return None;
     }
 
