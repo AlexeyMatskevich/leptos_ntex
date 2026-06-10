@@ -212,8 +212,65 @@ fn compressed_path(path: &Path, extension: &str) -> PathBuf {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AcceptedEncodings {
-    br: bool,
-    gzip: bool,
+    /// Effective q-weight the client gave `br` — `Some` only when accepted
+    /// (an explicit token or the `*` wildcard, with q > 0).
+    br: Option<f32>,
+    /// Effective q-weight the client gave `gzip` (same rules as `br`).
+    gzip: Option<f32>,
+}
+
+/// A precompressed sibling variant of a static file (`<file>.br` /
+/// `<file>.gz`) and the response metadata serving it implies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Precompressed {
+    Br,
+    Gzip,
+}
+
+impl Precompressed {
+    /// The on-disk sibling extension probed next to the plain file.
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Br => "br",
+            Self::Gzip => "gz",
+        }
+    }
+
+    fn content_encoding(self) -> ContentEncoding {
+        match self {
+            Self::Br => ContentEncoding::Br,
+            Self::Gzip => ContentEncoding::Gzip,
+        }
+    }
+
+    /// The `Content-Encoding` header value sent with the variant.
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::Br => "br",
+            Self::Gzip => "gzip",
+        }
+    }
+}
+
+/// The accepted precompressed variants, most preferred first: ordered by the
+/// client's q-weight (RFC 9110 §12.4.2), descending — a client sending
+/// `gzip;q=1, br;q=0.1` gets gzip even though a brotli sibling exists. An
+/// equal weight tie-breaks to `br` before `gzip` (the smaller transfer).
+/// Refused (`q=0`) and unmentioned encodings are absent.
+fn precompressed_preference(encodings: AcceptedEncodings) -> Vec<Precompressed> {
+    let mut weighted: Vec<(f32, Precompressed)> = Vec::with_capacity(2);
+    if let Some(q) = encodings.br {
+        weighted.push((q, Precompressed::Br));
+    }
+    if let Some(q) = encodings.gzip {
+        weighted.push((q, Precompressed::Gzip));
+    }
+    // Stable sort: on an equal q the push order above (br first) is the
+    // tie-break. Accepted weights are > 0.0 and never NaN (the parser only
+    // stores a finite q within 0..=1, and acceptance requires q > 0), so the
+    // `partial_cmp` fallback cannot fire.
+    weighted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    weighted.into_iter().map(|(_, variant)| variant).collect()
 }
 
 fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
@@ -233,8 +290,13 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
                 let Some((name, value)) = part.split_once('=') else {
                     continue;
                 };
+                // Accept only a valid qvalue (RFC 9110 §12.4.2: 0 to 1).
+                // Out-of-range (`q=2`), non-finite, and unparseable (`q=abc`)
+                // weights are all malformed alike and keep the default 1.0 —
+                // an invalid declaration must not outrank a valid one.
                 if name.trim().eq_ignore_ascii_case("q")
                     && let Ok(parsed) = value.trim().parse::<f32>()
+                    && (0.0..=1.0).contains(&parsed)
                 {
                     q = parsed;
                 }
@@ -251,8 +313,8 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
     }
 
     AcceptedEncodings {
-        br: br_q.or(wildcard_q).is_some_and(|q| q > 0.0),
-        gzip: gzip_q.or(wildcard_q).is_some_and(|q| q > 0.0),
+        br: br_q.or(wildcard_q).filter(|q| *q > 0.0),
+        gzip: gzip_q.or(wildcard_q).filter(|q| *q > 0.0),
     }
 }
 
@@ -304,23 +366,18 @@ fn open_static_file(
         .and_then(|ext| ext.to_str())
         .map(ntex_files::file_extension_to_mime);
 
-    for (extension, encoding, header_value, accepted) in [
-        ("br", ContentEncoding::Br, "br", accepted_encodings.br),
-        ("gz", ContentEncoding::Gzip, "gzip", accepted_encodings.gzip),
-    ] {
-        if !accepted {
-            continue;
-        }
-        if let Some(compressed) = canonical_under(canon_root, &compressed_path(&safe, extension))
+    for variant in precompressed_preference(accepted_encodings) {
+        if let Some(compressed) =
+            canonical_under(canon_root, &compressed_path(&safe, variant.extension()))
             && let Ok(mut file) = ntex_files::NamedFile::open(&compressed)
         {
-            file = file.set_content_encoding(encoding);
+            file = file.set_content_encoding(variant.content_encoding());
             if let Some(mime) = mime.clone() {
                 file = file.set_content_type(mime);
             }
             return Some(OpenedStaticFile {
                 file,
-                content_encoding: Some(header_value),
+                content_encoding: Some(variant.header_value()),
             });
         }
     }
@@ -503,60 +560,126 @@ mod tests {
         }
     }
 
-    // ----- accepted_encodings: Accept-Encoding negotiation spec ---------
-    // Parses the request's `Accept-Encoding` into the (br, gzip) pair that
-    // selects a precompressed sibling. Each token is matched case-insensitively
-    // with its q-weight honoured; `*` enables both, an explicit `q=0` refuses,
-    // and an UNRELATED token (`deflate`) must enable NEITHER — the case a
-    // `== "*"` → `!= "*"` slip would wrongly route into the wildcard branch.
-    fn accepted(accept_encoding: Option<&str>) -> (bool, bool) {
+    // ----- Accept-Encoding negotiation: ordered-preference spec ---------
+    // `accepted_encodings` parses the request's `Accept-Encoding` into
+    // per-encoding q-weights; `precompressed_preference` orders the accepted
+    // ones, highest q first (RFC 9110 §12.4.2), tie-breaking br before gzip.
+    // Axes (one context per non-default state): header presence; br token
+    // absent/accepted/refused; gzip token likewise; relative q order (live
+    // only when BOTH are accepted — implicit tie / explicit tie / either
+    // direction); wildcard absent/accepted/refused/backfilling one missing
+    // token; an unrelated token enabling neither (the case a `== "*"` →
+    // `!= "*"` slip would wrongly route into the wildcard branch); token and
+    // `q` case-insensitivity; a malformed, out-of-range, or non-finite q
+    // falling back to 1.0; and the tokens spanning two header lines.
+    fn preference(accept_encoding: &[&str]) -> Vec<&'static str> {
         let mut req = ntex::web::test::TestRequest::default();
-        if let Some(value) = accept_encoding {
-            req = req.header(header::ACCEPT_ENCODING, value);
+        for value in accept_encoding {
+            req = req.header(header::ACCEPT_ENCODING, *value);
         }
-        let encodings = accepted_encodings(&req.to_http_request());
-        (encodings.br, encodings.gzip)
+        precompressed_preference(accepted_encodings(&req.to_http_request()))
+            .into_iter()
+            .map(Precompressed::header_value)
+            .collect()
     }
 
     lets_expect! {
-        expect(accepted(accept_encoding)) as the_accepted_encodings {
-            let accept_encoding: Option<&str> = Some("br, gzip");
+        expect(preference(accept_encoding)) as the_encoding_preference {
+            let accept_encoding: &[&str] = &["br, gzip"];
 
-            to enables_both_when_both_are_offered { equal((true, true)) }
+            to prefers_brotli_on_an_implicit_tie { equal(vec!["br", "gzip"]) }
 
             when no_accept_encoding_is_sent {
-                let accept_encoding: Option<&str> = None;
-                to enables_neither { equal((false, false)) }
+                let accept_encoding: &[&str] = &[];
+                to accepts_neither { equal(Vec::<&str>::new()) }
             }
 
             when only_brotli_is_offered {
-                let accept_encoding = Some("br");
-                to enables_brotli_alone { equal((true, false)) }
+                let accept_encoding: &[&str] = &["br"];
+                to accepts_brotli_alone { equal(vec!["br"]) }
             }
 
             when only_gzip_is_offered {
-                let accept_encoding = Some("gzip");
-                to enables_gzip_alone { equal((false, true)) }
+                let accept_encoding: &[&str] = &["gzip"];
+                to accepts_gzip_alone { equal(vec!["gzip"]) }
+            }
+
+            when gzip_outweighs_brotli {
+                let accept_encoding: &[&str] = &["gzip;q=1, br;q=0.1"];
+                to prefers_gzip { equal(vec!["gzip", "br"]) }
+            }
+
+            when brotli_outweighs_gzip {
+                let accept_encoding: &[&str] = &["br;q=0.9, gzip;q=0.2"];
+                to prefers_brotli { equal(vec!["br", "gzip"]) }
+            }
+
+            when both_share_an_explicit_q {
+                let accept_encoding: &[&str] = &["gzip;q=0.5, br;q=0.5"];
+                to ties_break_to_brotli { equal(vec!["br", "gzip"]) }
             }
 
             when a_wildcard_is_offered {
-                let accept_encoding = Some("*");
-                to enables_both { equal((true, true)) }
+                let accept_encoding: &[&str] = &["*"];
+                to accepts_both { equal(vec!["br", "gzip"]) }
+            }
+
+            when a_wildcard_backfills_only_the_missing_token {
+                let accept_encoding: &[&str] = &["br;q=0.2, *;q=0.9"];
+                to ranks_the_explicit_q_below_the_wildcard {
+                    equal(vec!["gzip", "br"])
+                }
             }
 
             when an_unrelated_encoding_is_offered {
-                let accept_encoding = Some("deflate");
-                to enables_neither { equal((false, false)) }
+                let accept_encoding: &[&str] = &["deflate"];
+                to accepts_neither { equal(Vec::<&str>::new()) }
             }
 
             when brotli_is_explicitly_refused {
-                let accept_encoding = Some("br;q=0, gzip");
-                to enables_gzip_only { equal((false, true)) }
+                let accept_encoding: &[&str] = &["br;q=0, gzip"];
+                to accepts_gzip_only { equal(vec!["gzip"]) }
+            }
+
+            when gzip_is_explicitly_refused {
+                let accept_encoding: &[&str] = &["br, gzip;q=0"];
+                to accepts_brotli_only { equal(vec!["br"]) }
             }
 
             when the_wildcard_is_refused {
-                let accept_encoding = Some("*;q=0");
-                to enables_neither { equal((false, false)) }
+                let accept_encoding: &[&str] = &["*;q=0"];
+                to accepts_neither { equal(Vec::<&str>::new()) }
+            }
+
+            when tokens_are_mixed_case {
+                let accept_encoding: &[&str] = &["BR, GZip;Q=0.5"];
+                to matches_case_insensitively { equal(vec!["br", "gzip"]) }
+            }
+
+            when the_q_value_is_malformed {
+                let accept_encoding: &[&str] = &["gzip;q=abc, br;q=0.5"];
+                to treats_the_malformed_q_as_full_weight {
+                    equal(vec!["gzip", "br"])
+                }
+            }
+
+            when the_q_value_is_out_of_range {
+                let accept_encoding: &[&str] = &["gzip;q=2, br;q=1"];
+                to treats_it_as_malformed_and_ties_at_full_weight {
+                    equal(vec!["br", "gzip"])
+                }
+            }
+
+            when the_q_value_is_not_finite {
+                let accept_encoding: &[&str] = &["gzip;q=nan, br;q=0.5"];
+                to treats_it_as_malformed_and_keeps_full_weight {
+                    equal(vec!["gzip", "br"])
+                }
+            }
+
+            when the_encodings_span_two_header_lines {
+                let accept_encoding: &[&str] = &["br", "gzip"];
+                to merges_both_lines { equal(vec!["br", "gzip"]) }
             }
         }
     }

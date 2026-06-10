@@ -256,6 +256,56 @@ async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
     let _ = std::fs::remove_dir_all(&site_root);
 }
 
+/// A client whose q-weights rank gzip ABOVE brotli must receive the gzip
+/// sibling even though a `.br` sibling exists — the fixed br-then-gz probe
+/// order must not override the client's stated preference. (The q-ordering
+/// matrix itself is pinned by the `precompressed_preference` spec in
+/// `files.rs`; this leaf pins the end-to-end wiring through the handler.)
+#[ntex::test]
+async fn file_and_error_handler_honours_gzip_preference_over_br() {
+    use crate::file_and_error_handler;
+
+    let site_root = temp_site_root("file_handler_gzip_pref");
+    std::fs::create_dir_all(&site_root).unwrap();
+    std::fs::write(site_root.join("app.js"), "console.log('plain');").unwrap();
+    std::fs::write(site_root.join("app.js.br"), "br-bytes").unwrap();
+    std::fs::write(site_root.join("app.js.gz"), "gzip-bytes").unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_file_handler_gzip_pref")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/app.js")
+            .header(ntex::http::header::ACCEPT_ENCODING, "gzip;q=1, br;q=0.1")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(ntex::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "gzip;q=1 must outrank br;q=0.1"
+    );
+    let body = test::read_body(resp).await;
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "gzip-bytes");
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
 /// Builds a shell-only app with `file_and_error_handler` rooted at
 /// `site_root`, suitable for traversal assertions.
 macro_rules! traversal_app {
