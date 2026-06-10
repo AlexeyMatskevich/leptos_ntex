@@ -2,7 +2,7 @@
 //! covering body collection, streaming, and the WebSocket upgrade bridge.
 
 use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
-use futures::{Sink, SinkExt, Stream, StreamExt, channel::mpsc};
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
 use ntex::http::Payload;
 use ntex::util::Bytes as NBytes;
 use ntex::web::{self, HttpRequest};
@@ -239,24 +239,50 @@ where
                         let outbound_sink = sink.clone();
                         let mut outbound_errors = response_stream_tx.clone();
                         ntex::rt::spawn(async move {
-                            while let Some(incoming) = response_sink_rx.next().await {
+                            // The bridge parks on the OUTPUT receiver while
+                            // holding a clone of the INPUT sender, so it must
+                            // also watch the connection itself: when the peer
+                            // disconnects, ntex drops only the frame-service's
+                            // sender clone, and without this signal the bridge
+                            // and the server-fn forwarder would keep waiting
+                            // on each other forever — leaking both channels,
+                            // the task, and the WsSink of every closed
+                            // connection.
+                            let mut disconnect = outbound_sink.on_disconnect().fuse();
+                            loop {
+                                let incoming = futures::select! {
+                                    item = response_sink_rx.next() => match item {
+                                        Some(incoming) => incoming,
+                                        // Server fn finished its output:
+                                        // close the websocket politely.
+                                        None => break,
+                                    },
+                                    // Peer gone: release the INPUT sender so
+                                    // the server fn sees EOF and unwinds.
+                                    _ = disconnect => return,
+                                };
                                 if let Err(err) = outbound_sink
                                     .send(web::ws::Message::Binary(NBytes::copy_from_slice(&incoming)))
                                     .await
                                 {
-                                    // Surface the error to the
-                                    // server-fn receiver with full
-                                    // backpressure semantics; if the
-                                    // receiver is also gone there is
-                                    // nothing to do.
-                                    let _ = outbound_errors
-                                        .send(Err(InputStreamError::from_server_fn_error(
+                                    // Best-effort notify the server-fn
+                                    // receiver, then tear down. NOT an
+                                    // awaiting `send`: this is the teardown
+                                    // path, and backpressure here can
+                                    // deadlock — if the inbound channel is
+                                    // full because the server fn never drains
+                                    // its input, `send().await` would block
+                                    // forever and the bridge would never drop
+                                    // its sender clone (the very leak the
+                                    // disconnect watch above prevents).
+                                    let _ = outbound_errors.try_send(Err(
+                                        InputStreamError::from_server_fn_error(
                                             server_fn::error::ServerFnErrorErr::Request(
                                                 err.to_string(),
                                             ),
                                         )
-                                        .ser()))
-                                        .await;
+                                        .ser(),
+                                    ));
                                     let _ = outbound_sink
                                         .send(web::ws::Message::Close(Some(CloseReason {
                                             code: CloseCode::Abnormal,
