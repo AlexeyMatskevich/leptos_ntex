@@ -80,17 +80,45 @@ impl Res for NtexServerResponse {
     }
 
     fn content_type(&mut self, content_type: &str) {
-        if let Ok(content_type) = HeaderValue::from_str(content_type) {
-            self.0
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
+        // Degrade gracefully on an invalid header value rather than panic,
+        // but log it — silent no-ops are the same observability gap the
+        // crate already closed for `ResponseOptions::redirect`/
+        // `set_default_content_type` (see `response.rs`).
+        match HeaderValue::from_str(content_type) {
+            Ok(content_type) => {
+                self.0
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, content_type);
+            }
+            Err(_) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "skipped server-fn Content-Type: {content_type:?} is not a valid header value"
+                );
+                #[cfg(not(feature = "tracing"))]
+                eprintln!(
+                    "skipped server-fn Content-Type: {content_type:?} is not a valid header value"
+                );
+            }
         }
     }
 
     fn redirect(&mut self, path: &str) {
-        if let Ok(path) = HeaderValue::from_str(path) {
-            *self.0.status_mut() = StatusCode::FOUND;
-            self.0.headers_mut().insert(header::LOCATION, path);
+        match HeaderValue::from_str(path) {
+            Ok(path) => {
+                *self.0.status_mut() = StatusCode::FOUND;
+                self.0.headers_mut().insert(header::LOCATION, path);
+            }
+            Err(_) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "skipped server-fn redirect: {path:?} is not a valid Location header value"
+                );
+                #[cfg(not(feature = "tracing"))]
+                eprintln!(
+                    "skipped server-fn redirect: {path:?} is not a valid Location header value"
+                );
+            }
         }
     }
 }
