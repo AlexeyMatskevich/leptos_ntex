@@ -74,11 +74,18 @@ pub async fn sum_two(a: i32, b: i32) -> Result<i32, ServerFnError> {
 }
 
 fn temp_site_root(name: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("leptos_ntex_integration_{name}_{nonce}"))
+    // A nanosecond timestamp alone collides when several parallel
+    // `cargo-mutants` processes sharing the same temp dir request a root
+    // within one clock tick, so the path carries the pid plus a
+    // process-scoped atomic counter instead (the same pattern as the
+    // in-crate `tests::temp_site_root` and `files::resolves_under_root`).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "leptos_ntex_integration_{name}_{}_{}",
+        std::process::id(),
+        UNIQUE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[ntex::test]
