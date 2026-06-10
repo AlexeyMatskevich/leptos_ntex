@@ -150,6 +150,30 @@ pub(crate) fn content_length_exceeds(req: &HttpRequest, limit: usize) -> bool {
         .is_some_and(|declared| declared > limit)
 }
 
+/// Upper bound on the buffer capacity reserved up-front from a declared
+/// `Content-Length`, before any body byte has actually arrived. The
+/// declaration is client-controlled: without a cap, N parallel connections
+/// each declaring (up to) the configured limit and then trickling the body
+/// would reserve N × limit of memory before sending a single byte. 64 KiB
+/// keeps the up-front reservation small (actix-web caps its eager body
+/// buffer at 32 KiB for the same reason); the buffer still grows on demand
+/// as real chunks arrive, so honest large uploads pay only amortized
+/// reallocation, not a changed limit.
+pub(crate) const INITIAL_PAYLOAD_CAPACITY_CAP: usize = 64 * 1024;
+
+/// Initial buffer capacity for collecting a request body: the declared
+/// `Content-Length` when it is plausible (present and within `limit`),
+/// clamped to [`INITIAL_PAYLOAD_CAPACITY_CAP`] so the declaration alone
+/// cannot reserve large allocations. An absent or over-limit declaration
+/// reserves nothing — the over-limit case is rejected by the preflight /
+/// streaming check anyway, so pre-sizing for it would only serve an attacker.
+pub(crate) fn initial_payload_capacity(content_length: Option<usize>, limit: usize) -> usize {
+    content_length
+        .filter(|declared| *declared <= limit)
+        .unwrap_or(0)
+        .min(INITIAL_PAYLOAD_CAPACITY_CAP)
+}
+
 /// Collects the full request body into memory, enforcing `limit` against
 /// the cumulative chunk size. On overflow, stashes a [`PayloadTooLarge`]
 /// marker in `req.extensions_mut()` so the outer handler can translate the
@@ -159,14 +183,12 @@ pub(crate) async fn collect_payload(
     mut payload: Payload,
     limit: usize,
 ) -> Result<SfBytes, io::Error> {
-    let capacity = req
+    let declared = req
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|declared| *declared <= limit)
-        .unwrap_or(0);
-    let mut buf = SfBytesMut::with_capacity(capacity);
+        .and_then(|s| s.parse::<usize>().ok());
+    let mut buf = SfBytesMut::with_capacity(initial_payload_capacity(declared, limit));
     while let Some(chunk) = payload.recv().await {
         let chunk = chunk.map_err(io::Error::other)?;
         if buf.len().saturating_add(chunk.len()) > limit {

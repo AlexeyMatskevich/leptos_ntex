@@ -212,6 +212,62 @@ lets_expect! {
     }
 }
 
+// ----- initial_payload_capacity: eager-allocation clamp -------------
+// The up-front buffer reservation derived from a client-declared
+// `Content-Length`. Axes: declaration present/absent; declared vs `limit`
+// (an over-limit declaration reserves NOTHING — it is rejected later
+// anyway, so pre-sizing for it would only serve an attacker; boundary at
+// exactly-limit and one-over); declared vs the 64 KiB cap (a plausible
+// declaration passes through below the cap and clamps at/above it —
+// boundary at exactly-cap and one-over). The default `limit` sits ABOVE
+// the cap so both axes stay observable; the exactly-the-limit leaf drops
+// `limit` below the cap to show the declaration passing through unclamped.
+lets_expect! {
+    expect(crate::config::initial_payload_capacity(content_length, limit)) as the_initial_capacity {
+        let limit = 8 * 1024 * 1024usize;
+        let content_length: Option<usize> = Some(1024);
+
+        to reserves_the_declared_size { equal(1024usize) }
+
+        when no_content_length_is_declared {
+            let content_length: Option<usize> = None;
+            to reserves_nothing { equal(0usize) }
+        }
+
+        when the_declaration_is_one_byte_over_the_limit {
+            let content_length = Some(limit + 1);
+            to reserves_nothing { equal(0usize) }
+        }
+
+        when the_declaration_is_exactly_the_limit_and_below_the_cap {
+            let limit = 4096usize;
+            let content_length = Some(4096);
+            to reserves_the_declared_size { equal(4096usize) }
+        }
+
+        when the_declaration_is_exactly_the_cap {
+            let content_length = Some(crate::config::INITIAL_PAYLOAD_CAPACITY_CAP);
+            to reserves_the_full_cap {
+                equal(crate::config::INITIAL_PAYLOAD_CAPACITY_CAP)
+            }
+        }
+
+        when the_declaration_is_one_byte_over_the_cap {
+            let content_length = Some(crate::config::INITIAL_PAYLOAD_CAPACITY_CAP + 1);
+            to clamps_to_the_cap {
+                equal(crate::config::INITIAL_PAYLOAD_CAPACITY_CAP)
+            }
+        }
+
+        when the_declaration_is_far_over_the_cap {
+            let content_length = Some(1024 * 1024);
+            to clamps_to_the_cap {
+                equal(crate::config::INITIAL_PAYLOAD_CAPACITY_CAP)
+            }
+        }
+    }
+}
+
 // ----- DEFAULT_PAYLOAD_LIMIT: pins the documented 2 MiB default ------
 // Matches ntex's own `PayloadConfig` default. A regression in the
 // constant expression (e.g. a dropped factor) changes the limit silently.
