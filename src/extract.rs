@@ -36,6 +36,16 @@ where
 /// renderer must be spelled explicitly because Rust does not support
 /// default type parameters on free functions.
 ///
+/// # Panics
+///
+/// The extractor future is wrapped in a [`SendWrapper`] around the non-`Send`
+/// ntex request, so — like every server-function entry point in this crate —
+/// it must be awaited on the ntex worker thread that invoked the server
+/// function. Awaiting or dropping it on a different thread (e.g. after moving
+/// it onto a foreign runtime) panics. Inside a normal server function body the
+/// future never leaves its worker, so this is only a hazard for code that
+/// deliberately relocates it.
+///
 /// ```no_run
 /// use leptos::prelude::*;
 /// use leptos_ntex_unofficial::extract_with_err;

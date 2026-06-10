@@ -156,6 +156,17 @@ where
 /// The `stream_builder` argument selects how the HTML body is produced:
 /// out-of-order / in-order / async. See the [`render_app_to_stream`] family
 /// for common choices.
+///
+/// # Panics
+///
+/// The returned future captures the non-[`Send`] ntex [`HttpRequest`] inside a
+/// [`SendWrapper`]. Although the future's *type* is `Send` (so it composes
+/// with `Send`-bounded combinators), it must be **polled and dropped on the
+/// thread that created it** — the ntex worker handling the request. Polling or
+/// dropping it on another thread panics. In particular, do **not**
+/// `tokio::spawn` it or move it onto a foreign runtime's thread pool, despite
+/// the `Send` type that the `leptos_axum::handle_response_inner` shape invites.
+/// Unlike [`Request`], this future has no leak-instead-of-panic drop guard.
 #[allow(clippy::type_complexity)]
 pub fn handle_response_inner<IV>(
     additional_context: impl FnOnce() + 'static + Send,
