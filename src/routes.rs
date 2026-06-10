@@ -84,9 +84,16 @@ impl NtexPath for Vec<PathSegment> {
                     path.push('}');
                 }
                 PathSegment::Splat(s) => {
+                    // ntex tail-segment syntax: `{name}*` matches the whole
+                    // remainder of the path. The actix-style `{name:.*}` is a
+                    // custom regex on a SINGLE segment in ntex-router, so it
+                    // silently stops matching at the next `/` (nested URLs
+                    // would fall through to the catch-all/fallback). Leptos
+                    // splats are always terminal, which is exactly what the
+                    // ntex tail match requires.
                     path.push('{');
                     path.push_str(s);
-                    path.push_str(":.*}");
+                    path.push_str("}*");
                 }
                 PathSegment::Unit => {}
                 PathSegment::OptionalParam(_) => {
