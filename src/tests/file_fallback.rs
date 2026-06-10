@@ -344,11 +344,14 @@ async fn traversal_relative_parent_rejected() {
     let status = resp.status();
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_ne!(
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(
         status,
-        StatusCode::OK,
-        "traversal must not return 200, got body = {text:?}"
+        StatusCode::NOT_FOUND,
+        "traversal must fall back to the 404 shell, got body = {text:?}"
     );
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(
         !text.contains("SECRET"),
         "traversal leaked: body = {text:?}"
@@ -369,8 +372,13 @@ async fn traversal_percent_encoded_parent_rejected() {
     let app = traversal_app!(&site_root);
     let req = test::TestRequest::with_uri("/%2e%2e/secret.txt").to_request();
     let resp = test::call_service(&app, req).await;
+    // The full safe-rejection contract, not just secret absence: a 500 or an
+    // empty response must NOT pass for a correct rejection. The handler falls
+    // back to the 404 shell on a rejected path.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(!text.contains("PCT_SECRET"));
 
     let _ = std::fs::remove_dir_all(&parent);
@@ -391,7 +399,10 @@ async fn traversal_absolute_path_rejected() {
     let status = resp.status();
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_ne!(status, StatusCode::OK);
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(!text.contains("root:"), "leaked /etc/passwd: {text:?}");
 
     let _ = std::fs::remove_dir_all(&site_root);
@@ -408,8 +419,12 @@ async fn traversal_dotfile_rejected() {
     let app = traversal_app!(&site_root);
     let req = test::TestRequest::with_uri("/.env").to_request();
     let resp = test::call_service(&app, req).await;
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(!text.contains("API_KEY"));
 
     let _ = std::fs::remove_dir_all(&site_root);
@@ -447,8 +462,12 @@ async fn traversal_symlink_escape_rejected() {
     let app = traversal_app!(&site_root);
     let req = test::TestRequest::with_uri("/escape.txt").to_request();
     let resp = test::call_service(&app, req).await;
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(!text.contains("OUTSIDE"), "symlink escape leaked: {text:?}");
 
     let _ = std::fs::remove_dir_all(&parent);
@@ -465,8 +484,12 @@ async fn traversal_dotfile_in_subdirectory_rejected() {
 
     let req = test::TestRequest::with_uri("/subdir/.env").to_request();
     let resp = test::call_service(&app, req).await;
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(
         !text.contains("SECRET"),
         "dotfile in subdirectory must not be served"
@@ -485,8 +508,12 @@ async fn traversal_encoded_slash_dotfile_rejected() {
 
     let req = test::TestRequest::with_uri("/subdir%2F.env").to_request();
     let resp = test::call_service(&app, req).await;
+    // Full safe-rejection contract (status + shell + no secret) — secret
+    // absence alone would also pass on a 500 or an empty body.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
     assert!(
         !text.contains("SECRET=encoded"),
         "encoded slash must not bypass dotfile filtering"
