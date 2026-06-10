@@ -54,15 +54,21 @@ where
             >,
         > + 'static,
 {
-    REGISTERED_SERVER_FUNCTIONS
-        .write()
-        .or_poisoned()
-        .entry(T::PATH)
-        .or_default()
-        .push((
-            T::Protocol::METHOD,
-            ServerFnTraitObj::new::<T>(|req| Box::pin(T::run_on_server(req))),
-        ));
+    let obj = ServerFnTraitObj::new::<T>(|req| Box::pin(T::run_on_server(req)));
+    let method = T::Protocol::METHOD;
+    let mut guard = REGISTERED_SERVER_FUNCTIONS.write().or_poisoned();
+    let entries = guard.entry(T::PATH).or_default();
+    // Idempotent and last-writer-wins, matching the reference registries
+    // (`server_fn`'s axum/actix maps key on `(path, method)` and `insert`):
+    // a repeated or explicit registration REPLACES the entry for that
+    // `(path, method)` instead of appending a duplicate. Without this, an
+    // explicit registration on a native target where `inventory` already
+    // populated the map would be dead (the first match wins in
+    // `lookup_server_fn`) and `server_fn_paths()` would emit duplicates.
+    match entries.iter_mut().find(|(m, _)| *m == method) {
+        Some(slot) => slot.1 = obj,
+        None => entries.push((method, obj)),
+    }
 }
 
 /// Returns an iterator over the `(path, method)` pairs of every server
