@@ -209,6 +209,14 @@ where
 
 /// Combines [`generate_route_list_with_exclusions`] and
 /// [`generate_route_list_with_ssg`].
+///
+/// Exclusions affect only the returned route **listings** (which paths get
+/// registered as handlers): an excluded path is marked `exclude` so you can
+/// mount a custom handler there. They do **not** narrow the
+/// [`StaticRouteGenerator`] — `generate()` still prerenders every
+/// `SsrMode::Static` route, including excluded ones. This mirrors the
+/// reference `leptos_axum`/`leptos_actix` adapters; build the generator from a
+/// filtered app if you need SSG to skip a route.
 pub fn generate_route_list_with_exclusions_and_ssg<IV>(
     app_fn: impl Fn() -> IV + 'static + Send + Clone,
     excluded_routes: Option<Vec<String>>,
