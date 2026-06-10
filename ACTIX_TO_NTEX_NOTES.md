@@ -59,10 +59,13 @@ does; all of them adapted to ntex types:
   `PinnedFuture<HttpResponse>`), so it can be embedded in custom
   route handlers.
 - **Async filesystem I/O on the static path.** `write_static_route`
-  and `handle_static_route` wrap `fs::write`, `fs::create_dir_all`,
-  `Path::exists`, and `NamedFile::open` in `ntex::rt::spawn_blocking`
-  so slow filesystems (NFS, FUSE, overloaded disks) don't stall the
-  arbiter.
+  and `handle_static_route` run their blocking filesystem work
+  (`create_dir_all`, the atomic `write_file_atomic` temp-write + `rename`,
+  `canonicalize`, and `NamedFile::open`) on `ntex::rt::spawn_blocking` so
+  slow filesystems (NFS, FUSE, overloaded disks) don't stall the arbiter.
+  The write is atomic (temp sibling + `rename`, guarded against scratch-file
+  leaks) so a concurrent reader never observes a truncated file; see the
+  hardening note below.
 
 ## Original to this crate
 
@@ -184,8 +187,11 @@ Two paths, chosen at registration time:
 
 - **Catch-all.** `handle_server_fns()` / `handle_server_fns_with_context()`
   mount at a single wildcard route and look the target up in
-  `REGISTERED_SERVER_FUNCTIONS` per request. Useful for `/api/{tail:.*}`
-  style prefixes and for migration from the actix shape.
+  `REGISTERED_SERVER_FUNCTIONS` per request. Mount it at the ntex tail
+  pattern `/api/{tail}*` — **not** actix's `/api/{tail:.*}`, which matches
+  only a single segment in ntex-router and would 404 any server-fn endpoint
+  containing a slash. Useful for prefix-style mounting and migration from the
+  actix shape.
 - **Per-path.** When you register via `LeptosRoutes::leptos_routes*`,
   each `(path, method)` gets its own handler closing over a
   pre-resolved `ServerFnTraitObj` with a cached
@@ -199,6 +205,18 @@ referrer-based 302 fallback for HTML form submissions, and the
 `Location` header merge from `ResponseOptions` (singleton response
 headers replace earlier values; `Set-Cookie` and other repeatable
 headers still append).
+
+The referrer fallback is same-origin only. `server_fn`'s own
+form-redirect feature decides whether to echo the raw `Referer` using a
+loose `Accept: …contains("text/html")` check, so a server-fn `Location`
+derived from the referrer can reach `dispatch_server_fn` even for
+`Accept` shapes the integration's strict parser rejects (e.g.
+`text/html;q=0`) or rewritten error URLs. Rather than mirror every
+shape, the handler enforces the invariant wholesale: any `Location` left
+by the server-fn layer that does not resolve to the current origin is
+stripped (and a redirect status downgraded to `200`). Application-level
+redirects set through `redirect()` / `ResponseOptions` are applied
+afterwards and are unaffected.
 
 ## Payload limits and 413
 
@@ -231,6 +249,13 @@ The `Req::try_into_websocket` impl on `NtexRequest` upgrades via
   `futures::channel::mpsc`. Producers call `Sink::send().await`, so a
   slow consumer suspends the frame-reader task. Buffer capacity is
   `LeptosServerFnConfig::ws_channel_buffer`.
+- **Disconnect teardown.** The outbound bridge task parks on the
+  server-fn output receiver while holding a clone of the input sender, so
+  it also selects on `WsSink::on_disconnect()`. When the peer goes away it
+  returns and drops that sender clone, signalling EOF to the server fn so
+  the forwarder unwinds — otherwise the bridge and forwarder would wait on
+  each other forever, leaking the task, both channels, and the socket on
+  every closed connection.
 - **Fragment reassembly (RFC 6455 §5.4).** ntex delivers
   fragmented messages as
   `Frame::Continuation(Item::{FirstText, FirstBinary, Continue,
@@ -266,13 +291,16 @@ path through `safe_subpath`, which:
 - requires every resulting path component to be
   `Component::Normal` and not hidden, which blocks absolute-path
   smuggling and encoded separator tricks such as `%2F.env`;
-- canonicalizes both the candidate path and `site_root` and requires
-  the candidate to stay under the canonical root, which defeats
-  symlink-escape.
+- canonicalizes the candidate path and requires it to stay under the
+  canonical `site_root`, which defeats symlink-escape.
 
 The whole check runs on `ntex::rt::spawn_blocking` because
-`canonicalize` and `NamedFile::open` both perform blocking I/O. Adds
-`percent-encoding` as a required dep.
+`canonicalize` and `NamedFile::open` both perform blocking I/O. The
+`site_root` realpath itself is resolved once per file-serving handler and
+cached (the root is fixed for the app's lifetime; only the per-request
+*target* is re-canonicalized), the same construction-time canonicalization
+`ntex_files::Files` performs — a deploy that swaps the root symlink needs a
+restart to take effect. Adds `percent-encoding` as a required dep.
 
 ## Feature flags
 
@@ -300,8 +328,11 @@ islands-router = ["leptos/islands-router"]
   actix; the `register_leptos_routes(cfg, ...)` shortcut is the
   ergonomic escape hatch.
 - `Request::Drop` leaks an `Rc` increment on cross-thread drops
-  instead of panicking. Actix does not have an equivalent trade-off
-  because `actix_web::HttpRequest` is `Send`.
+  instead of panicking. `actix_web::HttpRequest` is **not** `Send`
+  either — `leptos_actix` wraps it in the same `SendWrapper`. The
+  divergence is the drop *policy*: `leptos_actix` lets a cross-thread
+  drop panic, whereas this crate leaks a bounded `Rc` increment instead,
+  so a migrating `Owner` never tears down an arbiter.
 - The `replace_blocks` argument on
   `render_app_to_stream_with_context_and_replace_blocks` is accepted
   for API parity with `leptos_actix` / `leptos_axum` but is currently

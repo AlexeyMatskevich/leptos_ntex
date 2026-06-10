@@ -20,7 +20,7 @@ Add the dependency:
 ```toml
 [dependencies]
 leptos = { version = "0.8", features = ["ssr", "nonce"] }
-leptos-ntex-unofficial = "0.4"
+leptos-ntex-unofficial = "0.5"
 ntex = "3"
 ```
 

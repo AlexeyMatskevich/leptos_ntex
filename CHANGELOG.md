@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The HTML-form server-function referrer fallback now enforces its documented
+  same-origin policy regardless of the request's `Accept` header. The
+  same-origin check was previously gated on the strict `Accept` parser, but
+  `server_fn`'s own form-redirect fallback uses a loose
+  `contains("text/html")` test and can inject the raw `Referer` (or a rewritten
+  error URL) as `Location` for `Accept` shapes the strict parser rejects (e.g.
+  `text/html;q=0`). The dispatcher now strips any server-fn `Location` that does
+  not resolve to the current origin (downgrading the redirect to `200`), closing
+  the cross-origin redirect gap for non-browser callers. Application redirects
+  via `redirect()` / `ResponseOptions` are applied afterwards and are
+  unaffected.
+
+### Fixed
+
+- `SsrMode::Static`/dynamic routes registered with a `*splat` (catch-all)
+  segment now match **nested** URLs. `generate_route_list` emitted the
+  actix-style `{name:.*}` for splats, which matches only a single segment in
+  ntex-router, so nested paths under any wildcard route silently fell through to
+  the router fallback (`404`/file handler). Splat segments now use ntex's
+  cross-segment tail pattern `{name}*`.
+- The server-function WebSocket bridge no longer leaks its bridge task, both
+  mpsc channels, and the socket on every closed connection. The outbound bridge
+  parked on the server-fn output while holding a clone of the input sender and
+  never observed the peer disconnect, so a request/response server fn (one that
+  waits for input) and the bridge waited on each other forever — unbounded
+  memory growth under connection churn. The bridge now selects on
+  `WsSink::on_disconnect()` and releases the sender on disconnect.
+- `register_explicit::<T>()` is now idempotent per `(path, method)`: a repeated
+  or explicit registration replaces the existing entry instead of appending a
+  duplicate, matching the reference `server_fn` registries. Previously, on
+  native targets where `inventory` already populated the map, an explicit
+  registration was dead (first match won) and `server_fn_paths()` reported
+  duplicates.
+- Invalid `Location`/`Content-Type` values passed to the server-fn response
+  layer are now logged (via `tracing` when enabled, else `eprintln!`) before
+  being skipped, instead of silently no-op'ing — and the static-route serve path
+  no longer returns an undiagnosable bare `500`/`404` when a `spawn_blocking`
+  file task fails.
+
+### Changed
+
+- The declared minimum `ntex` version is now `3.9.6` (was `3.7.2`). The crate
+  is only built and tested against `3.9.x`, and `3.7.2` no longer compiles
+  against the current semver-compatible `ntex-io`/`ntex-bytes`, so the old lower
+  bound advertised support that did not build.
+
+### Performance
+
+- The `site_root` realpath is now resolved once per file-serving handler and
+  cached, instead of re-`canonicalize`-ing the whole root on every asset
+  request (the per-request target canonicalization that enforces the
+  symlink-escape guard is unchanged). Static-route cache hits read the captured
+  headers under a shared lock with `peek` (no global exclusive lock per hit) and
+  without re-allocating the cache key, and pair the file body with its headers
+  under the per-file write stripe so a concurrent regeneration cannot serve a
+  body and headers from two different renders.
+- Incoming server-function stream chunks and unfragmented WebSocket frames are
+  bridged from ntex `Bytes` into `bytes::Bytes` with `from_owner` (zero-copy)
+  instead of `copy_from_slice`.
+
 ## [0.5.0] - 2026-06-08
 
 ### Security
