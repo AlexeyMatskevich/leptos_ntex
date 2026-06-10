@@ -127,7 +127,7 @@ where
     let route = Route::<Err>::new();
     // RFC 9110 §9.3.2: HEAD == GET without body. ntex's h1 encoder
     // unconditionally strips the body when the request method is HEAD
-    // (ntex-3.7.2/src/http/h1/encoder.rs:292-293 forces
+    // (ntex-3.9.6/src/http/h1/encoder.rs forces
     // `TransferEncoding::empty()`), so binding the same handler to
     // both methods produces the correct status and headers with no
     // body on the wire. `Route::method()` pushes onto a Vec that
