@@ -47,7 +47,13 @@ lets_expect = "0.5.2"
 serde_json = "1.0.145"
 server_fn = { version = "0.8.12", features = ["cbor"] }
 
+[[example]]
+name = "auth_extractor"
+path = "examples/auth_extractor.rs"
+required-features = ["cookie"]
+
 [features]
 default = []
+cookie = ["ntex/cookie"]
 tracing = ["dep:tracing"]
 islands-router = ["leptos/islands-router"]

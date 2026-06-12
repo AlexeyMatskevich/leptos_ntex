@@ -76,6 +76,13 @@ A runnable version of the same example is in
 cargo run --example basic
 ```
 
+There is also a server-function extractor example in
+[`examples/auth_extractor.rs`](examples/auth_extractor.rs):
+
+```sh
+cargo check --example auth_extractor --features cookie
+```
+
 ## Recommended ntex wiring
 
 Most applications want three ntex registrations:
