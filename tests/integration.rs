@@ -96,6 +96,16 @@ fn temp_site_root(name: &str) -> std::path::PathBuf {
     ))
 }
 
+fn server_url(srv: &test::TestServer, uri: &str) -> String {
+    // `TestServer::url` goes through `localhost`, while these tests want the
+    // exact socket address ntex bound so CI does not add resolver noise.
+    if uri.starts_with('/') {
+        format!("http://{}{}", srv.addr(), uri)
+    } else {
+        format!("http://{}/{}", srv.addr(), uri)
+    }
+}
+
 #[ntex::test]
 async fn real_server_renders_ssr_and_serves_server_fn() {
     register_explicit::<SumTwo>();
@@ -113,7 +123,7 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
     .await;
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url("/"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/"))
         .send()
         .await
         .unwrap();
@@ -124,7 +134,7 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
     assert!(html.contains("<title>Home</title>"));
 
     let resp = srv
-        .request(ntex::http::Method::POST, srv.url(SumTwo::PATH))
+        .request(ntex::http::Method::POST, server_url(&srv, SumTwo::PATH))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .send_body("a=3&b=4")
@@ -144,7 +154,7 @@ async fn catchall_handle_server_fns_returns_405_on_method_mismatch() {
         test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url(SumTwo::PATH))
+        .request(ntex::http::Method::GET, server_url(&srv, SumTwo::PATH))
         .send()
         .await
         .unwrap();
@@ -171,7 +181,7 @@ async fn real_server_method_specific_routing_rejects_wrong_method() {
     .await;
 
     let ok = srv
-        .request(ntex::http::Method::POST, srv.url(SumTwo::PATH))
+        .request(ntex::http::Method::POST, server_url(&srv, SumTwo::PATH))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .send_body("a=3&b=4")
@@ -183,7 +193,7 @@ async fn real_server_method_specific_routing_rejects_wrong_method() {
     // rejected at the router level; ntex may surface that as either 404
     // or 405 depending on resource matching details.
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url(SumTwo::PATH))
+        .request(ntex::http::Method::GET, server_url(&srv, SumTwo::PATH))
         .send()
         .await
         .unwrap();
@@ -220,7 +230,7 @@ async fn real_server_file_and_error_handler_serves_file_and_falls_back() {
     .await;
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url("/robots.txt"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/robots.txt"))
         .send()
         .await
         .unwrap();
@@ -230,7 +240,7 @@ async fn real_server_file_and_error_handler_serves_file_and_falls_back() {
     assert!(text.contains("User-agent:"));
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url("/does-not-exist"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/does-not-exist"))
         .send()
         .await
         .unwrap();
@@ -274,7 +284,7 @@ async fn real_server_site_pkg_dir_service_registers() {
     .await;
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url("/pkg/app.js"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/app.js"))
         .send()
         .await
         .unwrap();
@@ -284,7 +294,7 @@ async fn real_server_site_pkg_dir_service_registers() {
     assert!(text.contains("console.log"));
 
     let resp = srv
-        .request(ntex::http::Method::GET, srv.url("/pkg/app.js"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/app.js"))
         .header(ntex::http::header::ACCEPT_ENCODING, "br")
         .send()
         .await
@@ -304,7 +314,7 @@ async fn real_server_site_pkg_dir_service_registers() {
     let resp = srv
         .request(
             ntex::http::Method::GET,
-            srv.url("/pkg/snippets/crate/inline.js"),
+            server_url(&srv, "/pkg/snippets/crate/inline.js"),
         )
         .send()
         .await
@@ -355,7 +365,7 @@ async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
     .await;
 
     let resp = srv
-        .request(ntex::http::Method::POST, srv.url(MulTwo::PATH))
+        .request(ntex::http::Method::POST, server_url(&srv, MulTwo::PATH))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .send_body("a=3&b=4")
@@ -405,7 +415,7 @@ async fn real_server_roundtrips_cbor_server_fn() {
     ciborium::ser::into_writer(&args, &mut buf).unwrap();
 
     let resp = srv
-        .request(ntex::http::Method::POST, srv.url(SumCbor::PATH))
+        .request(ntex::http::Method::POST, server_url(&srv, SumCbor::PATH))
         .header("Content-Type", "application/cbor")
         .header("Accept", "application/cbor")
         .send_body(buf)
@@ -441,7 +451,7 @@ async fn real_server_head_mirrors_get_with_empty_body() {
     .await;
 
     let get_resp = srv
-        .request(ntex::http::Method::GET, srv.url("/"))
+        .request(ntex::http::Method::GET, server_url(&srv, "/"))
         .send()
         .await
         .unwrap();
@@ -452,7 +462,7 @@ async fn real_server_head_mirrors_get_with_empty_body() {
         .cloned();
 
     let head_resp = srv
-        .request(ntex::http::Method::HEAD, srv.url("/"))
+        .request(ntex::http::Method::HEAD, server_url(&srv, "/"))
         .send()
         .await
         .unwrap();
@@ -490,7 +500,7 @@ async fn real_server_head_on_missing_route_not_200() {
     let resp = srv
         .request(
             ntex::http::Method::HEAD,
-            srv.url("/this-path-does-not-exist"),
+            server_url(&srv, "/this-path-does-not-exist"),
         )
         .send()
         .await
