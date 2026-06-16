@@ -98,13 +98,16 @@ pub(crate) async fn dispatch_server_fn(
                         res.0.headers_mut().insert(header::LOCATION, referrer);
                     }
                 }
-                // A non-HTML client (including the `text/html;q=0` case) never
-                // reaches a form redirect to strip: `NtexRequest::accepts`
-                // hides a strict-refused `text/html` token from server_fn's
-                // fallback at the source, so the fallback simply does not fire.
-                // Any 3xx still present here is therefore a user middleware's own
-                // short-circuit response, which must pass through untouched
-                // (the same-origin guard below still applies to its `Location`).
+                // No non-HTML branch: when the strict `Accept` parser refuses
+                // HTML (e.g. `text/html;q=0`) this integration deliberately does
+                // NOT strip server_fn's form-redirect — matching `leptos_axum` /
+                // `leptos_actix`, whose form-redirect fallback fires on the same
+                // loose `contains("text/html")`. A same-origin form `302` is left
+                // intact, and a user middleware's own short-circuit `3xx` is
+                // likewise untouched. (There is no way to suppress only the
+                // fallback: server_fn drives it solely off `req.accepts()`, which
+                // middleware shares — see `NtexRequest::accepts`.) The cross-origin
+                // case is still handled by the same-origin guard below.
 
                 // Same-origin invariant for the server_fn-layer `Location`.
                 // The block above only repairs the EXACT referer echo, and

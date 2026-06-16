@@ -68,27 +68,7 @@ where
     }
 
     fn accepts(&self) -> Option<Cow<'_, str>> {
-        let accept = self.header("Accept");
-        // `server_fn`'s form-redirect fallback — the ONLY consumer of
-        // `accepts()` — keys on a loose `contains("text/html")`, which still
-        // treats `text/html;q=0` as "accepts HTML" even though that q-value
-        // explicitly REFUSES it. Align `server_fn` with this integration's
-        // strict `Accept` parser at the source: when the header carries a
-        // `text/html` token that strict parsing rejects, hide it so the fallback
-        // does not emit a browser form redirect to a client that asked for a
-        // structured response. Keeping the decision here (rather than stripping
-        // the redirect after the fact in `dispatch_server_fn`) means a redirect
-        // a user middleware emits — which never runs the fallback — can never be
-        // mistaken for it and corrupted.
-        match accept {
-            Some(value)
-                if value.contains("text/html")
-                    && !crate::response::accept_header_includes_html(value.as_ref()) =>
-            {
-                None
-            }
-            other => other,
-        }
+        self.header("Accept")
     }
 
     fn referer(&self) -> Option<Cow<'_, str>> {
@@ -672,9 +652,6 @@ mod tests {
     // wire and `None` when the field is absent — a collapse to a constant
     // (`""`, `"xyzzy"`, `None`, `Some`) would feed the runtime a wrong or
     // missing value. A concrete error type pins the generic `Req` impl.
-    // `accepts()` is the deliberate exception: it hides a strict-refused
-    // `text/html` token (e.g. `text/html;q=0`) so server_fn's loose
-    // form-redirect check aligns with this integration's strict parser.
     type E = ServerFnError;
 
     fn request_with(uri: &str, headers: &[(&str, &str)]) -> NtexRequest {
@@ -747,8 +724,6 @@ mod tests {
 
     lets_expect! {
         expect(accept(headers)) as the_request_accept {
-            // A header the strict parser ACCEPTS as HTML is reported verbatim,
-            // so server_fn's form-redirect fallback still fires for a browser.
             let headers: &[(&str, &str)] = &[("Accept", "text/html")];
 
             to reads_the_accept_header { equal(Some("text/html".to_string())) }
@@ -756,23 +731,6 @@ mod tests {
             when the_accept_header_is_absent {
                 let headers: &[(&str, &str)] = &[];
                 to returns_none { be_none }
-            }
-
-            // A non-HTML media type passes through unchanged: server_fn's loose
-            // `contains("text/html")` is already false, so there is nothing to
-            // hide and the runtime still sees the true header.
-            when the_accept_is_a_non_html_type {
-                let headers: &[(&str, &str)] = &[("Accept", "application/json")];
-                to is_reported_verbatim { equal(Some("application/json".to_string())) }
-            }
-
-            // The fix: a header that carries `text/html` but at `q=0` — which the
-            // strict parser REFUSES — is hidden, so server_fn's loose check sees
-            // no HTML and does not emit a browser form redirect to a client that
-            // asked for a structured response.
-            when the_html_token_is_refused_by_a_q_value {
-                let headers: &[(&str, &str)] = &[("Accept", "text/html;q=0")];
-                to hides_the_refused_html_token { be_none }
             }
         }
     }

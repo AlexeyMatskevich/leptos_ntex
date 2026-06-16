@@ -18,19 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher now restores `500 Internal Server Error` when the response carries
   `SERVER_FN_ERROR_HEADER`; a genuinely successful form redirect still downgrades
   to `200`.
-- A non-browser client that explicitly refuses HTML (`Accept: text/html;q=0`) no
-  longer receives an HTML-form `302` redirect. `server_fn`'s form-redirect
-  fallback gates on a loose `contains("text/html")` that still treats `q=0` as
-  accepting HTML. This integration now aligns `server_fn` with its strict
-  `Accept` parser at the source: `NtexRequest::accepts` hides a `text/html` token
-  the strict parser refuses, so the fallback never fires for such a client and it
-  receives the structured response (a `200`/`500`, not a `302`). Neutralising the
-  fallback at its source — rather than stripping the redirect afterwards — means
-  a `3xx` a user middleware emits when it wraps and short-circuits a server
-  function (an auth redirect, a `304`) is never mistaken for the fallback and is
-  left intact. The same-origin guard still strips a cross-origin `Location`, and
-  `redirect()` / `ResponseOptions` application redirects are applied later and are
-  unaffected.
+- A server function reached with a loose `text/html` `Accept` that the strict
+  parser refuses (e.g. `Accept: text/html;q=0`) no longer leaks a **cross-origin**
+  `Referer` as a redirect `Location`. `server_fn`'s form-redirect fallback fires
+  on a loose `contains("text/html")`, so even such a client triggers it and the
+  fallback echoes the `Referer`; the same-origin guard strips any cross-origin
+  target (and preserves a `500` on the error path rather than promoting it to
+  `200`). A **same-origin** form redirect is deliberately left intact, matching
+  `leptos_axum` / `leptos_actix`: the fallback is driven solely by `req.accepts()`,
+  which user middleware shares, so suppressing only the fallback at the adapter
+  layer cannot be done without corrupting a middleware's own redirect — the real
+  fix belongs upstream (tightening `server_fn`'s loose `Accept` check).
 - Excluding `/` from a routeless application via
   `generate_route_list_with_exclusions*` no longer leaves an active synthetic
   `GET /`. The fallback `/` route synthesized when an app declares no routes

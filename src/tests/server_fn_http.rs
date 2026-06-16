@@ -364,16 +364,17 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_leak_cross_origin_
     );
 }
 
-/// Same-origin sibling of the cross-origin q=0 leak test above, varying only
-/// the Referer's origin. `text/html;q=0` explicitly REFUSES HTML, so even
-/// though server_fn's loose `contains("text/html")` fallback emits a
-/// *same-origin* form redirect, the integration must drop it and return the
-/// structured response — a programmatic client that refuses HTML must not be
-/// bounced through a browser redirect. The `Accept: text/html` counterpart
-/// still redirects (`server_fn_html_form_falls_back_to_same_origin_referrer`),
-/// which is what pins this as the q=0-specific behavior.
+/// Same-origin sibling of the cross-origin q=0 leak test above. A SAME-origin
+/// form redirect for a `text/html;q=0` client is deliberately LEFT INTACT:
+/// server_fn's form-redirect fallback fires on a loose `contains("text/html")`,
+/// and it is driven solely by `req.accepts()` — which user middleware shares —
+/// so there is no way to suppress only the fallback without corrupting a
+/// middleware's own redirect. This integration therefore matches `leptos_axum` /
+/// `leptos_actix` and lets the same-origin `302` stand; only the cross-origin
+/// leak (test above) is stripped, by the same-origin guard. The real fix belongs
+/// upstream (tighten server_fn's loose `Accept` check).
 #[ntex::test]
-async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_to_same_origin_referrer() {
+async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_to_same_origin_referrer() {
     register_explicit::<EchoName>();
     let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
@@ -389,25 +390,29 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_to_same_o
     let resp = test::call_service(&app, req).await;
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "q=0 refuses HTML; the same-origin form redirect must not survive, got {}",
+        StatusCode::FOUND,
+        "a same-origin form redirect is preserved (upstream-aligned), got {}",
         resp.status()
     );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     assert!(
-        resp.headers().get("location").is_none(),
-        "a client refusing HTML must not receive a form Location"
+        location.starts_with("http://example.test:8080/form"),
+        "the redirect must target the same-origin referer, got {location:?}"
     );
 }
 
 /// Error sibling of the q=0 same-origin test above. On the ERROR path server_fn
-/// builds `Location = Referer + ?__path=…&__err=…`, which is NOT an exact
-/// referer echo — a `location_matches_referrer`-based strip misses it and the
-/// same-origin guard would otherwise preserve the `302`. A client that refuses
-/// HTML must still get the structured `500`, never a browser redirect. (Pins
-/// the Codex-found gap: the q=0 strip keys on "is the response a form redirect
-/// at all", not on an exact referer match.)
+/// builds `Location = Referer + ?__path=…&__err=…` and a `302`. For a SAME-origin
+/// referer this is left intact, exactly like the success case — the error rides
+/// in the redirect URL, as `leptos_axum` does. (The CROSS-origin error redirect
+/// IS stripped, and preserves the `500` — see
+/// `server_fn_html_form_error_redirect_strip_preserves_error_status`.)
 #[ntex::test]
-async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_on_error() {
+async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_on_error() {
     register_explicit::<AlwaysErr>();
     let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
@@ -423,34 +428,41 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_on_error(
     let resp = test::call_service(&app, req).await;
     assert_eq!(
         resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "q=0 refuses HTML; an erroring form post must return the structured error, not a 302, got {}",
+        StatusCode::FOUND,
+        "a same-origin form-error redirect is preserved (upstream-aligned), got {}",
         resp.status()
     );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     assert!(
-        resp.headers().get("location").is_none(),
-        "a client refusing HTML must not receive a form Location, even on the error path"
+        location.starts_with("http://example.test:8080/form"),
+        "the error redirect must target the same-origin referer (carrying the error query), got {location:?}"
     );
 }
 
 /// A user middleware attached to a server fn can short-circuit the request with
 /// its OWN response — e.g. an auth guard issuing a `302` to a login page —
-/// before the inner server fn (and server_fn's form-redirect fallback) ever
-/// runs. `dispatch_server_fn` must leave that 3xx alone: the form fallback is
-/// neutralised at the source (`NtexRequest::accepts` hides a strict-refused
-/// `text/html` token from server_fn), so no post-hoc redirect-stripping runs at
-/// all for a non-HTML client and a middleware response cannot be mistaken for
-/// the fallback. Regression for two Codex P2 findings — the original
-/// `is_redirection()` guard corrupted any non-HTML 3xx, and its referer-derived
-/// replacement still caught a middleware redirect back to the Referer.
+/// before the inner server fn ever runs. `dispatch_server_fn` must leave that
+/// `3xx` alone. `dispatch_server_fn` has NO non-HTML redirect-stripping branch:
+/// the only post-run intervention is the cross-origin same-origin guard, and a
+/// same-origin `Location` (here `/login`) passes it untouched. Regression for a
+/// chain of three Codex P2 findings — the original `is_redirection()` guard
+/// corrupted any non-HTML `3xx`, its referer-derived replacement still caught a
+/// middleware redirect back to the Referer, and the `accepts()`-source variant
+/// hid non-HTML media types from middleware. Removing the strip entirely (and
+/// matching upstream on the `q=0` form redirect) is what finally keeps this
+/// green without collateral.
 #[ntex::test]
 async fn middleware_redirect_survives_for_non_html_client() {
     register_explicit::<GuardedByRedirect>();
     let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
 
-    // The Codex example verbatim: a JSON (non-HTML) client. server_fn's form
-    // fallback cannot fire (no `text/html` in `Accept`), so the only 3xx is the
-    // middleware's — it must reach the client unchanged.
+    // The Codex example verbatim: a JSON (non-HTML) client. The middleware
+    // short-circuits, so the only 3xx is its own same-origin `/login` — and with
+    // no strip branch it reaches the client unchanged.
     let json = test::TestRequest::post()
         .uri(GuardedByRedirect::PATH)
         .header("Accept", "application/json")
@@ -469,10 +481,10 @@ async fn middleware_redirect_survives_for_non_html_client() {
     );
 
     // The case the second Codex finding called out: a loose `text/html` Accept
-    // (`q=0`) WITH a Referer present. The middleware's redirect must survive even
-    // though `text/html;q=0` is exactly when server_fn's fallback would have
-    // fired had the inner fn run — because `accepts()` hides the refused token,
-    // the fallback never fires and nothing strips the middleware's `Location`.
+    // (`q=0`) WITH a Referer present — exactly when server_fn's fallback WOULD
+    // fire had the inner fn run. The middleware short-circuits so the fallback
+    // never runs, and its same-origin `/login` (not the Referer) passes the
+    // cross-origin guard untouched.
     let q_zero = test::TestRequest::post()
         .uri(GuardedByRedirect::PATH)
         .header(header::HOST, "example.test:8080")
