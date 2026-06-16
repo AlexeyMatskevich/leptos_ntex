@@ -10,6 +10,10 @@ on:
         description: ntex-only parallel test-server iterations
         required: false
         default: "1000"
+      ready_iterations:
+        description: ntex-only explicit ServerStatus::Ready barrier iterations
+        required: false
+        default: "1000"
       serial_iterations:
         description: ntex-only serial diagnostic control iterations
         required: false
@@ -28,9 +32,10 @@ jobs:
   stress:
     name: ubuntu-24.04 / rust 1.88 ntex-only stress
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       NTEX_ITERS: ${{ github.event.inputs.ntex_iterations || '1000' }}
+      READY_ITERS: ${{ github.event.inputs.ready_iterations || '1000' }}
       SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '200' }}
     steps:
       - uses: actions/checkout@v4
@@ -51,8 +56,11 @@ jobs:
           printf 'io_uring_group: '
           cat /proc/sys/kernel/io_uring_group 2>/dev/null || true
 
-      - name: Build ntex-only diagnostic test once
-        run: cargo test --all-features --test ntex_test_server_parallel --no-run --verbose
+      - name: Build ntex-only diagnostic tests once
+        run: |
+          set -euo pipefail
+          cargo test --all-features --test ntex_test_server_parallel --no-run --verbose
+          cargo test --all-features --test ntex_ready_barrier_parallel --no-run --verbose
 
       - name: Stress ntex-only diagnostic test, default parallel harness
         id: ntex_parallel
@@ -79,6 +87,40 @@ jobs:
                 echo "kernel=$(uname -a)"
               } > ntex-diagnostic-logs/failure-ntex-parallel.env
               echo "::error::ntex parallel failed on iteration ${i} with status ${status}"
+              tail -n 500 "$log"
+              echo "::endgroup::"
+              exit "$status"
+            fi
+            rm -f "$log"
+            echo "::endgroup::"
+          done
+
+      - name: Stress explicit ServerStatus::Ready barrier diagnostic
+        id: ready_barrier
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p ntex-diagnostic-logs
+          for i in $(seq 1 "$READY_ITERS"); do
+            log="ntex-diagnostic-logs/ready-barrier-${i}.log"
+            echo "::group::ready barrier iteration ${i}/${READY_ITERS}"
+            set +e
+            timeout 120s env RUST_LOG="$RUST_LOG_FILTER" \
+              cargo test --all-features --test ntex_ready_barrier_parallel -- --nocapture \
+              >"$log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              {
+                echo "name=ready-barrier"
+                echo "iteration=${i}"
+                echo "status=${status}"
+                echo "command=cargo test --all-features --test ntex_ready_barrier_parallel -- --nocapture"
+                echo "rustc=$(rustc --version)"
+                echo "kernel=$(uname -a)"
+              } > ntex-diagnostic-logs/failure-ready-barrier.env
+              echo "::error::ready barrier failed on iteration ${i} with status ${status}"
               tail -n 500 "$log"
               echo "::endgroup::"
               exit "$status"
@@ -133,6 +175,8 @@ jobs:
         run: |
           set -euo pipefail
           printf 'ntex parallel outcome: %s\n' '${{ steps.ntex_parallel.outcome }}'
+          printf 'ready barrier outcome: %s\n' '${{ steps.ready_barrier.outcome }}'
           printf 'ntex serial outcome: %s\n' '${{ steps.ntex_serial.outcome }}'
           test '${{ steps.ntex_parallel.outcome }}' = success
+          test '${{ steps.ready_barrier.outcome }}' = success
           test '${{ steps.ntex_serial.outcome }}' = success
