@@ -28,6 +28,48 @@ async fn static_route_generator_writes_html() {
     let _ = std::fs::remove_dir_all(&site_root);
 }
 
+/// `StaticRouteGenerator::generate` must skip writing any route whose render
+/// resolves to an error status: leptos's static-file builder calls `was_404`
+/// after each render and, when it returns `true`, sends the HTML back instead
+/// of invoking the writer — the dynamic handler will re-render the real
+/// 404/500 on demand, so caching it as a bare `200 OK` would be wrong. A normal
+/// route (status left at the default) IS written.
+///
+/// Pins `was_404` end-to-end through the public `generate()` path, asserting
+/// the predicate both ways: `/ok` → file present, `/gone` → file absent.
+/// Replacing `was_404`'s body with `true` would drop `ok.html`; with `false`
+/// would write `gone.html`; flipping its `== NOT_FOUND` discriminant to `!=`
+/// would swap both — every variant breaks one of the two assertions.
+#[ntex::test]
+async fn static_generator_skips_writing_404_routes() {
+    let site_root = temp_site_root("static_404");
+    let (_routes, generator) = gen_route_list_with_ssg(StaticStatusApp);
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_static_404")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    generator.generate(&options).await;
+
+    let ok_path = site_root.join("ok.html");
+    let gone_path = site_root.join("gone.html");
+
+    assert!(
+        ok_path.exists(),
+        "a 200 static route must be pre-rendered to disk"
+    );
+    assert!(
+        !gone_path.exists(),
+        "a 404 static route must be skipped by `was_404`, not cached to disk as a bare 200"
+    );
+
+    let ok_html = std::fs::read_to_string(&ok_path).unwrap();
+    assert!(ok_html.contains("Static OK"));
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
 /// HEAD on a statically pre-rendered route must mirror GET's status
 /// and Content-Type. (Wire-level body elision is covered by the
 /// TCP-based integration tests.)

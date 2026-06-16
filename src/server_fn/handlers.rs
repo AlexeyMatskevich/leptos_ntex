@@ -14,6 +14,7 @@ use ntex::http::{
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use server_fn::{
     ServerFnTraitObj,
+    error::SERVER_FN_ERROR_HEADER,
     middleware::{BoxedService, Layer},
 };
 use std::sync::Arc;
@@ -69,23 +70,25 @@ pub(crate) async fn dispatch_server_fn(
 
                 let mut res = service.run(NtexRequest::from((req, payload))).await;
 
-                if accepts_html {
-                    let location_is_referrer = raw_referrer.as_ref().is_some_and(|raw| {
-                        res.0
-                            .headers()
-                            .get(header::LOCATION)
-                            .is_some_and(|location| location_matches_referrer(location, raw))
-                    });
+                // Whether the post-run `Location` is an echo of the request's
+                // Referer — the signature of server_fn's form-redirect fallback
+                // for an HTML form. It may append a bare `?`, which
+                // `location_matches_referrer` tolerates.
+                let location_is_referrer = raw_referrer.as_ref().is_some_and(|raw| {
+                    res.0
+                        .headers()
+                        .get(header::LOCATION)
+                        .is_some_and(|location| location_matches_referrer(location, raw))
+                });
 
+                if accepts_html {
                     if location_is_referrer {
                         if let Some(referrer) = referrer.clone() {
                             *res.0.status_mut() = StatusCode::FOUND;
                             res.0.headers_mut().insert(header::LOCATION, referrer);
                         } else {
                             res.0.headers_mut().remove(header::LOCATION);
-                            if res.0.status().is_redirection() {
-                                *res.0.status_mut() = StatusCode::OK;
-                            }
+                            reset_status_after_redirect_strip(&mut res);
                         }
                     } else if res.0.status().is_success()
                         && res.0.headers().get(header::LOCATION).is_none()
@@ -95,6 +98,16 @@ pub(crate) async fn dispatch_server_fn(
                         res.0.headers_mut().insert(header::LOCATION, referrer);
                     }
                 }
+                // No non-HTML branch: when the strict `Accept` parser refuses
+                // HTML (e.g. `text/html;q=0`) this integration deliberately does
+                // NOT strip server_fn's form-redirect — matching `leptos_axum` /
+                // `leptos_actix`, whose form-redirect fallback fires on the same
+                // loose `contains("text/html")`. A same-origin form `302` is left
+                // intact, and a user middleware's own short-circuit `3xx` is
+                // likewise untouched. (There is no way to suppress only the
+                // fallback: server_fn drives it solely off `req.accepts()`, which
+                // middleware shares — see `NtexRequest::accepts`.) The cross-origin
+                // case is still handled by the same-origin guard below.
 
                 // Same-origin invariant for the server_fn-layer `Location`.
                 // The block above only repairs the EXACT referer echo, and
@@ -113,9 +126,7 @@ pub(crate) async fn dispatch_server_fn(
                     && same_origin_location(&conn_scheme, &conn_host, &location).is_none()
                 {
                     res.0.headers_mut().remove(header::LOCATION);
-                    if res.0.status().is_redirection() {
-                        *res.0.status_mut() = StatusCode::OK;
-                    }
+                    reset_status_after_redirect_strip(&mut res);
                 }
 
                 let mut wrapped = NtexResponse(res.take());
@@ -124,6 +135,27 @@ pub(crate) async fn dispatch_server_fn(
             })
         })
         .await
+}
+
+/// Resets the status of a response whose `Location` was just stripped — either
+/// because it failed the same-origin invariant or because it was a referer echo
+/// refused by the strict `Accept` parser.
+///
+/// A server-function **error** response carries [`SERVER_FN_ERROR_HEADER`]: it
+/// started life as a `500` from `NtexServerResponse::error_response` that
+/// server_fn's form-redirect fallback then overwrote with `302`. Dropping that
+/// redirect must not silently promote the failure to `200 OK`, so an error
+/// response is restored to `500` while an ordinary, successful form redirect
+/// becomes `200`.
+fn reset_status_after_redirect_strip(res: &mut NtexServerResponse) {
+    if res.0.status().is_redirection() {
+        let was_error = res.0.headers().get(SERVER_FN_ERROR_HEADER).is_some();
+        *res.0.status_mut() = if was_error {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::OK
+        };
+    }
 }
 
 fn location_matches_referrer(location: &HeaderValue, referrer: &HeaderValue) -> bool {

@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- HTML-form server-function **error** responses now keep their error status when
+  an unsafe redirect is stripped. The same-origin guard added in 0.6.0
+  downgraded a stripped redirect to `200 OK`, but `server_fn` rewrites an
+  erroring form post into a `302` back to the (here cross-origin) `Referer` with
+  the error encoded in the query — so stripping that `Location` silently turned a
+  `500` into a `200`, reporting a failed server function as success. The
+  dispatcher now restores `500 Internal Server Error` when the response carries
+  `SERVER_FN_ERROR_HEADER`; a genuinely successful form redirect still downgrades
+  to `200`.
+- A server function reached with a loose `text/html` `Accept` that the strict
+  parser refuses (e.g. `Accept: text/html;q=0`) no longer leaks a **cross-origin**
+  `Referer` as a redirect `Location`. `server_fn`'s form-redirect fallback fires
+  on a loose `contains("text/html")`, so even such a client triggers it and the
+  fallback echoes the `Referer`; the same-origin guard strips any cross-origin
+  target (and preserves a `500` on the error path rather than promoting it to
+  `200`). A **same-origin** form redirect is deliberately left intact, matching
+  `leptos_axum` / `leptos_actix`: the fallback is driven solely by `req.accepts()`,
+  which user middleware shares, so suppressing only the fallback at the adapter
+  layer cannot be done without corrupting a middleware's own redirect — the real
+  fix belongs upstream (tightening `server_fn`'s loose `Accept` check).
+- Excluding `/` from a routeless application via
+  `generate_route_list_with_exclusions*` no longer leaves an active synthetic
+  `GET /`. The fallback `/` route synthesized when an app declares no routes
+  bypassed the exclusion filter, so a custom root handler mounted at the excluded
+  path was shadowed by Leptos's `GET /`. The synthetic fallback is now built
+  first and the exclusion filter is applied unconditionally. The same gap exists
+  in the upstream `leptos_axum` / `leptos_actix` adapters.
+- Server-function WebSocket **text** frames are now validated as UTF-8
+  (RFC 6455 §8.1); an invalid payload fails the connection with close code `1007`
+  (`Invalid frame payload data`). ntex's `Frame::Text` exposes raw bytes without
+  checking, so invalid UTF-8 previously reached server-function decoding instead
+  of being rejected at the WebSocket protocol boundary. Unfragmented frames and
+  reassembled fragmented messages are both validated — the full reassembled
+  buffer, so a multi-byte character split across fragments is accepted, not
+  spuriously rejected.
+- The server-function WebSocket bridge no longer puts the reserved close code
+  `1006` on the wire. The outbound send-failure teardown built a `Close` frame
+  with `CloseCode::Abnormal` (1006), which RFC 6455 §7.4.1 reserves for local
+  reporting and forbids in a `Close` control frame; it now sends
+  `CloseCode::Error` (1011).
+
 ## [0.6.0] - 2026-06-10
 
 ### Security
@@ -430,6 +475,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.1...v0.4.2

@@ -33,6 +33,77 @@ async fn handles_server_fn_post() {
     assert!(text.contains("Hello, Alice"));
 }
 
+/// `NtexRequest::try_into_stream` enforces the payload limit incrementally as
+/// chunks arrive (`cumulative > limit`) — the only overflow guard for a chunked
+/// streaming body, whose total size the up-front `Content-Length` preflight
+/// cannot see. Pin that boundary from the passing side: a body exactly AT the
+/// limit and one strictly UNDER it must both stream through to the server fn
+/// and succeed with the drained byte count.
+///
+/// Kill matrix for the `>` on `request.rs:122` (`if next > limit`):
+/// - at-limit (16 of 16 bytes, `16 > 16` is false → success) kills `> -> ==`
+///   and `> -> >=` (both would treat the equal case as overflow → 413);
+/// - under-limit (8 of 16 bytes) kills `> -> <` (which would reject every
+///   non-empty body below the limit → 413).
+///
+/// The at-limit body clears the `declared > limit` Content-Length preflight
+/// (`16 > 16` is false), so it genuinely reaches and exercises line 122.
+#[ntex::test]
+async fn streaming_input_payload_limit_boundary() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<DrainStreamingInput>();
+    let app = test::init_service(
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns()),
+    )
+    .await;
+
+    // UNDER the limit: 8 of 16 bytes.
+    let under = test::TestRequest::post()
+        .uri(DrainStreamingInput::PATH)
+        .header("Content-Type", "application/octet-stream")
+        .header("Accept", "application/json")
+        .set_payload("AAAAAAAA")
+        .to_request();
+    let resp = test::call_service(&app, under).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an under-limit streaming body must drain successfully, not 413"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains('8'),
+        "must report the 8 drained bytes, got: {text}"
+    );
+
+    // AT the limit: exactly 16 of 16 bytes.
+    let at_limit = test::TestRequest::post()
+        .uri(DrainStreamingInput::PATH)
+        .header("Content-Type", "application/octet-stream")
+        .header("Accept", "application/json")
+        .set_payload("AAAAAAAAAAAAAAAA")
+        .to_request();
+    let resp = test::call_service(&app, at_limit).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a body whose size equals the limit must succeed (limit is inclusive), not 413"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("16"),
+        "must report the 16 drained bytes, got: {text}"
+    );
+}
+
 /// The `&mut ServiceConfig` impl registers server functions ITSELF (its
 /// `server_fn_paths()` loop, guarded by `!excluded.contains(path)`), so a
 /// server fn must resolve through `register_leptos_routes` ALONE — WITHOUT
@@ -290,6 +361,268 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_leak_cross_origin_
     assert!(
         location.is_none_or(|l| l.starts_with('/')),
         "Location must never carry a cross-origin target, got {location:?}"
+    );
+}
+
+/// Same-origin sibling of the cross-origin q=0 leak test above. A SAME-origin
+/// form redirect for a `text/html;q=0` client is deliberately LEFT INTACT:
+/// server_fn's form-redirect fallback fires on a loose `contains("text/html")`,
+/// and it is driven solely by `req.accepts()` — which user middleware shares —
+/// so there is no way to suppress only the fallback without corrupting a
+/// middleware's own redirect. This integration therefore matches `leptos_axum` /
+/// `leptos_actix` and lets the same-origin `302` stand; only the cross-origin
+/// leak (test above) is stripped, by the same-origin guard. The real fix belongs
+/// upstream (tighten server_fn's loose `Accept` check).
+#[ntex::test]
+async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_to_same_origin_referrer() {
+    register_explicit::<EchoName>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(EchoName::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html;q=0")
+        .set_payload("name=Alice")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a same-origin form redirect is preserved (upstream-aligned), got {}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("http://example.test:8080/form"),
+        "the redirect must target the same-origin referer, got {location:?}"
+    );
+}
+
+/// Error sibling of the q=0 same-origin test above. On the ERROR path server_fn
+/// builds `Location = Referer + ?__path=…&__err=…` and a `302`. For a SAME-origin
+/// referer this is left intact, exactly like the success case — the error rides
+/// in the redirect URL, as `leptos_axum` does. (The CROSS-origin error redirect
+/// IS stripped, and preserves the `500` — see
+/// `server_fn_html_form_error_redirect_strip_preserves_error_status`.)
+#[ntex::test]
+async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_on_error() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html;q=0")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a same-origin form-error redirect is preserved (upstream-aligned), got {}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("http://example.test:8080/form"),
+        "the error redirect must target the same-origin referer (carrying the error query), got {location:?}"
+    );
+}
+
+/// A user middleware attached to a server fn can short-circuit the request with
+/// its OWN response — e.g. an auth guard issuing a `302` to a login page —
+/// before the inner server fn ever runs. `dispatch_server_fn` must leave that
+/// `3xx` alone. `dispatch_server_fn` has NO non-HTML redirect-stripping branch:
+/// the only post-run intervention is the cross-origin same-origin guard, and a
+/// same-origin `Location` (here `/login`) passes it untouched. Regression for a
+/// chain of three Codex P2 findings — the original `is_redirection()` guard
+/// corrupted any non-HTML `3xx`, its referer-derived replacement still caught a
+/// middleware redirect back to the Referer, and the `accepts()`-source variant
+/// hid non-HTML media types from middleware. Removing the strip entirely (and
+/// matching upstream on the `q=0` form redirect) is what finally keeps this
+/// green without collateral.
+#[ntex::test]
+async fn middleware_redirect_survives_for_non_html_client() {
+    register_explicit::<GuardedByRedirect>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    // The Codex example verbatim: a JSON (non-HTML) client. The middleware
+    // short-circuits, so the only 3xx is its own same-origin `/login` — and with
+    // no strip branch it reaches the client unchanged.
+    let json = test::TestRequest::post()
+        .uri(GuardedByRedirect::PATH)
+        .header("Accept", "application/json")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, json).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a middleware auth redirect must survive for a JSON client, not collapse to 200/500"
+    );
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login"),
+        "the middleware's own Location must be preserved"
+    );
+
+    // The case the second Codex finding called out: a loose `text/html` Accept
+    // (`q=0`) WITH a Referer present — exactly when server_fn's fallback WOULD
+    // fire had the inner fn run. The middleware short-circuits so the fallback
+    // never runs, and its same-origin `/login` (not the Referer) passes the
+    // cross-origin guard untouched.
+    let q_zero = test::TestRequest::post()
+        .uri(GuardedByRedirect::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/dashboard")
+        .header("Accept", "text/html;q=0")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, q_zero).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a middleware redirect to a non-referer target must survive even under text/html;q=0"
+    );
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login")
+    );
+
+    // The other 3xx Codex called out: a conditional `304 Not Modified` from a
+    // caching middleware. It carries no `Location`, so it can never match the
+    // referer-derived form-redirect shape — it must pass through untouched
+    // rather than being reset to `200`.
+    register_explicit::<GuardedByNotModified>();
+    let not_modified = test::TestRequest::post()
+        .uri(GuardedByNotModified::PATH)
+        .header("Accept", "application/json")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, not_modified).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_MODIFIED,
+        "a middleware 304 must survive for a JSON client, not collapse to 200"
+    );
+}
+
+/// When a server function **errors** on an HTML form post, server_fn rewrites
+/// the response into a `302` back to the Referer with the error encoded in the
+/// query. With a cross-origin Referer the same-origin guard must strip that
+/// unsafe `Location` WITHOUT promoting the failure to `200 OK` — the caller
+/// still has to observe a server error. Sibling of the successful cross-origin
+/// cases above, varying the server-fn OUTCOME (Err vs Ok).
+#[ntex::test]
+async fn server_fn_html_form_error_redirect_strip_preserves_error_status() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://evil.test/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "stripping an unsafe error redirect must preserve the server-fn failure status, got {}",
+        resp.status()
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "the unsafe cross-origin error Location must be stripped"
+    );
+}
+
+/// Same-origin sibling of the cross-origin error case above (C3), varying the
+/// Referer's origin. A SAME-origin form-error redirect is legitimate — the form
+/// page shows the error — so the `302` back to the full referer must be
+/// PRESERVED, not stripped and not normalized to a bare path. Pins both halves
+/// of the redirect machinery: `NtexServerResponse::redirect` must actually set
+/// the `302`+`Location` (a no-op there drops it to a non-redirect), and
+/// `location_matches_referrer` must NOT treat the upstream error-query URL as a
+/// plain referer echo (a blanket match would rewrite it to bare "/form").
+#[ntex::test]
+async fn server_fn_html_form_same_origin_error_redirect_is_preserved() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a same-origin form error must stay a 302 back to the form, got {}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert!(
+        location
+            .as_deref()
+            .is_some_and(|l| l.starts_with("http://example.test:8080/form")),
+        "the same-origin error redirect must preserve the full referer URL, got {location:?}"
+    );
+}
+
+/// `NtexServerResponse::content_type` (the `Res::content_type` setter) is only
+/// reached on the server-fn ERROR path, where server_fn sets the error
+/// encoding's media type after `error_response`. A no-op there would leave the
+/// error body with no `Content-Type`, so pin it: an erroring server fn must
+/// report `text/plain` (the `ServerFnError` encoder's `CONTENT_TYPE`). No
+/// Referer/Accept here, so no form redirect intervenes — we observe the raw
+/// error response.
+#[ntex::test]
+async fn server_fn_error_response_sets_error_encoder_content_type() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        content_type,
+        Some("text/plain"),
+        "the server-fn error encoder's Content-Type must be set on the error response"
     );
 }
 

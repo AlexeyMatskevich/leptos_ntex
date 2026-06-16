@@ -378,3 +378,58 @@ async fn handle_response_inner_renders_shell() {
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("HriHello"));
 }
+
+// ----- public no-context render helpers ------------------------------
+// render_app_to_stream / _in_order / _async are thin wrappers over their
+// _with_context forms, exported for callers who mount a route by hand. The
+// crate's own routing always goes through the _with_context variants, so these
+// wrappers were untested — a mutation returning an empty Route survived.
+// Mounting each directly and asserting the rendered body pins the wrapper.
+
+#[ntex::test]
+async fn render_app_to_stream_helper_renders_the_app() {
+    let app = test::init_service(NtexApp::new().route(
+        "/",
+        crate::render_app_to_stream(unit_shell, leptos_router::Method::Get),
+    ))
+    .await;
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        html.contains("Leptos over ntex"),
+        "render_app_to_stream produced no app body: {html}"
+    );
+}
+
+#[ntex::test]
+async fn render_app_to_stream_in_order_helper_renders_the_app() {
+    let app = test::init_service(NtexApp::new().route(
+        "/",
+        crate::render_app_to_stream_in_order(unit_shell, leptos_router::Method::Get),
+    ))
+    .await;
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        html.contains("Leptos over ntex"),
+        "render_app_to_stream_in_order produced no app body: {html}"
+    );
+}
+
+#[ntex::test]
+async fn render_app_async_helper_renders_the_app() {
+    let app = test::init_service(NtexApp::new().route(
+        "/",
+        crate::render_app_async(unit_shell, leptos_router::Method::Get),
+    ))
+    .await;
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        html.contains("Leptos over ntex"),
+        "render_app_async produced no app body: {html}"
+    );
+}

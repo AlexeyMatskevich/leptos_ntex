@@ -428,6 +428,40 @@ lets_expect! {
     }
 }
 
+// ----- empty-route-tree exclusion ------------------------------------
+// The synthetic-fallback branch: when the app declares no routes,
+// `generate_route_list*` injects a single GET `/` so the shell still
+// renders. Excluding `/` must drop that synthetic listing from the ACTIVE
+// set exactly like a real route — otherwise a custom root handler is
+// shadowed by Leptos's GET `/`. `EmptyApp` declares no `<Router>`, so
+// `RouteList::generate` yields nothing and the synthetic branch runs.
+// The default leaf (count == 1) is load-bearing: it proves the synthetic
+// `/` is actually produced, so the exclusion leaf cannot pass vacuously.
+fn active_root_listings_from_empty_tree(excluded: &[&str]) -> usize {
+    let excluded = if excluded.is_empty() {
+        None
+    } else {
+        Some(excluded.iter().map(|s| s.to_string()).collect())
+    };
+    gen_route_list_with_exclusions(EmptyApp, excluded)
+        .into_iter()
+        .filter(|listing| !listing.exclude && listing.path() == "/")
+        .count()
+}
+
+lets_expect! {
+    expect(active_root_listings_from_empty_tree(excluded)) as the_synthetic_root_listing {
+        let excluded: &[&str] = &[];
+
+        to is_active_when_nothing_is_excluded { equal(1) }
+
+        when the_root_is_excluded {
+            let excluded: &[&str] = &["/"];
+            to is_dropped_from_the_active_set { equal(0) }
+        }
+    }
+}
+
 // ----- to_ntex_path segment kinds ------------------------------------
 // Characteristic axis: the `PathSegment` variant of each route segment,
 // carried by the `SegmentKind` enum below — one `when`-context per kind.
