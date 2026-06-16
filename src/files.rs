@@ -509,6 +509,52 @@ mod tests {
     use super::*;
     use lets_expect::lets_expect;
 
+    // ----- ensure_precompressed_headers: Vary dedup --------------------
+    // The precompressed path sets Content-Encoding and advertises
+    // `Vary: Accept-Encoding`, but must NOT duplicate an Accept-Encoding a
+    // prior layer already set, and must leave a wildcard `Vary: *` alone. A
+    // fresh response (default) can't distinguish the dedup branch from a
+    // blanket append — only a pre-existing Vary does — so both non-default
+    // contexts carry one.
+    fn vary_after_precompress(existing_vary: Option<&'static str>) -> Vec<String> {
+        let mut builder = ntex::web::HttpResponse::Ok();
+        if let Some(v) = existing_vary {
+            builder.header(header::VARY, HeaderValue::from_static(v));
+        }
+        let mut res = builder.finish();
+        ensure_precompressed_headers(&mut res, "br");
+        res.headers()
+            .get_all(header::VARY)
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_string())
+            .collect()
+    }
+
+    lets_expect! {
+        expect(vary_after_precompress(existing)) as the_precompressed_vary_header {
+            let existing: Option<&'static str> = None;
+
+            to appends_accept_encoding_once {
+                equal(vec!["Accept-Encoding".to_string()])
+            }
+
+            when accept_encoding_is_already_advertised {
+                let existing: Option<&'static str> = Some("Accept-Encoding");
+                to is_not_duplicated {
+                    equal(vec!["Accept-Encoding".to_string()])
+                }
+            }
+
+            when a_wildcard_vary_is_present {
+                let existing: Option<&'static str> = Some("*");
+                to leaves_the_wildcard_untouched {
+                    equal(vec!["*".to_string()])
+                }
+            }
+        }
+    }
+
     // ----- safe_subpath dotfile guard: exhaustive spec -----------------
     // The file-fallback path resolver. After narrowing the dotfile guard for
     // RFC 8615, the exact `.well-known` segment resolves while every other
