@@ -20,16 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `200`.
 - A non-browser client that explicitly refuses HTML (`Accept: text/html;q=0`) no
   longer receives an HTML-form `302` redirect. `server_fn`'s form-redirect
-  fallback gates on a loose `contains("text/html")` and still fires for `q=0`,
-  redirecting back to the `Referer` — an exact echo on the success path,
-  `Referer + ?…&__err=…` on the error path. When the strict `Accept` parser
-  refuses HTML the dispatcher now drops that referer-derived redirect (both
-  shapes) so the client receives the structured response. The strip is scoped to
-  the fallback's own shape — a loosely-`text/html` request whose redirect
-  `Location` is derived from the `Referer` — so a `3xx` issued by user middleware
-  wrapping the server function (an auth bounce, a `304`) is left intact rather
-  than corrupted. `redirect()` / `ResponseOptions` application redirects are
-  applied afterwards and are unaffected.
+  fallback gates on a loose `contains("text/html")` that still treats `q=0` as
+  accepting HTML. This integration now aligns `server_fn` with its strict
+  `Accept` parser at the source: `NtexRequest::accepts` hides a `text/html` token
+  the strict parser refuses, so the fallback never fires for such a client and it
+  receives the structured response (a `200`/`500`, not a `302`). Neutralising the
+  fallback at its source — rather than stripping the redirect afterwards — means
+  a `3xx` a user middleware emits when it wraps and short-circuits a server
+  function (an auth redirect, a `304`) is never mistaken for the fallback and is
+  left intact. The same-origin guard still strips a cross-origin `Location`, and
+  `redirect()` / `ResponseOptions` application redirects are applied later and are
+  unaffected.
 - Excluding `/` from a routeless application via
   `generate_route_list_with_exclusions*` no longer leaves an active synthetic
   `GET /`. The fallback `/` route synthesized when an app declares no routes

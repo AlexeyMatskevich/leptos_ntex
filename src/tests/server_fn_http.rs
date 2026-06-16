@@ -436,12 +436,13 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_on_error(
 /// A user middleware attached to a server fn can short-circuit the request with
 /// its OWN response — e.g. an auth guard issuing a `302` to a login page —
 /// before the inner server fn (and server_fn's form-redirect fallback) ever
-/// runs. `dispatch_server_fn`'s referer-redirect sanitization must not mistake
-/// that 3xx for the form fallback and strip it: the fallback's `Location` is
-/// derived from the Referer and only fires on a loose `text/html` `Accept`,
-/// whereas this redirect targets `/login` regardless. Regression for the Codex
-/// P2 finding — the prior `is_redirection()` guard corrupted any non-HTML 3xx
-/// from middleware into a `200`/`500`.
+/// runs. `dispatch_server_fn` must leave that 3xx alone: the form fallback is
+/// neutralised at the source (`NtexRequest::accepts` hides a strict-refused
+/// `text/html` token from server_fn), so no post-hoc redirect-stripping runs at
+/// all for a non-HTML client and a middleware response cannot be mistaken for
+/// the fallback. Regression for two Codex P2 findings — the original
+/// `is_redirection()` guard corrupted any non-HTML 3xx, and its referer-derived
+/// replacement still caught a middleware redirect back to the Referer.
 #[ntex::test]
 async fn middleware_redirect_survives_for_non_html_client() {
     register_explicit::<GuardedByRedirect>();
@@ -467,10 +468,11 @@ async fn middleware_redirect_survives_for_non_html_client() {
         "the middleware's own Location must be preserved"
     );
 
-    // Even with a loose `text/html` Accept AND a Referer present, a redirect
-    // whose Location is NOT referer-derived (here `/login`, not the Referer) is
-    // the middleware's, not the form fallback — so it must still survive. This
-    // pins the referer-derived guard, not merely the Accept guard.
+    // The case the second Codex finding called out: a loose `text/html` Accept
+    // (`q=0`) WITH a Referer present. The middleware's redirect must survive even
+    // though `text/html;q=0` is exactly when server_fn's fallback would have
+    // fired had the inner fn run — because `accepts()` hides the refused token,
+    // the fallback never fires and nothing strips the middleware's `Location`.
     let q_zero = test::TestRequest::post()
         .uri(GuardedByRedirect::PATH)
         .header(header::HOST, "example.test:8080")

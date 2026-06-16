@@ -47,22 +47,12 @@ pub(crate) async fn dispatch_server_fn(
                 provide_context(res_options.clone());
                 additional_context();
 
-                let accept_header = req
+                let accepts_html = req
                     .headers()
                     .get(header::ACCEPT)
-                    .and_then(|v| v.to_str().ok());
-                let accepts_html = accept_header
+                    .and_then(|v| v.to_str().ok())
                     .map(accept_header_includes_html)
                     .unwrap_or(false);
-                // server_fn's form-redirect fallback gates on a LOOSE
-                // `contains("text/html")` (server_fn `lib.rs`), so it can fire
-                // even when our strict parser refuses HTML (e.g.
-                // `text/html;q=0`). Capture that loose signal up front — the
-                // request is consumed below — so the non-HTML branch can strip
-                // ONLY the fallback's own redirect and never a user
-                // middleware's.
-                let accept_contains_html =
-                    accept_header.is_some_and(|accept| accept.contains("text/html"));
                 let raw_referrer = req.headers().get(header::REFERER).cloned();
                 // The request is consumed by `service.run` below, so the
                 // origin used for the post-run Location checks is captured
@@ -81,27 +71,14 @@ pub(crate) async fn dispatch_server_fn(
                 let mut res = service.run(NtexRequest::from((req, payload))).await;
 
                 // Whether the post-run `Location` is an echo of the request's
-                // Referer — the signature of server_fn's form-redirect
-                // fallback. It may append `?` or an error query, which
+                // Referer — the signature of server_fn's form-redirect fallback
+                // for an HTML form. It may append a bare `?`, which
                 // `location_matches_referrer` tolerates.
                 let location_is_referrer = raw_referrer.as_ref().is_some_and(|raw| {
                     res.0
                         .headers()
                         .get(header::LOCATION)
                         .is_some_and(|location| location_matches_referrer(location, raw))
-                });
-                // Broader than `location_is_referrer`: the form-redirect
-                // fallback derives its `Location` from the Referer — an exact
-                // echo on success, `Referer?__path=…&__err=…` on the error path
-                // (which `location_matches_referrer` deliberately does NOT treat
-                // as a plain echo). The non-HTML strip below keys on THIS shape
-                // so it targets the fallback and leaves a user middleware's own
-                // redirect (an auth bounce, a 304) intact.
-                let location_is_referrer_form_redirect = raw_referrer.as_ref().is_some_and(|raw| {
-                    res.0
-                        .headers()
-                        .get(header::LOCATION)
-                        .is_some_and(|location| location_is_referrer_derived(location, raw))
                 });
 
                 if accepts_html {
@@ -120,32 +97,14 @@ pub(crate) async fn dispatch_server_fn(
                         *res.0.status_mut() = StatusCode::FOUND;
                         res.0.headers_mut().insert(header::LOCATION, referrer);
                     }
-                } else if accept_contains_html && location_is_referrer_form_redirect {
-                    // The strict `Accept` parser refused HTML (e.g.
-                    // `text/html;q=0`), but server_fn's loose
-                    // `contains("text/html")` still emitted a form redirect back
-                    // to the Referer. A client that explicitly refuses HTML must
-                    // receive the structured response, not a browser redirect,
-                    // so drop that redirect — covering every shape the strict
-                    // `location_matches_referrer` echo check misses (the exact
-                    // echo, and the `Referer?__path=…&__err=…` error URL).
-                    //
-                    // The two guards keep this narrow. `accept_contains_html`
-                    // means server_fn's fallback could actually have fired (it
-                    // gates on the same loose check); `location_is_referrer_form_redirect`
-                    // means the 3xx carries the fallback's referer-derived
-                    // `Location`. A user middleware can short-circuit
-                    // `service.run` above with ITS OWN 3xx (an auth redirect, a
-                    // `304`), and that response is NOT the form fallback — its
-                    // `Location` is not referer-derived (and often the client is
-                    // not sending `text/html` at all), so it is left intact
-                    // rather than corrupted into a `200`/`500`. The no-Referer
-                    // fallback (server_fn redirects to a bare `/`) is likewise
-                    // left in place: it is indistinguishable from a middleware
-                    // redirect to `/`, and a same-origin `/` is harmless.
-                    res.0.headers_mut().remove(header::LOCATION);
-                    reset_status_after_redirect_strip(&mut res);
                 }
+                // A non-HTML client (including the `text/html;q=0` case) never
+                // reaches a form redirect to strip: `NtexRequest::accepts`
+                // hides a strict-refused `text/html` token from server_fn's
+                // fallback at the source, so the fallback simply does not fire.
+                // Any 3xx still present here is therefore a user middleware's own
+                // short-circuit response, which must pass through untouched
+                // (the same-origin guard below still applies to its `Location`).
 
                 // Same-origin invariant for the server_fn-layer `Location`.
                 // The block above only repairs the EXACT referer echo, and
@@ -204,23 +163,6 @@ fn location_matches_referrer(location: &HeaderValue, referrer: &HeaderValue) -> 
         return false;
     };
     location == referrer || location.strip_suffix('?') == Some(referrer)
-}
-
-/// Whether `location` is the `referrer` optionally followed by a query string —
-/// the shape server_fn's form-redirect fallback produces: an exact echo on the
-/// success path, or `Referer?__path=…&__err=…` on the error path. Broader than
-/// [`location_matches_referrer`] (which intentionally tolerates only a bare
-/// trailing `?`, so the `Accept: text/html` repair path preserves a full
-/// same-origin error redirect rather than collapsing it to the bare referer).
-/// Used only to recognise the fallback's redirect for a client that refused
-/// HTML, so a user middleware's non-referer redirect is never mistaken for it.
-fn location_is_referrer_derived(location: &HeaderValue, referrer: &HeaderValue) -> bool {
-    let (Ok(location), Ok(referrer)) = (location.to_str(), referrer.to_str()) else {
-        return false;
-    };
-    location
-        .strip_prefix(referrer)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'))
 }
 
 /// Accepts a `Location`/`Referer` value only when it stays on the current
