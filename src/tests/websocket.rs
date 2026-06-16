@@ -258,6 +258,58 @@ async fn websocket_server_fn_first_text_fragment_over_limit_closes_with_size() {
     }
 }
 
+/// RFC 6455 §8.1: a TEXT message must be valid UTF-8. ntex's codec hands the
+/// bridge raw bytes WITHOUT validating, so a fragmented text message whose
+/// reassembled payload is not valid UTF-8 must fail the connection with
+/// `CloseCode::Invalid` (1007) — the invalid bytes must never reach the server
+/// fn. Sibling of the `_over_limit_closes_with_size` text tests, varying the
+/// payload-VALIDITY axis instead of the size axis.
+///
+/// Coverage note: only the FRAGMENTED text path is wire-reachable here, because
+/// ntex's high-level client encodes unfragmented text as
+/// `Message::Text(ByteString)` — UTF-8 by construction. The unfragmented
+/// `Frame::Text` arm shares the same `from_utf8` guard and the same
+/// `close_invalid_utf8()` helper (unit-tested in `request.rs`); only a raw,
+/// non-ntex client could drive invalid bytes through it on the wire.
+#[ntex::test]
+async fn websocket_fragmented_text_with_invalid_utf8_closes_with_invalid() {
+    use ntex::ws::{CloseCode, Item};
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv =
+        test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    // 0xFF is never a valid UTF-8 byte. Split across two fragments so the bytes
+    // only form a complete message at `Last` — the point where the bridge
+    // reassembles and validates.
+    sink.send(ws::Message::Continuation(Item::FirstText(
+        vec![0xffu8].into(),
+    )))
+    .await
+    .unwrap();
+    sink.send(ws::Message::Continuation(Item::Last(vec![0xfeu8].into())))
+        .await
+        .unwrap();
+
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Close(Some(reason)) => {
+            assert_eq!(
+                reason.code,
+                CloseCode::Invalid,
+                "invalid-UTF-8 text must close with 1007, got {:?}",
+                reason.code
+            );
+        }
+        other => panic!("expected Close(Invalid) on invalid-UTF-8 text, got {other:?}"),
+    }
+}
+
 /// An oversized opening fragment (`FirstBinary`/`FirstText`) must
 /// be rejected with `CloseCode::Size` *before* the buffer is
 /// established. A prior bug simply pushed the bytes into the buffer

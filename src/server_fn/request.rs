@@ -289,10 +289,7 @@ where
                                         .ser(),
                                     ));
                                     let _ = outbound_sink
-                                        .send(web::ws::Message::Close(Some(CloseReason {
-                                            code: CloseCode::Abnormal,
-                                            description: Some(err.to_string()),
-                                        })))
+                                        .send(close_send_failure(&err.to_string()))
                                         .await;
                                     return;
                                 }
@@ -366,6 +363,24 @@ where
                                                     .await;
                                                 return Ok(Some(close_too_big(payload_limit)));
                                             }
+                                            // RFC 6455 §8.1: a text message MUST
+                                            // be valid UTF-8. ntex's `Frame::Text`
+                                            // hands over raw bytes without
+                                            // checking, so validate here and fail
+                                            // the connection (1007) rather than
+                                            // forward invalid bytes to the
+                                            // server fn.
+                                            if std::str::from_utf8(&text).is_err() {
+                                                let _ = tx
+                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                        server_fn::error::ServerFnErrorErr::Args(
+                                                            "websocket text frame is not valid UTF-8 (RFC 6455 §8.1)".to_string(),
+                                                        ),
+                                                    )
+                                                    .ser()))
+                                                    .await;
+                                                return Ok(Some(close_invalid_utf8()));
+                                            }
                                             let _ = tx
                                                 .send(Ok(SfBytes::from_owner(text)))
                                                 .await;
@@ -392,9 +407,11 @@ where
                                                 Overflow(usize),
                                             }
                                             // For Last: take the buffer
-                                            // (if any), or reject.
+                                            // (if any) along with its message
+                                            // kind (so a Text message can be
+                                            // UTF-8 validated), or reject.
                                             enum LastAction {
-                                                Complete(SfBytesMut),
+                                                Complete(FragmentKind, SfBytesMut),
                                                 NoOpener,
                                                 Overflow(usize),
                                             }
@@ -510,7 +527,7 @@ where
                                                         let taken = fragment.borrow_mut().take();
                                                         match taken {
                                                             None => LastAction::NoOpener,
-                                                            Some((_, mut buf)) => {
+                                                            Some((kind, mut buf)) => {
                                                                 if buf
                                                                     .len()
                                                                     .saturating_add(b.len())
@@ -521,13 +538,35 @@ where
                                                                     )
                                                                 } else {
                                                                     buf.extend_from_slice(&b);
-                                                                    LastAction::Complete(buf)
+                                                                    LastAction::Complete(kind, buf)
                                                                 }
                                                             }
                                                         }
                                                     };
                                                     match action {
-                                                        LastAction::Complete(buf) => {
+                                                        LastAction::Complete(kind, buf) => {
+                                                            // RFC 6455 §8.1: a
+                                                            // reassembled TEXT
+                                                            // message must be
+                                                            // valid UTF-8. The
+                                                            // kind was recorded
+                                                            // on the opening
+                                                            // fragment; validate
+                                                            // the whole buffer
+                                                            // before forwarding.
+                                                            if matches!(kind, FragmentKind::Text)
+                                                                && std::str::from_utf8(&buf).is_err()
+                                                            {
+                                                                let _ = tx
+                                                                    .send(Err(InputStreamError::from_server_fn_error(
+                                                                        server_fn::error::ServerFnErrorErr::Args(
+                                                                            "reassembled websocket text message is not valid UTF-8 (RFC 6455 §8.1)".to_string(),
+                                                                        ),
+                                                                    )
+                                                                    .ser()))
+                                                                    .await;
+                                                                return Ok(Some(close_invalid_utf8()));
+                                                            }
                                                             let _ = tx.send(Ok(buf.freeze())).await;
                                                             Ok(None)
                                                         }
@@ -571,6 +610,32 @@ fn close_too_big(limit: usize) -> web::ws::Message {
     web::ws::Message::Close(Some(ntex::ws::CloseReason {
         code: ntex::ws::CloseCode::Size,
         description: Some(format!("message exceeds limit of {limit} bytes")),
+    }))
+}
+
+/// Builds the policy-violation `Close` for a text frame whose payload is not
+/// valid UTF-8, carrying [`CloseCode::Invalid`](ntex::ws::CloseCode::Invalid)
+/// (1007, "Invalid frame payload data" per RFC 6455 §7.4.1; §8.1 requires text
+/// messages to be valid UTF-8). ntex's `Frame::Text` exposes raw `Bytes`
+/// WITHOUT validating UTF-8, so the bridge must validate before forwarding.
+/// The matching `InputStreamError` is emitted at the call site because its
+/// generic type is only in scope inside `impl Req for NtexRequest`.
+fn close_invalid_utf8() -> web::ws::Message {
+    web::ws::Message::Close(Some(ntex::ws::CloseReason {
+        code: ntex::ws::CloseCode::Invalid,
+        description: Some("text frame payload is not valid UTF-8".to_string()),
+    }))
+}
+
+/// Builds the `Close` sent when an OUTBOUND server-fn message fails to reach
+/// the peer, carrying [`CloseCode::Error`](ntex::ws::CloseCode::Error) (1011,
+/// "Internal Error"). RFC 6455 §7.4.1 RESERVES 1006 ("Abnormal Closure") for
+/// local reporting only — an endpoint must never place it in a Close control
+/// frame, and ntex serializes whatever code it is given onto the wire verbatim.
+fn close_send_failure(reason: &str) -> web::ws::Message {
+    web::ws::Message::Close(Some(ntex::ws::CloseReason {
+        code: ntex::ws::CloseCode::Error,
+        description: Some(reason.to_string()),
     }))
 }
 
@@ -666,6 +731,36 @@ mod tests {
             when the_accept_header_is_absent {
                 let headers: &[(&str, &str)] = &[];
                 to returns_none { be_none }
+            }
+        }
+    }
+
+    // ----- WebSocket policy-close codes ---------------------------------
+    // The bridge builds policy `Close` frames whose CODE is the contract
+    // (RFC 6455 §7.4.1). These lock the two added codes: invalid-UTF-8 text
+    // closes with 1007, and an outbound send failure closes with 1011 — NOT
+    // the reserved 1006, which an endpoint must never serialize onto the
+    // wire. (`close_send_failure`'s path is otherwise unreachable in a wire
+    // test, so this is its primary regression.)
+    fn close_code(msg: &web::ws::Message) -> Option<ntex::ws::CloseCode> {
+        match msg {
+            web::ws::Message::Close(Some(reason)) => Some(reason.code),
+            _ => None,
+        }
+    }
+
+    lets_expect! {
+        expect(close_code(&close_invalid_utf8())) as the_invalid_utf8_close {
+            to carries_close_code_1007_invalid {
+                equal(Some(ntex::ws::CloseCode::Invalid))
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(close_code(&close_send_failure("send failed"))) as the_send_failure_close {
+            to carries_1011_internal_error_not_reserved_1006 {
+                equal(Some(ntex::ws::CloseCode::Error))
             }
         }
     }
