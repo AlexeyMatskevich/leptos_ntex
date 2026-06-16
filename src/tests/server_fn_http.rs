@@ -33,6 +33,77 @@ async fn handles_server_fn_post() {
     assert!(text.contains("Hello, Alice"));
 }
 
+/// `NtexRequest::try_into_stream` enforces the payload limit incrementally as
+/// chunks arrive (`cumulative > limit`) — the only overflow guard for a chunked
+/// streaming body, whose total size the up-front `Content-Length` preflight
+/// cannot see. Pin that boundary from the passing side: a body exactly AT the
+/// limit and one strictly UNDER it must both stream through to the server fn
+/// and succeed with the drained byte count.
+///
+/// Kill matrix for the `>` on `request.rs:122` (`if next > limit`):
+/// - at-limit (16 of 16 bytes, `16 > 16` is false → success) kills `> -> ==`
+///   and `> -> >=` (both would treat the equal case as overflow → 413);
+/// - under-limit (8 of 16 bytes) kills `> -> <` (which would reject every
+///   non-empty body below the limit → 413).
+///
+/// The at-limit body clears the `declared > limit` Content-Length preflight
+/// (`16 > 16` is false), so it genuinely reaches and exercises line 122.
+#[ntex::test]
+async fn streaming_input_payload_limit_boundary() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<DrainStreamingInput>();
+    let app = test::init_service(
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns()),
+    )
+    .await;
+
+    // UNDER the limit: 8 of 16 bytes.
+    let under = test::TestRequest::post()
+        .uri(DrainStreamingInput::PATH)
+        .header("Content-Type", "application/octet-stream")
+        .header("Accept", "application/json")
+        .set_payload("AAAAAAAA")
+        .to_request();
+    let resp = test::call_service(&app, under).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an under-limit streaming body must drain successfully, not 413"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains('8'),
+        "must report the 8 drained bytes, got: {text}"
+    );
+
+    // AT the limit: exactly 16 of 16 bytes.
+    let at_limit = test::TestRequest::post()
+        .uri(DrainStreamingInput::PATH)
+        .header("Content-Type", "application/octet-stream")
+        .header("Accept", "application/json")
+        .set_payload("AAAAAAAAAAAAAAAA")
+        .to_request();
+    let resp = test::call_service(&app, at_limit).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a body whose size equals the limit must succeed (limit is inclusive), not 413"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("16"),
+        "must report the 16 drained bytes, got: {text}"
+    );
+}
+
 /// The `&mut ServiceConfig` impl registers server functions ITSELF (its
 /// `server_fn_paths()` loop, guarded by `!excluded.contains(path)`), so a
 /// server fn must resolve through `register_leptos_routes` ALONE — WITHOUT

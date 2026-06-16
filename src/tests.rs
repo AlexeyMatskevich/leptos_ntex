@@ -103,6 +103,42 @@ fn StaticEpochApp() -> impl IntoView {
     }
 }
 
+/// Two `SsrMode::Static` routes that differ only on the `was_404` axis: `/ok`
+/// renders with the default status, while `/gone` calls
+/// `ResponseOptions::set_status(404)` during render. Drives the
+/// `static_generator_skips_writing_404_routes` test: leptos's static-file
+/// builder must NOT persist an error render to disk (the dynamic handler
+/// re-renders the real 404/500), so `gone.html` must be absent while `ok.html`
+/// is written.
+#[component]
+fn StaticStatusApp() -> impl IntoView {
+    provide_meta_context();
+
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <h1>"Not Found"</h1> }>
+                    <Route
+                        path=path!("/ok")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| view! { <h1>"Static OK"</h1> }
+                    />
+                    <Route
+                        path=path!("/gone")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| {
+                            if let Some(res) = use_context::<crate::ResponseOptions>() {
+                                res.set_status(ntex::http::StatusCode::NOT_FOUND);
+                            }
+                            view! { <h1>"Gone Body"</h1> }
+                        }
+                    />
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
 #[component]
 fn MixedApp() -> impl IntoView {
     provide_meta_context();
@@ -382,6 +418,35 @@ async fn redirect_to_about() -> Result<(), ServerFnError> {
 )]
 async fn always_err() -> Result<(), ServerFnError> {
     Err(ServerFnError::new("boom"))
+}
+
+/// Streaming-INPUT server fn (`input = StreamingText`): the request body is
+/// decoded by [`NtexRequest::try_into_stream`], whose per-chunk payload-limit
+/// boundary (`cumulative > limit`) is what
+/// `streaming_input_payload_limit_boundary` pins. The fn fully drains the input
+/// and returns the total number of received bytes, so a non-overflowing body
+/// surfaces as `200 OK` with that count (proving the drain ran), while an
+/// overflow trips the request-scoped `PayloadTooLarge` marker the dispatcher
+/// promotes to 413. Distinct from the buffered `collect_payload` path the
+/// existing 413 tests exercise and from the `Websocket` echo (which uses
+/// `try_into_websocket`, not `try_into_stream`).
+#[server(
+    name = DrainStreamingInput,
+    prefix = "/api",
+    endpoint = "drain_streaming_input",
+    input = server_fn::codec::StreamingText,
+    server = crate::NtexServerFnBackend
+)]
+async fn drain_streaming_input(
+    input: server_fn::codec::TextStream,
+) -> Result<usize, ServerFnError> {
+    use futures::StreamExt;
+    let mut total = 0usize;
+    let mut stream = input.into_inner();
+    while let Some(chunk) = stream.next().await {
+        total += chunk?.len();
+    }
+    Ok(total)
 }
 
 #[server(
