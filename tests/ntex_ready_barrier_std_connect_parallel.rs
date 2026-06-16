@@ -31,9 +31,7 @@ async fn std_http_get(name: &'static str, addr: net::SocketAddr) -> (String, Vec
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let request = format!(
-            "GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-        );
+        let request = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes())?;
 
         let mut reader = BufReader::new(stream);
