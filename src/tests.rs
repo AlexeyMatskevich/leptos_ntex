@@ -329,6 +329,15 @@ fn NestedApp() -> impl IntoView {
     }
 }
 
+// An app that declares NO routes (no `<Router>`/`<Routes>`), so
+// `RouteList::generate` yields an empty list and `generate_route_list*` takes
+// its synthetic-fallback branch, injecting a single GET `/`. Drives the
+// empty-route-tree exclusion spec in `unit_specs.rs`.
+#[component]
+fn EmptyApp() -> impl IntoView {
+    view! { <h1>"empty"</h1> }
+}
+
 fn suspense_shell() -> impl IntoView {
     view! {
         <!DOCTYPE html>

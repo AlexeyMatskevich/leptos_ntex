@@ -315,13 +315,20 @@ where
 
     let generator = StaticRouteGenerator::new(&routes, app_fn.clone(), additional_context.clone());
 
-    let mut routes = routes
+    let routes = routes
         .into_inner()
         .into_iter()
         .flat_map(IntoRouteListing::into_route_listing)
         .collect::<Vec<_>>();
 
-    let routes = if routes.is_empty() {
+    // Synthesize the fallback `/` listing when the app declared no routes, so
+    // an empty app still serves the shell. Apply exclusions UNCONDITIONALLY
+    // afterwards: the previous `else`-only filter let an excluded `/` slip
+    // through in the empty case, leaving an active synthetic `/` that shadowed
+    // a custom root handler. This is a conscious divergence from the
+    // `leptos_axum` / `leptos_actix` reference adapters, which share the same
+    // gap — see UPSTREAM_ISSUES_RU.md.
+    let mut routes = if routes.is_empty() {
         vec![NtexRouteListing::new(
             "/".to_string(),
             Default::default(),
@@ -329,11 +336,12 @@ where
             vec![],
         )]
     } else {
-        if let Some(excluded_routes) = &excluded_routes {
-            routes.retain(|p| !excluded_routes.iter().any(|e| e == p.path()))
-        }
         routes
     };
+
+    if let Some(excluded_routes) = &excluded_routes {
+        routes.retain(|p| !excluded_routes.iter().any(|e| e == p.path()))
+    }
 
     let excluded = excluded_routes
         .into_iter()
