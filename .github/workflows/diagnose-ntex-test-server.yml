@@ -14,6 +14,10 @@ on:
         description: ntex-only explicit ServerStatus::Ready barrier iterations
         required: false
         default: "1000"
+      std_connect_iterations:
+        description: ntex server + std TcpStream after ServerStatus::Ready iterations
+        required: false
+        default: "1000"
       serial_iterations:
         description: ntex-only serial diagnostic control iterations
         required: false
@@ -36,6 +40,7 @@ jobs:
     env:
       NTEX_ITERS: ${{ github.event.inputs.ntex_iterations || '1000' }}
       READY_ITERS: ${{ github.event.inputs.ready_iterations || '1000' }}
+      STD_CONNECT_ITERS: ${{ github.event.inputs.std_connect_iterations || '1000' }}
       SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '200' }}
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +66,7 @@ jobs:
           set -euo pipefail
           cargo test --all-features --test ntex_test_server_parallel --no-run --verbose
           cargo test --all-features --test ntex_ready_barrier_parallel --no-run --verbose
+          cargo test --all-features --test ntex_ready_barrier_std_connect_parallel --no-run --verbose
 
       - name: Stress ntex-only diagnostic test, default parallel harness
         id: ntex_parallel
@@ -129,6 +135,40 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Stress std TcpStream after ServerStatus::Ready diagnostic
+        id: std_connect
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p ntex-diagnostic-logs
+          for i in $(seq 1 "$STD_CONNECT_ITERS"); do
+            log="ntex-diagnostic-logs/std-connect-${i}.log"
+            echo "::group::std connect iteration ${i}/${STD_CONNECT_ITERS}"
+            set +e
+            timeout 120s env RUST_LOG="$RUST_LOG_FILTER" \
+              cargo test --all-features --test ntex_ready_barrier_std_connect_parallel -- --nocapture \
+              >"$log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              {
+                echo "name=std-connect"
+                echo "iteration=${i}"
+                echo "status=${status}"
+                echo "command=cargo test --all-features --test ntex_ready_barrier_std_connect_parallel -- --nocapture"
+                echo "rustc=$(rustc --version)"
+                echo "kernel=$(uname -a)"
+              } > ntex-diagnostic-logs/failure-std-connect.env
+              echo "::error::std connect failed on iteration ${i} with status ${status}"
+              tail -n 500 "$log"
+              echo "::endgroup::"
+              exit "$status"
+            fi
+            rm -f "$log"
+            echo "::endgroup::"
+          done
+
       - name: Stress ntex-only diagnostic test, serial harness control
         id: ntex_serial
         if: always()
@@ -176,7 +216,9 @@ jobs:
           set -euo pipefail
           printf 'ntex parallel outcome: %s\n' '${{ steps.ntex_parallel.outcome }}'
           printf 'ready barrier outcome: %s\n' '${{ steps.ready_barrier.outcome }}'
+          printf 'std connect outcome: %s\n' '${{ steps.std_connect.outcome }}'
           printf 'ntex serial outcome: %s\n' '${{ steps.ntex_serial.outcome }}'
           test '${{ steps.ntex_parallel.outcome }}' = success
           test '${{ steps.ready_barrier.outcome }}' = success
+          test '${{ steps.std_connect.outcome }}' = success
           test '${{ steps.ntex_serial.outcome }}' = success
