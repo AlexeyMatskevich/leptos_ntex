@@ -6,6 +6,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{self, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -74,6 +76,12 @@ async fn one_round(name: &'static str) {
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
     let app_name = format!("{name}-std-connect");
 
+    #[cfg(unix)]
+    eprintln!(
+        "{name}: listener bound at {addr} fd={}",
+        listener.as_raw_fd()
+    );
+    #[cfg(not(unix))]
     eprintln!("{name}: listener bound at {addr}");
 
     let server = server::build()
