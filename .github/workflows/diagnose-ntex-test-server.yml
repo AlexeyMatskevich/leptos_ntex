@@ -9,23 +9,23 @@ on:
       ntex_iterations:
         description: ntex-only parallel test-server iterations
         required: false
-        default: "1000"
+        default: "1"
       test_server_std_iterations:
         description: ntex test::server + std TcpStream iterations
         required: false
-        default: "1000"
+        default: "1"
       ready_iterations:
         description: ntex-only explicit ServerStatus::Ready barrier iterations
         required: false
-        default: "1000"
+        default: "2000"
       std_connect_iterations:
         description: ntex server + std TcpStream after ServerStatus::Ready iterations
         required: false
-        default: "1000"
+        default: "2000"
       serial_iterations:
         description: ntex-only serial diagnostic control iterations
         required: false
-        default: "200"
+        default: "1"
 
 permissions:
   contents: read
@@ -42,11 +42,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      NTEX_ITERS: ${{ github.event.inputs.ntex_iterations || '1000' }}
-      TEST_SERVER_STD_ITERS: ${{ github.event.inputs.test_server_std_iterations || '1000' }}
-      READY_ITERS: ${{ github.event.inputs.ready_iterations || '1000' }}
-      STD_CONNECT_ITERS: ${{ github.event.inputs.std_connect_iterations || '1000' }}
-      SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '200' }}
+      NTEX_ITERS: ${{ github.event.inputs.ntex_iterations || '1' }}
+      TEST_SERVER_STD_ITERS: ${{ github.event.inputs.test_server_std_iterations || '1' }}
+      READY_ITERS: ${{ github.event.inputs.ready_iterations || '2000' }}
+      STD_CONNECT_ITERS: ${{ github.event.inputs.std_connect_iterations || '2000' }}
+      SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '1' }}
     steps:
       - uses: actions/checkout@v4
 
