@@ -449,6 +449,80 @@ async fn drain_streaming_input(
     Ok(total)
 }
 
+// --- Middleware short-circuit fixtures (Codex P2 regression) ----------------
+//
+// A server_fn middleware `Layer` that short-circuits `service.run` with its OWN
+// response (an auth-redirect `302`, or a conditional `304`), never calling the
+// inner server fn. `dispatch_server_fn`'s referer-redirect sanitization must
+// leave these 3xx responses intact for a non-HTML client — none of them is
+// server_fn's referer-derived form-redirect fallback. Drives
+// `middleware_redirect_survives_for_non_html_client`.
+//
+// One generic `Layer` carries a builder fn pointer so each guarded server fn
+// can short-circuit with a different response without duplicating the
+// `Service`/`Layer` boilerplate.
+use crate::server_fn::request::NtexRequest as MwReq;
+use crate::server_fn::response::NtexServerResponse as MwRes;
+
+struct ShortCircuitLayer(fn() -> MwRes);
+struct ShortCircuitService(fn() -> MwRes);
+
+impl server_fn::middleware::Service<MwReq, MwRes> for ShortCircuitService {
+    fn run(
+        &mut self,
+        _req: MwReq,
+        _ser: fn(server_fn::error::ServerFnErrorErr) -> bytes::Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MwRes> + Send>> {
+        let build = self.0;
+        Box::pin(async move { build() })
+    }
+}
+
+impl server_fn::middleware::Layer<MwReq, MwRes> for ShortCircuitLayer {
+    fn layer(
+        &self,
+        inner: server_fn::middleware::BoxedService<MwReq, MwRes>,
+    ) -> server_fn::middleware::BoxedService<MwReq, MwRes> {
+        // Reuse the inner service's error serializer; replace the service with
+        // one that always short-circuits, so the inner server fn never runs.
+        server_fn::middleware::BoxedService::new(inner.ser, ShortCircuitService(self.0))
+    }
+}
+
+fn mw_redirect_to_login() -> MwRes {
+    MwRes::from(
+        ntex::web::HttpResponse::Found()
+            .header(ntex::http::header::LOCATION, "/login")
+            .finish(),
+    )
+}
+
+fn mw_not_modified() -> MwRes {
+    MwRes::from(ntex::web::HttpResponse::NotModified().finish())
+}
+
+#[server(
+    name = GuardedByRedirect,
+    prefix = "/api",
+    endpoint = "guarded_by_redirect",
+    server = crate::NtexServerFnBackend
+)]
+#[middleware(ShortCircuitLayer(mw_redirect_to_login))]
+async fn guarded_by_redirect() -> Result<String, ServerFnError> {
+    Ok("unreachable: the middleware short-circuits before the body runs".into())
+}
+
+#[server(
+    name = GuardedByNotModified,
+    prefix = "/api",
+    endpoint = "guarded_by_not_modified",
+    server = crate::NtexServerFnBackend
+)]
+#[middleware(ShortCircuitLayer(mw_not_modified))]
+async fn guarded_by_not_modified() -> Result<String, ServerFnError> {
+    Ok("unreachable: the middleware short-circuits before the body runs".into())
+}
+
 #[server(
     name = EchoWebsocket,
     prefix = "/api",

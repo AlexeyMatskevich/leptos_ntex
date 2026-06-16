@@ -433,6 +433,80 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_on_error(
     );
 }
 
+/// A user middleware attached to a server fn can short-circuit the request with
+/// its OWN response — e.g. an auth guard issuing a `302` to a login page —
+/// before the inner server fn (and server_fn's form-redirect fallback) ever
+/// runs. `dispatch_server_fn`'s referer-redirect sanitization must not mistake
+/// that 3xx for the form fallback and strip it: the fallback's `Location` is
+/// derived from the Referer and only fires on a loose `text/html` `Accept`,
+/// whereas this redirect targets `/login` regardless. Regression for the Codex
+/// P2 finding — the prior `is_redirection()` guard corrupted any non-HTML 3xx
+/// from middleware into a `200`/`500`.
+#[ntex::test]
+async fn middleware_redirect_survives_for_non_html_client() {
+    register_explicit::<GuardedByRedirect>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    // The Codex example verbatim: a JSON (non-HTML) client. server_fn's form
+    // fallback cannot fire (no `text/html` in `Accept`), so the only 3xx is the
+    // middleware's — it must reach the client unchanged.
+    let json = test::TestRequest::post()
+        .uri(GuardedByRedirect::PATH)
+        .header("Accept", "application/json")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, json).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a middleware auth redirect must survive for a JSON client, not collapse to 200/500"
+    );
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login"),
+        "the middleware's own Location must be preserved"
+    );
+
+    // Even with a loose `text/html` Accept AND a Referer present, a redirect
+    // whose Location is NOT referer-derived (here `/login`, not the Referer) is
+    // the middleware's, not the form fallback — so it must still survive. This
+    // pins the referer-derived guard, not merely the Accept guard.
+    let q_zero = test::TestRequest::post()
+        .uri(GuardedByRedirect::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/dashboard")
+        .header("Accept", "text/html;q=0")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, q_zero).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a middleware redirect to a non-referer target must survive even under text/html;q=0"
+    );
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login")
+    );
+
+    // The other 3xx Codex called out: a conditional `304 Not Modified` from a
+    // caching middleware. It carries no `Location`, so it can never match the
+    // referer-derived form-redirect shape — it must pass through untouched
+    // rather than being reset to `200`.
+    register_explicit::<GuardedByNotModified>();
+    let not_modified = test::TestRequest::post()
+        .uri(GuardedByNotModified::PATH)
+        .header("Accept", "application/json")
+        .set_payload("")
+        .to_request();
+    let resp = test::call_service(&app, not_modified).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_MODIFIED,
+        "a middleware 304 must survive for a JSON client, not collapse to 200"
+    );
+}
+
 /// When a server function **errors** on an HTML form post, server_fn rewrites
 /// the response into a `302` back to the Referer with the error encoded in the
 /// query. With a cross-origin Referer the same-origin guard must strip that
