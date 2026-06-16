@@ -293,6 +293,180 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_leak_cross_origin_
     );
 }
 
+/// Same-origin sibling of the cross-origin q=0 leak test above, varying only
+/// the Referer's origin. `text/html;q=0` explicitly REFUSES HTML, so even
+/// though server_fn's loose `contains("text/html")` fallback emits a
+/// *same-origin* form redirect, the integration must drop it and return the
+/// structured response — a programmatic client that refuses HTML must not be
+/// bounced through a browser redirect. The `Accept: text/html` counterpart
+/// still redirects (`server_fn_html_form_falls_back_to_same_origin_referrer`),
+/// which is what pins this as the q=0-specific behavior.
+#[ntex::test]
+async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_to_same_origin_referrer() {
+    register_explicit::<EchoName>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(EchoName::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html;q=0")
+        .set_payload("name=Alice")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "q=0 refuses HTML; the same-origin form redirect must not survive, got {}",
+        resp.status()
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "a client refusing HTML must not receive a form Location"
+    );
+}
+
+/// Error sibling of the q=0 same-origin test above. On the ERROR path server_fn
+/// builds `Location = Referer + ?__path=…&__err=…`, which is NOT an exact
+/// referer echo — a `location_matches_referrer`-based strip misses it and the
+/// same-origin guard would otherwise preserve the `302`. A client that refuses
+/// HTML must still get the structured `500`, never a browser redirect. (Pins
+/// the Codex-found gap: the q=0 strip keys on "is the response a form redirect
+/// at all", not on an exact referer match.)
+#[ntex::test]
+async fn server_fn_html_form_with_html_q_zero_accept_does_not_redirect_on_error() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html;q=0")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "q=0 refuses HTML; an erroring form post must return the structured error, not a 302, got {}",
+        resp.status()
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "a client refusing HTML must not receive a form Location, even on the error path"
+    );
+}
+
+/// When a server function **errors** on an HTML form post, server_fn rewrites
+/// the response into a `302` back to the Referer with the error encoded in the
+/// query. With a cross-origin Referer the same-origin guard must strip that
+/// unsafe `Location` WITHOUT promoting the failure to `200 OK` — the caller
+/// still has to observe a server error. Sibling of the successful cross-origin
+/// cases above, varying the server-fn OUTCOME (Err vs Ok).
+#[ntex::test]
+async fn server_fn_html_form_error_redirect_strip_preserves_error_status() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://evil.test/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "stripping an unsafe error redirect must preserve the server-fn failure status, got {}",
+        resp.status()
+    );
+    assert!(
+        resp.headers().get("location").is_none(),
+        "the unsafe cross-origin error Location must be stripped"
+    );
+}
+
+/// Same-origin sibling of the cross-origin error case above (C3), varying the
+/// Referer's origin. A SAME-origin form-error redirect is legitimate — the form
+/// page shows the error — so the `302` back to the full referer must be
+/// PRESERVED, not stripped and not normalized to a bare path. Pins both halves
+/// of the redirect machinery: `NtexServerResponse::redirect` must actually set
+/// the `302`+`Location` (a no-op there drops it to a non-redirect), and
+/// `location_matches_referrer` must NOT treat the upstream error-query URL as a
+/// plain referer echo (a blanket match would rewrite it to bare "/form").
+#[ntex::test]
+async fn server_fn_html_form_same_origin_error_redirect_is_preserved() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .header(header::HOST, "example.test:8080")
+        .header(header::REFERER, "http://example.test:8080/form")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "a same-origin form error must stay a 302 back to the form, got {}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert!(
+        location
+            .as_deref()
+            .is_some_and(|l| l.starts_with("http://example.test:8080/form")),
+        "the same-origin error redirect must preserve the full referer URL, got {location:?}"
+    );
+}
+
+/// `NtexServerResponse::content_type` (the `Res::content_type` setter) is only
+/// reached on the server-fn ERROR path, where server_fn sets the error
+/// encoding's media type after `error_response`. A no-op there would leave the
+/// error body with no `Content-Type`, so pin it: an erroring server fn must
+/// report `text/plain` (the `ServerFnError` encoder's `CONTENT_TYPE`). No
+/// Referer/Accept here, so no form redirect intervenes — we observe the raw
+/// error response.
+#[ntex::test]
+async fn server_fn_error_response_sets_error_encoder_content_type() {
+    register_explicit::<AlwaysErr>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(AlwaysErr::PATH)
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        content_type,
+        Some("text/plain"),
+        "the server-fn error encoder's Content-Type must be set on the error response"
+    );
+}
+
 /// Oversize request detected via streaming (no Content-Length
 /// preflight, because `set_payload` doesn't set the header — the
 /// limit trips mid-read in `collect_payload` and is promoted to 413

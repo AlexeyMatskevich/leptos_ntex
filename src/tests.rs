@@ -375,6 +375,16 @@ async fn redirect_to_about() -> Result<(), ServerFnError> {
 }
 
 #[server(
+    name = AlwaysErr,
+    prefix = "/api",
+    endpoint = "always_err",
+    server = crate::NtexServerFnBackend
+)]
+async fn always_err() -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("boom"))
+}
+
+#[server(
     name = EchoWebsocket,
     prefix = "/api",
     endpoint = "echo_websocket",
