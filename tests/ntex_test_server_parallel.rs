@@ -27,7 +27,7 @@ async fn one_round(name: &'static str) {
     let url = server_url(&srv, "/");
     eprintln!("{name}: server addr={}, url={url}", srv.addr());
 
-    let mut resp = srv.request(Method::GET, url).send().await.unwrap();
+    let resp = srv.request(Method::GET, url).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = resp.body().await.unwrap();
