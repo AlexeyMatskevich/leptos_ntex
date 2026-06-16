@@ -20,13 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `200`.
 - A non-browser client that explicitly refuses HTML (`Accept: text/html;q=0`) no
   longer receives an HTML-form `302` redirect. `server_fn`'s form-redirect
-  fallback gates on a loose `contains("text/html")` and still fires for `q=0` —
-  including the error path (`Location = Referer + ?…&__err=…`, which is not an
-  exact `Referer` echo) and the bare `/` it targets when no `Referer` is sent.
-  When the strict `Accept` parser refuses HTML the dispatcher now drops the form
-  redirect wholesale: before application redirects are applied, the only source
-  of a `3xx` on the server-function response is that fallback. `redirect()` /
-  `ResponseOptions` redirects are applied afterwards and are unaffected.
+  fallback gates on a loose `contains("text/html")` and still fires for `q=0`,
+  redirecting back to the `Referer` — an exact echo on the success path,
+  `Referer + ?…&__err=…` on the error path. When the strict `Accept` parser
+  refuses HTML the dispatcher now drops that referer-derived redirect (both
+  shapes) so the client receives the structured response. The strip is scoped to
+  the fallback's own shape — a loosely-`text/html` request whose redirect
+  `Location` is derived from the `Referer` — so a `3xx` issued by user middleware
+  wrapping the server function (an auth bounce, a `304`) is left intact rather
+  than corrupted. `redirect()` / `ResponseOptions` application redirects are
+  applied afterwards and are unaffected.
 - Excluding `/` from a routeless application via
   `generate_route_list_with_exclusions*` no longer leaves an active synthetic
   `GET /`. The fallback `/` route synthesized when an app declares no routes
