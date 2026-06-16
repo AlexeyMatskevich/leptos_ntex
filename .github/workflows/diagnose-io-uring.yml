@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       integration_iterations:
-        description: Full integration.rs iterations
+        description: Full integration.rs iterations with default test concurrency
         required: false
         default: "250"
+      serial_iterations:
+        description: Full integration.rs iterations with --test-threads=1 diagnostic control
+        required: false
+        default: "100"
       cbor_iterations:
         description: Focused CBOR server-fn iterations
         required: false
@@ -31,6 +35,7 @@ jobs:
     timeout-minutes: 60
     env:
       INTEGRATION_ITERS: ${{ github.event.inputs.integration_iterations || '250' }}
+      SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '100' }}
       CBOR_ITERS: ${{ github.event.inputs.cbor_iterations || '750' }}
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +62,9 @@ jobs:
       - name: Build integration test binary once
         run: cargo test --all-features --test integration --no-run --verbose
 
-      - name: Stress full integration binary
+      - name: Stress full integration binary, default parallel harness
+        id: parallel
+        continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p diagnostic-logs
@@ -81,7 +88,7 @@ jobs:
                   echo "command=$*"
                   echo "rustc=$(rustc --version)"
                   echo "kernel=$(uname -a)"
-                } > diagnostic-logs/failure.env
+                } > "diagnostic-logs/failure-${name}.env"
                 echo "::error::${name} failed on iteration ${i} with status ${status}"
                 tail -n 500 "$log"
                 echo "::endgroup::"
@@ -92,10 +99,13 @@ jobs:
             done
           }
 
-          run_case integration "$INTEGRATION_ITERS" \
+          run_case integration-parallel "$INTEGRATION_ITERS" \
             cargo test --all-features --test integration -- --nocapture
 
-      - name: Stress focused CBOR server-fn test
+      - name: Stress full integration binary, serial harness diagnostic control
+        id: serial
+        if: always()
+        continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p diagnostic-logs
@@ -119,7 +129,48 @@ jobs:
                   echo "command=$*"
                   echo "rustc=$(rustc --version)"
                   echo "kernel=$(uname -a)"
-                } > diagnostic-logs/failure.env
+                } > "diagnostic-logs/failure-${name}.env"
+                echo "::error::${name} failed on iteration ${i} with status ${status}"
+                tail -n 500 "$log"
+                echo "::endgroup::"
+                exit "$status"
+              fi
+              rm -f "$log"
+              echo "::endgroup::"
+            done
+          }
+
+          run_case integration-serial "$SERIAL_ITERS" \
+            cargo test --all-features --test integration -- --nocapture --test-threads=1
+
+      - name: Stress focused CBOR server-fn test
+        id: cbor
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic-logs
+          run_case() {
+            local name="$1"
+            local iterations="$2"
+            shift 2
+
+            for i in $(seq 1 "$iterations"); do
+              local log="diagnostic-logs/${name}-${i}.log"
+              echo "::group::${name} iteration ${i}/${iterations}"
+              set +e
+              timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1
+              local status=$?
+              set -e
+              if [ "$status" -ne 0 ]; then
+                {
+                  echo "name=${name}"
+                  echo "iteration=${i}"
+                  echo "status=${status}"
+                  echo "command=$*"
+                  echo "rustc=$(rustc --version)"
+                  echo "kernel=$(uname -a)"
+                } > "diagnostic-logs/failure-${name}.env"
                 echo "::error::${name} failed on iteration ${i} with status ${status}"
                 tail -n 500 "$log"
                 echo "::endgroup::"
@@ -134,8 +185,19 @@ jobs:
             cargo test --all-features --test integration real_server_roundtrips_cbor_server_fn -- --nocapture
 
       - uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: io-uring-diagnostic-logs
           path: diagnostic-logs/
           if-no-files-found: ignore
+
+      - name: Report diagnostic outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          printf 'parallel outcome: %s\n' '${{ steps.parallel.outcome }}'
+          printf 'serial outcome: %s\n' '${{ steps.serial.outcome }}'
+          printf 'cbor outcome: %s\n' '${{ steps.cbor.outcome }}'
+          test '${{ steps.parallel.outcome }}' = success
+          test '${{ steps.serial.outcome }}' = success
+          test '${{ steps.cbor.outcome }}' = success
