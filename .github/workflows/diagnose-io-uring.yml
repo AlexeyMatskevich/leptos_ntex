@@ -69,8 +69,11 @@ jobs:
             for i in $(seq 1 "$iterations"); do
               local log="diagnostic-logs/${name}-${i}.log"
               echo "::group::${name} iteration ${i}/${iterations}"
-              if ! timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1; then
-                local status=$?
+              set +e
+              timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1
+              local status=$?
+              set -e
+              if [ "$status" -ne 0 ]; then
                 {
                   echo "name=${name}"
                   echo "iteration=${i}"
@@ -104,8 +107,11 @@ jobs:
             for i in $(seq 1 "$iterations"); do
               local log="diagnostic-logs/${name}-${i}.log"
               echo "::group::${name} iteration ${i}/${iterations}"
-              if ! timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1; then
-                local status=$?
+              set +e
+              timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1
+              local status=$?
+              set -e
+              if [ "$status" -ne 0 ]; then
                 {
                   echo "name=${name}"
                   echo "iteration=${i}"
