@@ -1,0 +1,135 @@
+name: Diagnose io-uring flake
+
+on:
+  push:
+    branches:
+      - codex/diagnose-io-uring-flake
+  workflow_dispatch:
+    inputs:
+      integration_iterations:
+        description: Full integration.rs iterations
+        required: false
+        default: "250"
+      cbor_iterations:
+        description: Focused CBOR server-fn iterations
+        required: false
+        default: "750"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: full
+  RUST_LOG_FILTER: ntex_net::uring=trace,ntex_io=trace,ntex_server=trace,ntex::client=trace,ntex::http=trace
+
+jobs:
+  stress:
+    name: ubuntu-24.04 / rust 1.88 io-uring stress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      INTEGRATION_ITERS: ${{ github.event.inputs.integration_iterations || '250' }}
+      CBOR_ITERS: ${{ github.event.inputs.cbor_iterations || '750' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+
+      - name: Environment
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          uname -a
+          cat /proc/version
+          printf 'nproc: '; nproc
+          lscpu
+          ulimit -a
+          printf 'io_uring_disabled: '
+          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || true
+          printf 'io_uring_group: '
+          cat /proc/sys/kernel/io_uring_group 2>/dev/null || true
+
+      - name: Build integration test binary once
+        run: cargo test --all-features --test integration --no-run --verbose
+
+      - name: Stress full integration binary
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic-logs
+          run_case() {
+            local name="$1"
+            local iterations="$2"
+            shift 2
+
+            for i in $(seq 1 "$iterations"); do
+              local log="diagnostic-logs/${name}-${i}.log"
+              echo "::group::${name} iteration ${i}/${iterations}"
+              if ! timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1; then
+                local status=$?
+                {
+                  echo "name=${name}"
+                  echo "iteration=${i}"
+                  echo "status=${status}"
+                  echo "command=$*"
+                  echo "rustc=$(rustc --version)"
+                  echo "kernel=$(uname -a)"
+                } > diagnostic-logs/failure.env
+                echo "::error::${name} failed on iteration ${i} with status ${status}"
+                tail -n 500 "$log"
+                echo "::endgroup::"
+                exit "$status"
+              fi
+              rm -f "$log"
+              echo "::endgroup::"
+            done
+          }
+
+          run_case integration "$INTEGRATION_ITERS" \
+            cargo test --all-features --test integration -- --nocapture
+
+      - name: Stress focused CBOR server-fn test
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic-logs
+          run_case() {
+            local name="$1"
+            local iterations="$2"
+            shift 2
+
+            for i in $(seq 1 "$iterations"); do
+              local log="diagnostic-logs/${name}-${i}.log"
+              echo "::group::${name} iteration ${i}/${iterations}"
+              if ! timeout 120s env RUST_LOG="$RUST_LOG_FILTER" "$@" >"$log" 2>&1; then
+                local status=$?
+                {
+                  echo "name=${name}"
+                  echo "iteration=${i}"
+                  echo "status=${status}"
+                  echo "command=$*"
+                  echo "rustc=$(rustc --version)"
+                  echo "kernel=$(uname -a)"
+                } > diagnostic-logs/failure.env
+                echo "::error::${name} failed on iteration ${i} with status ${status}"
+                tail -n 500 "$log"
+                echo "::endgroup::"
+                exit "$status"
+              fi
+              rm -f "$log"
+              echo "::endgroup::"
+            done
+          }
+
+          run_case cbor "$CBOR_ITERS" \
+            cargo test --all-features --test integration real_server_roundtrips_cbor_server_fn -- --nocapture
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: io-uring-diagnostic-logs
+          path: diagnostic-logs/
+          if-no-files-found: ignore
