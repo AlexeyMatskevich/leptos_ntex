@@ -22,6 +22,10 @@ on:
         description: ntex server + std TcpStream after ServerStatus::Ready iterations
         required: false
         default: "2000"
+      tokio_std_connect_iterations:
+        description: ntex tokio driver + std TcpStream after ServerStatus::Ready iterations
+        required: false
+        default: "2000"
       serial_iterations:
         description: ntex-only serial diagnostic control iterations
         required: false
@@ -34,7 +38,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: full
-  RUST_LOG_FILTER: ntex_net::uring=trace,ntex_io=trace,ntex_server=trace,ntex::client=trace,ntex::http=trace
+  RUST_LOG_FILTER: ntex_net::uring=trace,ntex_net::tokio=trace,ntex_io=trace,ntex_server=trace,ntex::client=trace,ntex::http=trace
 
 jobs:
   stress:
@@ -46,6 +50,7 @@ jobs:
       TEST_SERVER_STD_ITERS: ${{ github.event.inputs.test_server_std_iterations || '1' }}
       READY_ITERS: ${{ github.event.inputs.ready_iterations || '2000' }}
       STD_CONNECT_ITERS: ${{ github.event.inputs.std_connect_iterations || '2000' }}
+      TOKIO_STD_CONNECT_ITERS: ${{ github.event.inputs.tokio_std_connect_iterations || '2000' }}
       SERIAL_ITERS: ${{ github.event.inputs.serial_iterations || '1' }}
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +78,7 @@ jobs:
           cargo test --all-features --test ntex_test_server_std_connect_parallel --no-run --verbose
           cargo test --all-features --test ntex_ready_barrier_parallel --no-run --verbose
           cargo test --all-features --test ntex_ready_barrier_std_connect_parallel --no-run --verbose
+          cargo test --all-features --features ntex/tokio --test ntex_ready_barrier_std_connect_parallel --no-run --verbose
 
       - name: Stress ntex-only diagnostic test, default parallel harness
         id: ntex_parallel
@@ -209,6 +215,40 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Stress std TcpStream after ServerStatus::Ready diagnostic, tokio driver
+        id: std_connect_tokio
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p ntex-diagnostic-logs
+          for i in $(seq 1 "$TOKIO_STD_CONNECT_ITERS"); do
+            log="ntex-diagnostic-logs/tokio-std-connect-${i}.log"
+            echo "::group::tokio std connect iteration ${i}/${TOKIO_STD_CONNECT_ITERS}"
+            set +e
+            timeout 120s env RUST_LOG="$RUST_LOG_FILTER" \
+              cargo test --all-features --features ntex/tokio --test ntex_ready_barrier_std_connect_parallel -- --nocapture \
+              >"$log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              {
+                echo "name=std-connect-tokio"
+                echo "iteration=${i}"
+                echo "status=${status}"
+                echo "command=cargo test --all-features --features ntex/tokio --test ntex_ready_barrier_std_connect_parallel -- --nocapture"
+                echo "rustc=$(rustc --version)"
+                echo "kernel=$(uname -a)"
+              } > ntex-diagnostic-logs/failure-std-connect-tokio.env
+              echo "::error::tokio std connect failed on iteration ${i} with status ${status}"
+              tail -n 500 "$log"
+              echo "::endgroup::"
+              exit "$status"
+            fi
+            rm -f "$log"
+            echo "::endgroup::"
+          done
+
       - name: Stress ntex-only diagnostic test, serial harness control
         id: ntex_serial
         if: always()
@@ -258,9 +298,11 @@ jobs:
           printf 'test server std outcome: %s\n' '${{ steps.test_server_std.outcome }}'
           printf 'ready barrier outcome: %s\n' '${{ steps.ready_barrier.outcome }}'
           printf 'std connect outcome: %s\n' '${{ steps.std_connect.outcome }}'
+          printf 'tokio std connect outcome: %s\n' '${{ steps.std_connect_tokio.outcome }}'
           printf 'ntex serial outcome: %s\n' '${{ steps.ntex_serial.outcome }}'
           test '${{ steps.ntex_parallel.outcome }}' = success
           test '${{ steps.test_server_std.outcome }}' = success
           test '${{ steps.ready_barrier.outcome }}' = success
           test '${{ steps.std_connect.outcome }}' = success
+          test '${{ steps.std_connect_tokio.outcome }}' = success
           test '${{ steps.ntex_serial.outcome }}' = success
