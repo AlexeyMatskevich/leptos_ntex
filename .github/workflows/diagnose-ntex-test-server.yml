@@ -71,6 +71,11 @@ jobs:
           printf 'io_uring_group: '
           cat /proc/sys/kernel/io_uring_group 2>/dev/null || true
 
+      - name: Dependency graph
+        run: |
+          set -euo pipefail
+          cargo tree -i ntex-server
+
       - name: Build ntex-only diagnostic tests once
         run: |
           set -euo pipefail

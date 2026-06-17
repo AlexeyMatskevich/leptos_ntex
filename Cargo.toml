@@ -47,6 +47,13 @@ lets_expect = "0.5.2"
 serde_json = "1.0.145"
 server_fn = { version = "0.8.12", features = ["cbor"] }
 
+[patch.crates-io]
+# Diagnostic-only verification for ntex-rs/ntex#911. The branch's
+# ntex-server 3.10.1 is not compatible with ntex 3.9.6's pinned
+# ntex-server 3.9.0 dependency, so patch both crates from the same branch.
+ntex = { git = "https://github.com/ntex-rs/ntex", branch = "server-ready" }
+ntex-server = { git = "https://github.com/ntex-rs/ntex", branch = "server-ready" }
+
 [[example]]
 name = "auth_extractor"
 path = "examples/auth_extractor.rs"
