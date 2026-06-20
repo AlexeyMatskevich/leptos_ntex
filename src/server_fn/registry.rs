@@ -25,12 +25,36 @@ pub(crate) static REGISTERED_SERVER_FUNCTIONS: LazyServerFnMap<NtexRequest, Ntex
         for obj in server_fn::inventory::iter::<ServerFnTraitObj<NtexRequest, NtexServerResponse>>
             .into_iter()
         {
-            map.entry(obj.path())
-                .or_insert_with(Vec::new)
-                .push((obj.method(), obj.clone()));
+            let entries = map.entry(obj.path()).or_insert_with(Vec::new);
+            // Dedup the inventory pass on `(path, method)` too — NOT just
+            // `register_explicit`. Two inventory entries colliding on the same
+            // path+method (a duplicate `submit!`, an aliased endpoint) would
+            // otherwise accumulate as duplicate `server_fn_paths()` rows and
+            // duplicate route registrations, and a later `register_explicit`
+            // would replace only the first slot, orphaning the rest.
+            upsert(entries, obj.method(), obj.clone());
         }
         RwLock::new(map)
     });
+
+/// Inserts or replaces the entry for `(path, method)` in a path's method Vec,
+/// last-writer-wins — the single write-site invariant that keeps both the
+/// `inventory` init and [`register_explicit`] from accumulating duplicate
+/// `(path, method)` slots. Mirrors the reference `server_fn` axum/actix maps,
+/// which key on `(path, method)` and `insert`.
+fn upsert(
+    entries: &mut Vec<(
+        HttpMethod,
+        ServerFnTraitObj<NtexRequest, NtexServerResponse>,
+    )>,
+    method: HttpMethod,
+    obj: ServerFnTraitObj<NtexRequest, NtexServerResponse>,
+) {
+    match entries.iter_mut().find(|(m, _)| *m == method) {
+        Some(slot) => slot.1 = obj,
+        None => entries.push((method, obj)),
+    }
+}
 
 /// Explicitly registers a server function with this integration.
 ///
@@ -58,17 +82,13 @@ where
     let method = T::Protocol::METHOD;
     let mut guard = REGISTERED_SERVER_FUNCTIONS.write().or_poisoned();
     let entries = guard.entry(T::PATH).or_default();
-    // Idempotent and last-writer-wins, matching the reference registries
-    // (`server_fn`'s axum/actix maps key on `(path, method)` and `insert`):
-    // a repeated or explicit registration REPLACES the entry for that
-    // `(path, method)` instead of appending a duplicate. Without this, an
-    // explicit registration on a native target where `inventory` already
-    // populated the map would be dead (the first match wins in
-    // `lookup_server_fn`) and `server_fn_paths()` would emit duplicates.
-    match entries.iter_mut().find(|(m, _)| *m == method) {
-        Some(slot) => slot.1 = obj,
-        None => entries.push((method, obj)),
-    }
+    // Idempotent and last-writer-wins via the shared `upsert`: a repeated or
+    // explicit registration REPLACES the entry for that `(path, method)`
+    // instead of appending a duplicate. Without this, an explicit registration
+    // on a native target where `inventory` already populated the map would be
+    // dead (the first match wins in `lookup_server_fn`) and `server_fn_paths()`
+    // would emit duplicates.
+    upsert(entries, method, obj);
 }
 
 /// Returns an iterator over the `(path, method)` pairs of every server
