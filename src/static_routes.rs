@@ -20,7 +20,7 @@ use leptos_router::{
     RouteList,
     static_routes::{RegenerationFn, ResolvedStaticPath},
 };
-use ntex::http::StatusCode;
+use ntex::http::header;
 use ntex::web::error::StateExtractorError;
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use or_poisoned::OrPoisoned;
@@ -139,7 +139,7 @@ impl StaticRouteGenerator {
                                     .await
                             }
                         },
-                        was_404,
+                        was_error_status,
                     )))
                 })
             })
@@ -220,10 +220,21 @@ const STATIC_HEADERS_DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(10
 /// Environment variable that overrides [`STATIC_HEADERS_DEFAULT_CAPACITY`].
 const STATIC_HEADERS_CAPACITY_ENV: &str = "LEPTOS_STATIC_HEADERS_CACHE_SIZE";
 
-fn was_404(owner: &Owner) -> bool {
+/// Whether a static render produced an ERROR status that must NOT be cached
+/// to disk. leptos takes this as its `was_404` / `was_error` hook: when it
+/// returns true, leptos sends the rendered HTML back instead of invoking the
+/// writer, so the dynamic handler can re-render the live error on demand.
+///
+/// leptos's own contract is "404, 500, etc." (see the `was_error` comment in
+/// leptos_router's static generation), so this skips EVERY 4xx/5xx render —
+/// not only 404. A 500 (or any error) render cached as a bare static file
+/// would otherwise be served from disk indefinitely, even after the cause
+/// cleared. This is a deliberate divergence from `leptos_axum` /
+/// `leptos_actix`, whose `was_404` callbacks check only `== NOT_FOUND`.
+fn was_error_status(owner: &Owner) -> bool {
     let resp = owner.with(|| expect_context::<ResponseOptions>());
     let status = resp.0.read().or_poisoned().status;
-    status == Some(StatusCode::NOT_FOUND)
+    status.is_some_and(|status| status.is_client_error() || status.is_server_error())
 }
 
 fn static_path(options: &LeptosOptions, path: &str) -> Option<PathBuf> {
@@ -559,7 +570,7 @@ where
                                     .await
                             }
                         },
-                        was_404,
+                        was_error_status,
                         regenerate,
                     )
                     .await;
@@ -623,6 +634,11 @@ where
             // `ETag`. A 500 here now means the file genuinely could not be
             // opened after a successful write, not the expected
             // success-path (which previously fell through to a bogus 500).
+            // Whether this response body is the on-disk file (served via
+            // `NamedFile`) vs. the inline 404 HTML. On the file branch
+            // `NamedFile` is the authoritative source of the body-framing
+            // headers, so the captured snapshot must not override them below.
+            let served_from_file = html.is_none();
             let mut res = NtexResponse(match html {
                 Some(html) => HttpResponse::NotFound()
                     .content_type("text/html")
@@ -645,7 +661,31 @@ where
                 }),
             });
 
-            if let Some(options) = response_options {
+            if let Some(mut options) = response_options {
+                if served_from_file {
+                    // `NamedFile::into_response` already derived the
+                    // body-framing headers from the file actually on disk
+                    // (length, MIME, validators). A captured `ResponseParts`
+                    // snapshot is in the `should_replace_header` REPLACE set
+                    // for these keys, so a stale or app-set value (e.g. a wrong
+                    // `Content-Length`) would otherwise overwrite the
+                    // authoritative one and desync the framing from the real
+                    // body. Drop them from the snapshot so `NamedFile` wins;
+                    // the app's status and its non-framing headers (cookies,
+                    // `Cache-Control`, custom `x-*`) still apply.
+                    for key in [
+                        header::CONTENT_LENGTH,
+                        header::CONTENT_TYPE,
+                        header::CONTENT_ENCODING,
+                        header::TRANSFER_ENCODING,
+                        header::CONTENT_RANGE,
+                        header::ACCEPT_RANGES,
+                        header::ETAG,
+                        header::LAST_MODIFIED,
+                    ] {
+                        options.headers.remove(key);
+                    }
+                }
                 res.extend_response_parts(options);
             }
 
@@ -688,7 +728,7 @@ mod tests {
     // happy path (append `.html`; map `/`, the empty path and trailing
     // slashes to `index.html`) and REJECT every traversal / dotfile /
     // smuggling shape. The old tests asserted only rejection (`None`); all
-    // eight `Some` leaves below — the `.html` suffixing and the index
+    // nine `Some` leaves below — the `.html` suffixing and the index
     // resolution — were previously unpinned, so a regression dropping
     // `.html` or mangling the join would not have been caught.
     lets_expect! {

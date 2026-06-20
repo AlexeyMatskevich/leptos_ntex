@@ -28,8 +28,12 @@ fn generate_routes_without_a_ntex_runtime() {
     let _routes2 = gen_route_list(Empty);
 }
 
+// Named for what the `not_panic` assertion actually pins — route generation
+// off any ntex arbiter — NOT executor initialization (which this leaf does not
+// observe). The clean-start install success is pinned out-of-process by
+// `tests/executor_clean_start.rs`.
 lets_expect! {
-    expect(generate_routes_without_a_ntex_runtime()) as executor_initialization {
+    expect(generate_routes_without_a_ntex_runtime()) as route_generation_without_a_ntex_runtime {
         to not_panic
     }
 }

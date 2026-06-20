@@ -293,10 +293,11 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
                 // Accept only a valid qvalue (RFC 9110 §12.4.2: 0 to 1).
                 // Out-of-range (`q=2`), non-finite, and unparseable (`q=abc`)
                 // weights are all malformed alike and keep the default 1.0 —
-                // an invalid declaration must not outrank a valid one.
+                // an invalid declaration must not outrank a valid one. The
+                // finite/range policy lives in the shared `parse_qvalue` so the
+                // `Accept` (HTML) parser cannot drift from this one.
                 if name.trim().eq_ignore_ascii_case("q")
-                    && let Ok(parsed) = value.trim().parse::<f32>()
-                    && (0.0..=1.0).contains(&parsed)
+                    && let Some(parsed) = crate::config::parse_qvalue(value)
                 {
                     q = parsed;
                 }
@@ -552,6 +553,23 @@ mod tests {
                     equal(vec!["*".to_string()])
                 }
             }
+
+            // The dedup is case-insensitive and scans every comma-separated
+            // token, so neither a lowercase value nor `Accept-Encoding` buried
+            // in a list gets a duplicate appended.
+            when accept_encoding_is_already_advertised_in_lowercase {
+                let existing: Option<&'static str> = Some("accept-encoding");
+                to is_not_duplicated_case_insensitively {
+                    equal(vec!["accept-encoding".to_string()])
+                }
+            }
+
+            when accept_encoding_is_one_token_in_a_comma_list {
+                let existing: Option<&'static str> = Some("Origin, Accept-Encoding");
+                to is_not_duplicated_within_the_list {
+                    equal(vec!["Origin".to_string(), "Accept-Encoding".to_string()])
+                }
+            }
         }
     }
 
@@ -577,6 +595,13 @@ mod tests {
         std::fs::create_dir_all(root.join(".well-known")).unwrap();
         std::fs::write(root.join(".well-known/security.txt"), "ok").unwrap();
         std::fs::write(root.join(".env"), "secret").unwrap();
+        // Materialize the rejection-leaf targets on disk too, so a rejected
+        // path is rejected by the GUARD, not merely because the file is absent
+        // (which `canonicalize()` would turn into `None` regardless): a nested
+        // dotfile under `.well-known`, and a non-dotfile reachable only via a
+        // `..` traversal out of `.well-known`.
+        std::fs::write(root.join(".well-known/.secret"), "nested-secret").unwrap();
+        std::fs::write(root.join("public.txt"), "public").unwrap();
         let canon_root = root.canonicalize().unwrap();
         let resolved = safe_subpath(&canon_root, path).is_some();
         let _ = std::fs::remove_dir_all(&root);
@@ -600,7 +625,12 @@ mod tests {
             }
 
             when a_traversal_hides_behind_well_known {
-                let path = "/.well-known/../.env";
+                // Target a NON-dotfile (`public.txt`) reachable only by escaping
+                // `.well-known` via `..`, so the rejection is driven by the
+                // traversal guard rather than by the target also being a
+                // dotfile — `public.txt` exists on disk, so a dropped `..`
+                // guard would actually resolve it.
+                let path = "/.well-known/../public.txt";
                 to is_rejected { be_false }
             }
         }
@@ -726,6 +756,39 @@ mod tests {
             when the_encodings_span_two_header_lines {
                 let accept_encoding: &[&str] = &["br", "gzip"];
                 to merges_both_lines { equal(vec!["br", "gzip"]) }
+            }
+
+            // Discriminating q-NAME-case leaf: with the param name `Q`
+            // recognized, gzip=0.1 < br=0.9 → [br, gzip]; if `Q` were NOT
+            // recognized, gzip would keep its default 1.0 and outrank br →
+            // [gzip, br]. (The mixed-case leaf above can't tell these apart.)
+            when the_quality_param_name_is_uppercase {
+                let accept_encoding: &[&str] = &["br;q=0.9, gzip;Q=0.1"];
+                to honours_the_uppercase_q_name { equal(vec!["br", "gzip"]) }
+            }
+
+            // An explicit refusal must beat the wildcard backfill: `or(wildcard)`
+            // runs BEFORE `filter(q>0)`, so a refused token stays refused even
+            // when `*` is offered, and the wildcard only backfills the OTHER.
+            when brotli_is_refused_but_a_wildcard_is_offered {
+                let accept_encoding: &[&str] = &["br;q=0, *;q=1"];
+                to keeps_brotli_refused_and_accepts_gzip { equal(vec!["gzip"]) }
+            }
+
+            when gzip_is_refused_but_a_wildcard_is_offered {
+                let accept_encoding: &[&str] = &["gzip;q=0, *;q=1"];
+                to keeps_gzip_refused_and_accepts_brotli { equal(vec!["br"]) }
+            }
+
+            // A token repeated across the header is last-write-wins.
+            when a_token_is_repeated_then_refused {
+                let accept_encoding: &[&str] = &["br;q=0.9, br;q=0"];
+                to takes_the_last_weight_and_refuses { equal(Vec::<&str>::new()) }
+            }
+
+            when a_token_is_refused_then_re_offered {
+                let accept_encoding: &[&str] = &["br;q=0, br;q=0.9"];
+                to takes_the_last_weight_and_accepts { equal(vec!["br"]) }
             }
         }
     }

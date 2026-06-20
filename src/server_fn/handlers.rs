@@ -180,7 +180,18 @@ fn same_origin_location(
     value: &HeaderValue,
 ) -> Option<HeaderValue> {
     let value = value.to_str().ok()?;
-    if value.starts_with('/') && !value.starts_with("//") {
+    // An origin-relative path is a SINGLE leading '/'. Reject both the
+    // protocol-relative `//host` form and the backslash-prefixed `/\host`
+    // form: browsers fold `\` to `/` in HTTP(S) URLs, so a `Location: /\evil.com`
+    // resolves as the cross-origin `//evil.com` and would otherwise slip
+    // through this same-origin fast path. A bare `/` (len 1) has no second
+    // byte and stays same-origin.
+    if value.starts_with('/')
+        && !value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| *b == b'/' || *b == b'\\')
+    {
         return HeaderValue::from_str(value).ok();
     }
 
@@ -359,4 +370,69 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lets_expect::lets_expect;
+
+    // ----- same_origin_location: the post-run Location safety guard -------
+    // A redirect `Location` reaching the server-fn layer may only target the
+    // current origin. The guard accepts an origin-relative path or a
+    // scheme+authority-matching absolute URI (returning the path-and-query
+    // form), and rejects everything else. The connection origin is fixed at
+    // `http://example.test:8080`. The load-bearing negative is the
+    // backslash-prefixed `/\host`: browsers fold `\` to `/`, so it must be
+    // treated as the cross-origin `//host`, not as a same-origin path.
+    fn same_origin(value: &str) -> Option<String> {
+        same_origin_location(
+            "http",
+            "example.test:8080",
+            &HeaderValue::from_str(value).unwrap(),
+        )
+        .and_then(|v| v.to_str().ok().map(str::to_owned))
+    }
+
+    lets_expect! {
+        expect(same_origin(value)) as the_same_origin_location {
+            let value = "/dashboard";
+
+            to keeps_an_origin_relative_path { equal(Some("/dashboard".to_string())) }
+
+            when the_value_is_the_bare_root {
+                let value = "/";
+                to stays_same_origin { equal(Some("/".to_string())) }
+            }
+
+            when the_value_is_protocol_relative {
+                let value = "//evil.test/steal";
+                to is_rejected_as_cross_origin { equal(None) }
+            }
+
+            when the_value_is_backslash_prefixed {
+                // Browsers fold `\` to `/`, so `/\evil.test` is really
+                // `//evil.test` — the guard must NOT pass it as same-origin.
+                let value = "/\\evil.test/steal";
+                to is_rejected_like_a_protocol_relative_url { equal(None) }
+            }
+
+            when the_value_is_a_same_origin_absolute_uri {
+                let value = "http://example.test:8080/form?x=1";
+                to is_reduced_to_its_path_and_query {
+                    equal(Some("/form?x=1".to_string()))
+                }
+            }
+
+            when the_value_targets_a_different_host {
+                let value = "http://evil.test/form";
+                to is_rejected { equal(None) }
+            }
+
+            when the_value_uses_a_different_scheme {
+                let value = "https://example.test:8080/form";
+                to is_rejected { equal(None) }
+            }
+        }
+    }
 }

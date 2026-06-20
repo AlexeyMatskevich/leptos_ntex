@@ -78,9 +78,10 @@ async fn streaming_input_payload_limit_boundary() {
     );
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        text.contains('8'),
-        "must report the 8 drained bytes, got: {text}"
+    assert_eq!(
+        text.trim().parse::<usize>().ok(),
+        Some(8),
+        "must report EXACTLY 8 drained bytes (a substring check passes for 18/80/108), got: {text:?}"
     );
 
     // AT the limit: exactly 16 of 16 bytes.
@@ -98,9 +99,47 @@ async fn streaming_input_payload_limit_boundary() {
     );
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        text.contains("16"),
-        "must report the 16 drained bytes, got: {text}"
+    assert_eq!(
+        text.trim().parse::<usize>().ok(),
+        Some(16),
+        "must report EXACTLY 16 drained bytes (a substring check passes for 116/160), got: {text:?}"
+    );
+}
+
+/// The OVER-limit side of the streaming-input boundary: a body past the limit,
+/// sent WITHOUT a `Content-Length` (so the up-front preflight can't see it),
+/// must trip `try_into_stream`'s per-chunk guard (`next > limit`), stash the
+/// `PayloadTooLarge` marker, and surface as a `413`. This is the streaming-INPUT
+/// overflow path — distinct from the buffered `collect_payload` path the other
+/// 413 tests exercise — and the boundary test above never actually crosses the
+/// limit, so without this a `> -> always-false` regression on `request.rs:122`
+/// would ship undetected.
+#[ntex::test]
+async fn streaming_input_over_limit_returns_413() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<DrainStreamingInput>();
+    let app = test::init_service(
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns()),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri(DrainStreamingInput::PATH)
+        .header("Content-Type", "application/octet-stream")
+        .header("Accept", "application/json")
+        .set_payload("A".repeat(100))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an over-limit streaming body must 413 via the per-chunk guard, not drain"
     );
 }
 
@@ -352,10 +391,15 @@ async fn server_fn_html_form_with_html_q_zero_accept_does_not_leak_cross_origin_
         .to_request();
 
     let resp = test::call_service(&app, req).await;
-    assert!(
-        !resp.status().is_redirection(),
-        "must not redirect, got {}",
-        resp.status()
+    // Positive anchor first: the server fn must actually have dispatched and
+    // its (stripped) form redirect must have been reset to `200 OK`. Without
+    // this, the Location-safety assertions pass VACUOUSLY for an undispatched
+    // `400` (no route) or a degraded `500`, which carry no cross-origin
+    // Location either.
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the server fn must dispatch; the stripped cross-origin redirect resets to 200"
     );
     let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
     assert!(
@@ -440,6 +484,13 @@ async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_on_error() 
     assert!(
         location.starts_with("http://example.test:8080/form"),
         "the error redirect must target the same-origin referer (carrying the error query), got {location:?}"
+    );
+    // ...and the error must actually RIDE in the redirect URL: a Location that
+    // dropped the encoded query (bare referer) would pass the prefix check
+    // alone but lose the failure payload the form page needs.
+    assert!(
+        location.contains("__path=") && location.contains("__err="),
+        "the error redirect must carry server_fn's encoded error query, got {location:?}"
     );
 }
 
@@ -593,6 +644,11 @@ async fn server_fn_html_form_same_origin_error_redirect_is_preserved() {
             .as_deref()
             .is_some_and(|l| l.starts_with("http://example.test:8080/form")),
         "the same-origin error redirect must preserve the full referer URL, got {location:?}"
+    );
+    let location = location.unwrap_or_default();
+    assert!(
+        location.contains("__path=") && location.contains("__err="),
+        "the same-origin error redirect must preserve server_fn's encoded error query, got {location:?}"
     );
 }
 

@@ -1,20 +1,17 @@
 use super::*;
-use crate::{handle_server_fns, register_explicit, register_leptos_routes};
+use crate::register_leptos_routes;
 use ntex::http::{StatusCode, header};
 use ntex::web::{App as NtexApp, test};
 
 #[ntex::test]
 async fn renders_root_route() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
+    // No server-fn setup: these render tests only request rendered routes
+    // ('/', '/about'), never an `/api` server fn, so the registration + catchall
+    // were dead scaffolding.
     let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), unit_shell);
-            }),
-    )
+    let app = test::init_service(NtexApp::new().configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), unit_shell);
+    }))
     .await;
 
     let req = test::TestRequest::with_uri("/").to_request();
@@ -28,16 +25,13 @@ async fn renders_root_route() {
 
 #[ntex::test]
 async fn renders_about_route() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
+    // No server-fn setup: these render tests only request rendered routes
+    // ('/', '/about'), never an `/api` server fn, so the registration + catchall
+    // were dead scaffolding.
     let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), unit_shell);
-            }),
-    )
+    let app = test::init_service(NtexApp::new().configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), unit_shell);
+    }))
     .await;
 
     let req = test::TestRequest::with_uri("/about").to_request();
@@ -92,6 +86,18 @@ async fn param_route_serves_single_segment() {
     assert!(
         html.contains("User Param"),
         "param route must render: {html}"
+    );
+
+    // The boundary that makes "exactly one segment" meaningful: a TWO-segment
+    // URL must NOT match the single-segment `:param` route (it falls through to
+    // the fallback). Without this, the positive case alone would also pass a
+    // `{id}*`-style multi-segment match.
+    let req = test::TestRequest::with_uri("/users/42/extra").to_request();
+    let resp = test::call_service(&app, req).await;
+    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        !html.contains("User Param"),
+        "a 2-segment URL must not match the single-segment :param route: {html}"
     );
 }
 
@@ -218,12 +224,17 @@ async fn async_mode_blocks_for_the_resource_via_service_config() {
     );
 }
 
+/// OutOfOrder is observable in the FINAL buffered body by the presence of BOTH
+/// the fallback marker AND the resolved content (InOrder/Async drop the
+/// fallback marker entirely). `read_body` buffers the whole response, so this
+/// pins the OOO body SHAPE — not the temporal streaming ORDER, which the
+/// TCP-based integration tests cover. The name reflects that.
 #[ntex::test]
-async fn out_of_order_mode_streams_the_fallback_shell() {
+async fn out_of_order_body_contains_the_fallback_marker() {
     let html = suspense_body_via_app_impl("/out").await;
     assert!(
         html.contains("FALLBACK-MARKER"),
-        "OutOfOrder must stream the shell + fallback before the resolved fragment"
+        "OutOfOrder's body must carry the streamed fallback marker"
     );
     assert!(html.contains("RESOLVED-CONTENT"));
 }
@@ -271,6 +282,12 @@ async fn head_request_via_service_config_mirrors_get() {
     }))
     .await;
 
+    // Actually compare against GET (the name claims parity): same status AND
+    // Content-Type, mirroring the App-impl variant — not just "HEAD is 200".
+    let get = test::call_service(&app, test::TestRequest::with_uri("/out").to_request()).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let get_ct = get.headers().get(header::CONTENT_TYPE).cloned();
+
     let head = test::call_service(
         &app,
         test::TestRequest::default()
@@ -280,6 +297,11 @@ async fn head_request_via_service_config_mirrors_get() {
     )
     .await;
     assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers().get(header::CONTENT_TYPE),
+        get_ct.as_ref(),
+        "HEAD Content-Type must mirror GET through the ServiceConfig path"
+    );
 }
 
 /// HEAD on an unregistered path must not return 200 — the old
@@ -308,13 +330,9 @@ async fn head_request_on_missing_route_not_200() {
 async fn app_leptos_routes_impl_renders_route() {
     use crate::LeptosRoutes;
 
+    // No `/api` catchall: this test only renders '/', never a server fn.
     let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .leptos_routes(routes, unit_shell),
-    )
-    .await;
+    let app = test::init_service(NtexApp::new().leptos_routes(routes, unit_shell)).await;
 
     let req = test::TestRequest::with_uri("/").to_request();
     let resp = test::call_service(&app, req).await;

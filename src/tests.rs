@@ -56,6 +56,15 @@ fn StaticHeaderApp() -> impl IntoView {
                                     ntex::http::header::HeaderName::from_static("x-static-cache"),
                                     ntex::http::header::HeaderValue::from_static("preserved"),
                                 );
+                                // A deliberately WRONG body-framing header: the
+                                // served `Content-Length` must come from the
+                                // on-disk file (`NamedFile`), NOT from this stale
+                                // snapshot value — that is exactly what the
+                                // cache-hit framing-strip (CB-07) guarantees.
+                                res.insert_header(
+                                    ntex::http::header::CONTENT_LENGTH,
+                                    ntex::http::header::HeaderValue::from_static("5"),
+                                );
                             }
                             view! { <h1>"Static Headers"</h1> }
                         }
@@ -103,13 +112,14 @@ fn StaticEpochApp() -> impl IntoView {
     }
 }
 
-/// Two `SsrMode::Static` routes that differ only on the `was_404` axis: `/ok`
-/// renders with the default status, while `/gone` calls
-/// `ResponseOptions::set_status(404)` during render. Drives the
-/// `static_generator_skips_writing_404_routes` test: leptos's static-file
-/// builder must NOT persist an error render to disk (the dynamic handler
-/// re-renders the real 404/500), so `gone.html` must be absent while `ok.html`
-/// is written.
+/// Three `SsrMode::Static` routes that differ only on the render-status axis:
+/// `/ok` renders with the default status, `/gone` calls
+/// `ResponseOptions::set_status(404)`, and `/server-error` sets `500`. Drives
+/// the `static_generator_skips_writing_error_routes` test: leptos's static-file
+/// builder must NOT persist an ERROR render to disk (the dynamic handler
+/// re-renders the real error), so both `gone.html` and `server-error.html` must
+/// be absent — `was_error_status` skips every 4xx/5xx — while `ok.html` is
+/// written.
 #[component]
 fn StaticStatusApp() -> impl IntoView {
     provide_meta_context();
@@ -131,6 +141,19 @@ fn StaticStatusApp() -> impl IntoView {
                                 res.set_status(ntex::http::StatusCode::NOT_FOUND);
                             }
                             view! { <h1>"Gone Body"</h1> }
+                        }
+                    />
+                    <Route
+                        path=path!("/server-error")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| {
+                            // A non-404 ERROR render: drives the broadened
+                            // `was_error_status` skip (every 4xx/5xx, not just
+                            // 404) — a 500 must NOT be cached to disk either.
+                            if let Some(res) = use_context::<crate::ResponseOptions>() {
+                                res.set_status(ntex::http::StatusCode::INTERNAL_SERVER_ERROR);
+                            }
+                            view! { <h1>"Server Error Body"</h1> }
                         }
                     />
                 </Routes>

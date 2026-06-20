@@ -411,10 +411,13 @@ mod tests {
 
     // A future `SsrMode` this integration cannot render must serve a typed 500
     // — not panic the worker via `unreachable!()`, and not silently mis-render
-    // as OutOfOrder. `SsrMode::Async` stands in for "a variant the dispatch's
-    // dedicated arms don't handle"; the route this helper builds is the
-    // catch-all a new `#[non_exhaustive]` variant falls through to. Mirrors
-    // `leptos_actix` (leptos-rs/leptos#4755).
+    // as OutOfOrder. These tests call `unsupported_ssr_mode_route` DIRECTLY
+    // (not through the dispatch `match`), so the `SsrMode` argument is just an
+    // arbitrary value passed to the 500 route builder — `SsrMode::Async`
+    // happens to be convenient and is NOT a claim that dispatch fails to handle
+    // Async (`leptos_routes` handles it explicitly). The route this helper
+    // builds is the catch-all a new `#[non_exhaustive]` variant falls through
+    // to. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
     #[ntex::test]
     async fn unsupported_ssr_mode_serves_500() {
         let app = test::init_service(App::new().route(
@@ -426,6 +429,13 @@ mod tests {
         let req = test::TestRequest::get().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Pin the exact body, not just the status: any 500 (or an empty body)
+        // would otherwise pass.
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "This rendering mode is not supported."
+        );
     }
 
     // HEAD must reach the same 500: the helper binds GET+HEAD for a `Method::Get`
@@ -460,5 +470,54 @@ mod tests {
         let req = test::TestRequest::post().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // The route must reject a MISMATCHED method (it is not an all-method
+    // catch-all): a POST to a `Method::Get` route, and a GET to a `Method::Post`
+    // route, must NOT 500 — they fall through to the router's method rejection.
+    #[ntex::test]
+    async fn unsupported_ssr_mode_rejects_a_mismatched_method() {
+        let get_route = test::init_service(App::new().route(
+            "/",
+            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
+        ))
+        .await;
+        let resp =
+            test::call_service(&get_route, test::TestRequest::post().uri("/").to_request()).await;
+        assert!(
+            resp.status().is_client_error(),
+            "POST to a GET-only route must be rejected by the router, got {}",
+            resp.status()
+        );
+
+        let post_route = test::init_service(App::new().route(
+            "/",
+            unsupported_ssr_mode_route(Method::Post, &SsrMode::Async),
+        ))
+        .await;
+        let resp =
+            test::call_service(&post_route, test::TestRequest::get().uri("/").to_request()).await;
+        assert!(
+            resp.status().is_client_error(),
+            "GET to a POST-only route must be rejected by the router, got {}",
+            resp.status()
+        );
+    }
+
+    // `leptos_corrected_path` builds the `RequestUrl` leptos routes on. The
+    // query branch (`?{query}`) is otherwise only reached through the full
+    // render pipeline by query-less URIs, so pin both branches directly.
+    #[ntex::test]
+    async fn leptos_corrected_path_includes_the_query() {
+        let req = test::TestRequest::default()
+            .uri("/p?q=1&x=2")
+            .to_http_request();
+        assert_eq!(leptos_corrected_path(&req), "http://leptos/p?q=1&x=2");
+    }
+
+    #[ntex::test]
+    async fn leptos_corrected_path_omits_an_absent_query() {
+        let req = test::TestRequest::default().uri("/p").to_http_request();
+        assert_eq!(leptos_corrected_path(&req), "http://leptos/p");
     }
 }
