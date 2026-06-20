@@ -156,6 +156,7 @@ signatures, and runnable snippets.
 |---|---|
 | `tracing` | Emit `tracing` spans around route rendering and server-fn dispatch |
 | `islands-router` | Forwards to `leptos/islands-router` |
+| `cookie` | Enable ntex's cookie support (`ntex/cookie`) for cookie-reading extractors; required to build `examples/auth_extractor.rs` |
 
 Nothing is enabled by default.
 

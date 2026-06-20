@@ -307,10 +307,14 @@ restart to take effect. Adds `percent-encoding` as a required dep.
 ```toml
 [features]
 default = []
+cookie = ["ntex/cookie"]
 tracing = ["dep:tracing"]
 islands-router = ["leptos/islands-router"]
 ```
 
+- `cookie` enables ntex's cookie support (`ntex/cookie`), giving
+  `HttpRequest::cookie(...)` for cookie-reading `FromRequest` extractors.
+  Required to build `examples/auth_extractor.rs`.
 - `tracing` enables `#[tracing::instrument(...)]` on the public route
   functions and `tracing::warn!/error!` inside the redirect path and
   the `OptionalParam` branch. Without the feature those warnings still
