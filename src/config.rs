@@ -139,15 +139,40 @@ pub(crate) fn server_fn_config(req: &HttpRequest) -> LeptosServerFnConfig {
 #[derive(Copy, Clone)]
 pub(crate) struct PayloadTooLarge;
 
-/// Returns true when the request declares `Content-Length` and it exceeds
-/// `limit`. The preflight avoids reading the body at all when the client
-/// tells us up-front that it is oversize.
+/// Returns true when the request declares a `Content-Length` that the
+/// preflight should reject up-front: either a parseable value exceeding
+/// `limit`, or a **present but malformed** declaration (non-numeric, or a
+/// number larger than `usize` can hold). The preflight avoids reading the
+/// body at all when the client tells us up-front that it is oversize.
+///
+/// A malformed declaration is treated as oversize on purpose: a value like
+/// `99999999999999999999999999` (beyond `usize::MAX`) or `abc` is a
+/// pathological/oversize claim, and accepting it as "no declaration" would
+/// only defer the rejection to the body-collection path. A genuinely absent
+/// header returns `false` — the streaming `collect_payload` check still
+/// bounds an unknown-length body.
 pub(crate) fn content_length_exceeds(req: &HttpRequest, limit: usize) -> bool {
-    req.headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .is_some_and(|declared| declared > limit)
+    let Some(raw) = req.headers().get(header::CONTENT_LENGTH) else {
+        return false;
+    };
+    match raw.to_str().ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(declared) => declared > limit,
+        None => true,
+    }
+}
+
+/// Parses an RFC 9110 §12.4.2 quality value: a finite number in `0.0..=1.0`.
+/// Returns `None` for anything malformed — non-numeric, out of range, or
+/// non-finite (`NaN`/`inf`) — so every caller can apply one uniform
+/// "malformed → field default" policy. Shared by the `Accept` (HTML) and
+/// `Accept-Encoding` parsers so the two cannot drift on how they treat a bad
+/// `q` (the range check also rejects `NaN`/`inf`, since neither compares
+/// inside `0.0..=1.0`).
+pub(crate) fn parse_qvalue(s: &str) -> Option<f32> {
+    s.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|q| (0.0..=1.0).contains(q))
 }
 
 /// Upper bound on the buffer capacity reserved up-front from a declared

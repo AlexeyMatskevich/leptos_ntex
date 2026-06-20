@@ -168,8 +168,10 @@ lets_expect! {
 // `Content-Length`, WITHOUT reading it. The boundary is the crux: a body
 // of *exactly* `limit` bytes does NOT "exceed" the limit (the predicate
 // is strict `>`), so the preflight must let it through — only `limit + 1`
-// and above are rejected. A missing or unparseable header is not a size
-// declaration, so the preflight stays out of the way and returns false.
+// and above are rejected. A MISSING header is not a size declaration, so the
+// preflight stays out of the way (false); a PRESENT but malformed declaration
+// (non-numeric, or a number beyond `usize`) is a pathological/oversize claim
+// and is rejected up-front (true).
 fn content_length_preflight(content_length: Option<&str>, limit: usize) -> bool {
     let mut req = test::TestRequest::default();
     if let Some(value) = content_length {
@@ -207,7 +209,15 @@ lets_expect! {
 
         when the_content_length_is_not_a_number {
             let content_length = Some("not-a-number");
-            to stays_out_of_the_way { be_false }
+            to rejects_the_malformed_declaration { be_true }
+        }
+
+        when the_declared_length_overflows_usize {
+            // A value beyond `usize::MAX` cannot parse, so it must be rejected
+            // as a malformed oversize claim rather than slipping past as "no
+            // declaration".
+            let content_length = Some("99999999999999999999999999");
+            to rejects_the_overflowing_declaration { be_true }
         }
     }
 }
@@ -308,8 +318,11 @@ lets_expect! {
 }
 
 // ----- ResponseOptions::overwrite: wholesale replacement ------------
-// `overwrite` swaps the entire inner `ResponseParts`, so a previously set
-// status is replaced by the incoming one (including back to `None`).
+// `overwrite` swaps the entire inner `ResponseParts`, so BOTH halves of the
+// contract are pinned: a previously set status is replaced by the incoming one
+// (including back to `None`), AND a previously set header is dropped, leaving
+// only the replacement's headers — a `*writable = parts` regression that kept
+// or merged stale headers would otherwise pass the status-only leaves.
 fn status_after_overwrite(replacement: Option<StatusCode>) -> Option<StatusCode> {
     let options = crate::ResponseOptions::default();
     options.set_status(StatusCode::OK);
@@ -318,6 +331,26 @@ fn status_after_overwrite(replacement: Option<StatusCode>) -> Option<StatusCode>
         ..Default::default()
     });
     options.0.read().unwrap().status
+}
+
+// (old header present?, new header present?) after a wholesale overwrite.
+fn headers_after_overwrite() -> (bool, bool) {
+    let options = crate::ResponseOptions::default();
+    options.insert_header(
+        header::HeaderName::from_static("x-old"),
+        header::HeaderValue::from_static("1"),
+    );
+    let mut replacement = crate::ResponseParts::default();
+    replacement.insert_header(
+        header::HeaderName::from_static("x-new"),
+        header::HeaderValue::from_static("2"),
+    );
+    options.overwrite(replacement);
+    let parts = options.0.read().unwrap();
+    (
+        parts.headers.contains_key("x-old"),
+        parts.headers.contains_key("x-new"),
+    )
 }
 
 lets_expect! {
@@ -329,6 +362,14 @@ lets_expect! {
         when the_replacement_carries_no_status {
             let replacement: Option<StatusCode> = None;
             to clears_the_previously_set_status { equal(None) }
+        }
+    }
+}
+
+lets_expect! {
+    expect(headers_after_overwrite()) as overwriting_response_parts_headers {
+        to drops_old_headers_and_keeps_only_the_replacement {
+            equal((false, true))
         }
     }
 }
@@ -368,24 +409,47 @@ lets_expect! {
 // The getters must report the values the listing was built with, not the
 // type defaults (a collapse to `SsrMode::default()` / `[Method::Get]`
 // would silently re-mode and re-method every route).
+// Two distinct methods, so `methods()` must report BOTH in order — a single
+// method could not catch a `.take(1)` / drop-after-first / reorder regression.
 fn sample_listing() -> crate::NtexRouteListing {
     crate::NtexRouteListing::new(
         "/sample".to_string(),
         leptos_router::SsrMode::Async,
+        [leptos_router::Method::Get, leptos_router::Method::Post],
+        Vec::new(),
+    )
+}
+
+fn listing_with_mode(mode: leptos_router::SsrMode) -> crate::NtexRouteListing {
+    crate::NtexRouteListing::new(
+        "/sample".to_string(),
+        mode,
         [leptos_router::Method::Post],
         Vec::new(),
     )
 }
 
 lets_expect! {
-    expect(sample_listing().mode()) as the_listing_mode {
+    expect(listing_with_mode(mode).mode()) as the_listing_mode {
+        let mode = leptos_router::SsrMode::Async;
+
         to reports_the_configured_mode { equal(leptos_router::SsrMode::Async) }
+
+        // A SECOND, different mode pins that the getter ECHOES the stored
+        // value, not a fixed non-default one (a `mode()` hardcoded to `Async`
+        // would pass the first leaf alone).
+        when the_listing_was_built_in_order {
+            let mode = leptos_router::SsrMode::InOrder;
+            to echoes_that_mode { equal(leptos_router::SsrMode::InOrder) }
+        }
     }
 }
 
 lets_expect! {
     expect(sample_listing().methods().collect::<Vec<_>>()) as the_listing_methods {
-        to reports_the_configured_methods { equal(vec![leptos_router::Method::Post]) }
+        to reports_every_configured_method_in_order {
+            equal(vec![leptos_router::Method::Get, leptos_router::Method::Post])
+        }
     }
 }
 

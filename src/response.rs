@@ -388,9 +388,15 @@ pub(crate) fn accept_header_includes_html(accept: &str) -> bool {
         if media.type_() != mime::TEXT || media.subtype() != mime::HTML {
             return false;
         }
-        // honour an explicit `q=0`, which means the client refuses HTML
+        // Honour an explicit `q=0`, which means the client refuses HTML. A
+        // MALFORMED `q` (non-numeric, negative, > 1, `NaN`/`inf`) is not a
+        // valid refusal, so it defaults to accepting — the same
+        // "malformed → field default" policy the `Accept-Encoding` parser
+        // applies, via the shared `parse_qvalue`.
         match media.get_param("q") {
-            Some(q) => q.as_str().parse::<f32>().map(|w| w > 0.0).unwrap_or(true),
+            Some(q) => crate::config::parse_qvalue(q.as_str())
+                .map(|w| w > 0.0)
+                .unwrap_or(true),
             None => true,
         }
     })
@@ -463,6 +469,53 @@ pub fn redirect(path: &str) {
 mod tests {
     use super::*;
     use lets_expect::lets_expect;
+
+    // ----- should_replace_header: the full singleton set ----------------
+    // `extend_response_parts` REPLACES these headers and APPENDS every other.
+    // The set is a hand-maintained 12-entry `matches!`, so pin EVERY arm
+    // directly. (Going through a real response can't cover CONTENT_LENGTH /
+    // CONTENT_TYPE / TRANSFER_ENCODING, which ntex auto-manages on `finish()`,
+    // so the predicate is tested in isolation.) The sweep returns the list of
+    // MISCLASSIFIED headers, so deleting any arm — or wrongly adding one —
+    // names the offender instead of just flipping a bool. Two negatives pin
+    // the append side.
+    fn header_classification_failures() -> Vec<String> {
+        let must_replace = [
+            header::CONTENT_LENGTH,
+            header::CONTENT_TYPE,
+            header::CONTENT_ENCODING,
+            header::TRANSFER_ENCODING,
+            header::LOCATION,
+            header::ETAG,
+            header::LAST_MODIFIED,
+            header::CACHE_CONTROL,
+            header::EXPIRES,
+            header::CONTENT_DISPOSITION,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ];
+        let must_append = [header::SET_COOKIE, HeaderName::from_static("x-custom")];
+        let mut failures = Vec::new();
+        for key in must_replace {
+            if !should_replace_header(&key) {
+                failures.push(format!("{key:?} must REPLACE"));
+            }
+        }
+        for key in must_append {
+            if should_replace_header(&key) {
+                failures.push(format!("{key:?} must APPEND"));
+            }
+        }
+        failures
+    }
+
+    lets_expect! {
+        expect(header_classification_failures()) as the_should_replace_header_set {
+            to classifies_all_twelve_singletons_and_no_others {
+                equal(Vec::<String>::new())
+            }
+        }
+    }
 
     // ----- accept_header_includes_html: exhaustive spec -----------------
     // Domain-walk of a type-poor `&str -> bool`: the media range parses or
@@ -555,9 +608,29 @@ mod tests {
                 to ignores_the_empty_range_and_accepts_html { be_true }
             }
 
+            // A negative `q` is outside the RFC 0..=1 range, i.e. MALFORMED —
+            // it is not a valid `q=0` refusal, so it defaults to accepting
+            // (the shared `parse_qvalue` policy), exactly like the unparseable
+            // case above. The out-of-range-high, finite-max, and non-finite
+            // siblings pin the rest of that boundary.
             when the_quality_is_negative {
                 let accept = "text/html;q=-0.5";
-                to does_not_accept_html { be_false }
+                to treats_an_out_of_range_quality_as_accepting { be_true }
+            }
+
+            when the_quality_is_above_the_maximum {
+                let accept = "text/html;q=2";
+                to treats_an_out_of_range_quality_as_accepting { be_true }
+            }
+
+            when the_quality_is_exactly_the_maximum {
+                let accept = "text/html;q=1";
+                to accepts_html { be_true }
+            }
+
+            when the_quality_is_not_a_finite_number {
+                let accept = "text/html;q=nan";
+                to treats_a_non_finite_quality_as_accepting { be_true }
             }
 
             when the_accept_header_is_empty {
@@ -606,6 +679,15 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let owner = Owner::new();
         owner.with(|| provide_context(DropProbe(cleaned.clone())));
+
+        // NOTE: this leaf pins the THREAD-AFFINITY contract (origin-thread drop
+        // runs the reactive teardown; off-thread drop leaks instead of
+        // panicking), which is the actual `OwnerCleanupStream` bug class. It
+        // does NOT separately isolate "forced cleanup" from an ordinary
+        // last-handle disposal — `unset_with_forced_cleanup()` does not dispose
+        // a graph that another live `Owner` handle is keeping alive, so the
+        // "hold a second clone" trick cannot distinguish them (verified: it
+        // suppresses disposal on BOTH paths).
 
         // Build the body but drop it WITHOUT draining the stream.
         let stream =
