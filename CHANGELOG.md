@@ -7,8 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The same-origin redirect guard now rejects a backslash-prefixed `Location` /
+  `Referer` such as `/\evil.example`. Browsers fold `\` to `/` in HTTP(S) URLs,
+  so a `Location: /\host` resolves as the protocol-relative cross-origin
+  `//host`; it previously passed the origin-relative fast path (which rejected
+  only `//host`) and could be echoed as a cross-origin redirect target. Both
+  forms are now rejected.
+
 ### Fixed
 
+- `SsrMode::Static` generation no longer caches a render that resolved to **any**
+  error status to disk — previously only a `404` was skipped, so a route that set
+  `500` (or any other non-404 error) during render was written to disk and then
+  served from that stale snapshot indefinitely, even after the cause cleared. The
+  skip predicate (`was_404` → `was_error_status`) now covers every `4xx`/`5xx`,
+  matching `leptos_router`'s documented "404, 500, etc." contract. This is a
+  deliberate divergence from the upstream `leptos_axum` / `leptos_actix`
+  adapters, whose callbacks check only `== NOT_FOUND`.
+- A `SsrMode::Static` cache hit no longer lets a captured `ResponseOptions`
+  snapshot overwrite the body-framing headers (`Content-Length`, `Content-Type`,
+  `Content-Encoding`, `Transfer-Encoding`, `Content-Range`, `Accept-Ranges`,
+  `ETag`, `Last-Modified`) that `NamedFile` derives from the on-disk file. A
+  stale or component-set `Content-Length` could otherwise replace the
+  authoritative one and desync the framing from the served body; the app's status
+  and non-framing headers (cookies, `Cache-Control`, custom `x-*`) still apply.
+- `Accept: text/html` with a malformed quality value — negative, `> 1`, or
+  non-finite (`NaN`/`inf`) — is now treated as **accepting** HTML rather than
+  refusing it, consistent with the `Accept-Encoding` parser's "malformed `q` →
+  field default" policy; only a valid `q=0` is honoured as a refusal. Both
+  parsers now share one RFC 9110 §12.4.2 qvalue helper, so they can no longer
+  disagree on how a bad `q` is treated.
+- The `Content-Length` payload preflight now rejects a **present but malformed**
+  declaration — non-numeric, or a number larger than `usize` can hold — up-front
+  with `413`, instead of treating it as "no declaration" and deferring the
+  rejection to body collection. An absent header is still passed through (the
+  streaming limit check bounds an unknown-length body).
+- The `inventory`-based automatic registration of server functions now
+  de-duplicates on `(path, method)` exactly like `register_explicit`, so two
+  `inventory` entries colliding on the same path and method no longer accumulate
+  duplicate `server_fn_paths()` rows or duplicate route registrations (a later
+  `register_explicit` previously replaced only the first slot, orphaning the
+  rest).
+- `to_ntex_path` route conversion no longer mishandles two degenerate segment
+  shapes: a leaked `OptionalParam` (one that bypassed optional-expansion) now
+  degrades to a matchable `{name}` param instead of being silently dropped (which
+  produced a wrong-but-live route such as `/users/` for `/users/{id}`), and the
+  segment separator no longer depends on the name being non-empty (an empty
+  `Param` / `Splat` name no longer glues a separator-less `{}` / `{}*` onto the
+  previous segment). The same structural gap exists in the upstream `leptos_axum`
+  / `leptos_actix` path converters.
 - HTML-form server-function **error** responses now keep their error status when
   an unsafe redirect is stripped. The same-origin guard added in 0.6.0
   downgraded a stripped redirect to `200 OK`, but `server_fn` rewrites an
