@@ -280,6 +280,32 @@ where
 ///
 /// Convenience function that calls [`LeptosRoutes::leptos_routes`] on a
 /// configuration object, for use from inside an [`App::configure`] closure.
+/// It hides the verbose `App<M, T, Err>` bounds, so this is the registration
+/// path most applications should copy.
+///
+/// ```no_run
+/// use leptos::prelude::*;
+/// use leptos_ntex_unofficial::{generate_route_list, register_leptos_routes};
+/// use ntex::web::{self, App as NtexApp};
+///
+/// # fn app() -> impl IntoView { "" }
+/// # fn shell() -> impl IntoView { "" }
+/// #[ntex::main]
+/// async fn main() -> std::io::Result<()> {
+///     let routes = generate_route_list(app);
+///     web::server(move || {
+///         let routes = routes.clone();
+///         async move {
+///             NtexApp::new().configure(move |cfg| {
+///                 register_leptos_routes(cfg, routes.clone(), shell);
+///             })
+///         }
+///     })
+///     .bind(("127.0.0.1", 3000))?
+///     .run()
+///     .await
+/// }
+/// ```
 pub fn register_leptos_routes<IV, Err>(
     cfg: &mut ServiceConfig<Err>,
     paths: Vec<NtexRouteListing>,
