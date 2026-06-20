@@ -683,11 +683,25 @@ mod tests {
         <NtexRequest as Req<E, E, E>>::accepts(&req).map(|value| value.into_owned())
     }
 
+    fn referer(headers: &[(&str, &str)]) -> Option<String> {
+        let req = request_with("/", headers);
+        <NtexRequest as Req<E, E, E>>::referer(&req).map(|value| value.into_owned())
+    }
+
     lets_expect! {
         expect(header_value(headers)) as the_request_header {
             let headers: &[(&str, &str)] = &[("x-probe", "probe-value")];
 
             to returns_the_exact_header_value { equal(Some("probe-value".to_string())) }
+
+            // A SECOND present value with different content: pins that the
+            // shared `header()` primitive returns the ACTUAL value, not a
+            // fixture constant (a `header()` hardcoded to return "probe-value"
+            // for any present key would still pass the first leaf alone).
+            when a_different_value_is_present {
+                let headers: &[(&str, &str)] = &[("x-probe", "other-value")];
+                to returns_that_value { equal(Some("other-value".to_string())) }
+            }
 
             when the_header_is_absent {
                 let headers: &[(&str, &str)] = &[];
@@ -702,6 +716,18 @@ mod tests {
 
             to returns_the_raw_query_string { equal(Some("foo=bar&baz=1".to_string())) }
 
+            when a_different_query_is_present {
+                let uri = "/path?x=9";
+                to returns_that_query { equal(Some("x=9".to_string())) }
+            }
+
+            when the_uri_ends_with_a_bare_question_mark {
+                // A trailing `?` is an EMPTY query — `Some("")`, distinct from
+                // no `?` at all (`None`). This boundary the `&str` type hides.
+                let uri = "/path?";
+                to returns_an_empty_query { equal(Some("".to_string())) }
+            }
+
             when there_is_no_query {
                 let uri = "/path";
                 to returns_none { be_none }
@@ -714,6 +740,11 @@ mod tests {
             let headers: &[(&str, &str)] = &[("Content-Type", "application/json")];
 
             to reads_the_content_type_header { equal(Some("application/json".to_string())) }
+
+            when a_different_content_type_is_present {
+                let headers: &[(&str, &str)] = &[("Content-Type", "application/cbor")];
+                to returns_that_content_type { equal(Some("application/cbor".to_string())) }
+            }
 
             when the_content_type_is_absent {
                 let headers: &[(&str, &str)] = &[];
@@ -728,7 +759,27 @@ mod tests {
 
             to reads_the_accept_header { equal(Some("text/html".to_string())) }
 
+            when a_different_accept_is_present {
+                let headers: &[(&str, &str)] = &[("Accept", "application/json")];
+                to returns_that_accept { equal(Some("application/json".to_string())) }
+            }
+
             when the_accept_header_is_absent {
+                let headers: &[(&str, &str)] = &[];
+                to returns_none { be_none }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(referer(headers)) as the_request_referer {
+            let headers: &[(&str, &str)] = &[("Referer", "http://example.test/form")];
+
+            to reads_the_referer_header {
+                equal(Some("http://example.test/form".to_string()))
+            }
+
+            when the_referer_is_absent {
                 let headers: &[(&str, &str)] = &[];
                 to returns_none { be_none }
             }
@@ -737,7 +788,9 @@ mod tests {
 
     // ----- WebSocket policy-close codes ---------------------------------
     // The bridge builds policy `Close` frames whose CODE is the contract
-    // (RFC 6455 §7.4.1). These lock the two added codes: invalid-UTF-8 text
+    // (RFC 6455 §7.4.1). These lock all THREE codes: an oversize message
+    // closes with 1009 (Size) — the most-fired policy close, reached from
+    // every Binary/Text/Continuation overflow branch — invalid-UTF-8 text
     // closes with 1007, and an outbound send failure closes with 1011 — NOT
     // the reserved 1006, which an endpoint must never serialize onto the
     // wire. (`close_send_failure`'s path is otherwise unreachable in a wire
@@ -746,6 +799,14 @@ mod tests {
         match msg {
             web::ws::Message::Close(Some(reason)) => Some(reason.code),
             _ => None,
+        }
+    }
+
+    lets_expect! {
+        expect(close_code(&close_too_big(8))) as the_too_big_close {
+            to carries_close_code_1009_size {
+                equal(Some(ntex::ws::CloseCode::Size))
+            }
         }
     }
 
@@ -763,5 +824,59 @@ mod tests {
                 equal(Some(ntex::ws::CloseCode::Error))
             }
         }
+    }
+
+    // ----- try_into_stream cumulative overflow ACROSS chunks ------------
+    // The per-chunk guard carries the running total between chunks
+    // (`next = so_far + b.len()`). A single HTTP test payload is delivered as
+    // ONE chunk (`TestRequest::set_payload`), so the HTTP-level streaming tests
+    // only ever trip on the FIRST chunk and cannot pin the cross-chunk
+    // accumulation — a regression resetting the carried total to 0 would
+    // survive. Drive it directly with a hand-built multi-chunk `Payload`
+    // (the analog of the websocket Continue/Last accumulation tests): two
+    // 10-byte chunks, each under the limit of 16, whose cumulative 20 exceeds
+    // it on the SECOND chunk.
+    #[ntex::test]
+    async fn try_into_stream_overflows_on_the_cumulative_total_across_chunks() {
+        use futures::StreamExt;
+        use ntex::http::Payload;
+        use ntex::util::Bytes as NBytes;
+
+        let http_req = test::TestRequest::default()
+            .state(crate::LeptosServerFnConfig {
+                payload_limit: 16,
+                ..Default::default()
+            })
+            .to_http_request();
+
+        let chunks = futures::stream::iter(vec![
+            Ok::<_, ntex::http::error::PayloadError>(NBytes::from(vec![b'A'; 10])),
+            Ok(NBytes::from(vec![b'B'; 10])),
+        ]);
+        let req = NtexRequest::from((http_req.clone(), Payload::from_stream(chunks)));
+
+        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
+            .expect("try_into_stream must build the stream");
+        let items: Vec<_> = stream.collect().await;
+
+        // First chunk (10) is under the limit and streams through Ok; the second
+        // pushes the running total to 20 > 16 and yields the error frame.
+        assert!(
+            items.first().is_some_and(|r| r.is_ok()),
+            "the first under-limit chunk must stream through Ok, got {items:?}"
+        );
+        assert!(
+            items.iter().any(|r| r.is_err()),
+            "the cumulative total crossing the limit on the SECOND chunk must yield an error frame"
+        );
+        // ...and the request-scoped marker is set so the dispatcher promotes it
+        // to 413 (extensions are shared across `HttpRequest` clones).
+        assert!(
+            http_req
+                .extensions()
+                .get::<crate::config::PayloadTooLarge>()
+                .is_some(),
+            "the PayloadTooLarge marker must be set on cumulative overflow"
+        );
     }
 }

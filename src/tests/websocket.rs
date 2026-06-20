@@ -87,8 +87,6 @@ async fn websocket_client_close_releases_the_server_fn_output_stream() {
 
 #[ntex::test]
 async fn websocket_server_fn_echoes_messages() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
     register_explicit::<EchoWebsocket>();
 
     let srv =
@@ -886,7 +884,153 @@ async fn websocket_close_is_echoed() {
     match frame {
         ws::Frame::Close(Some(reason)) => {
             assert_eq!(reason.code, CloseCode::Normal);
+            // The bridge echoes the WHOLE close reason, not just the code, so
+            // pin the description it was sent with too — otherwise a
+            // regression dropping/altering the echoed description survives.
+            assert_eq!(reason.description.as_deref(), Some("bye"));
         }
         other => panic!("expected Close echo, got {other:?}"),
     }
+}
+
+/// Cumulative overflow across `Continue`: a fragmented message whose OPENING
+/// fragment is UNDER the limit but whose running total crosses it on a later
+/// `Continue` frame must close with `CloseCode::Size`. The existing
+/// `oversize_fragmented` test sends an opening fragment already past the limit,
+/// so it only exercises the `FirstBinary` guard — this one pins the distinct
+/// `Item::Continue` accumulation guard (`buf.len() + b.len() > limit`).
+#[ntex::test]
+async fn websocket_continuation_cumulative_overflow_closes_with_size() {
+    use crate::LeptosServerFnConfig;
+    use ntex::ws::{CloseCode, Item};
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 16,
+                ws_channel_buffer: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    // First(8) is under the limit and installs the buffer; Continue(12) pushes
+    // the running total to 20 > 16, tripping the `Continue` accumulation guard.
+    sink.send(ws::Message::Continuation(Item::FirstBinary(
+        [b'A'; 8].to_vec().into(),
+    )))
+    .await
+    .unwrap();
+    sink.send(ws::Message::Continuation(Item::Continue(
+        [b'B'; 12].to_vec().into(),
+    )))
+    .await
+    .unwrap();
+
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Close(Some(reason)) => assert_eq!(reason.code, CloseCode::Size),
+        other => panic!("expected Close(Size) on cumulative Continue overflow, got {other:?}"),
+    }
+}
+
+/// Cumulative overflow on the TERMINAL `Last` frame: First(8) + Continue(4)
+/// stays under the limit, then `Last(8)` carries the running total to 20 > 16.
+/// Pins the `Item::Last` accumulation guard separately from the `Continue` one.
+#[ntex::test]
+async fn websocket_last_fragment_cumulative_overflow_closes_with_size() {
+    use crate::LeptosServerFnConfig;
+    use ntex::ws::{CloseCode, Item};
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 16,
+                ws_channel_buffer: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    sink.send(ws::Message::Continuation(Item::FirstBinary(
+        [b'A'; 8].to_vec().into(),
+    )))
+    .await
+    .unwrap();
+    sink.send(ws::Message::Continuation(Item::Continue(
+        [b'B'; 4].to_vec().into(),
+    )))
+    .await
+    .unwrap();
+    sink.send(ws::Message::Continuation(Item::Last(
+        [b'C'; 8].to_vec().into(),
+    )))
+    .await
+    .unwrap();
+
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Close(Some(reason)) => assert_eq!(reason.code, CloseCode::Size),
+        other => panic!("expected Close(Size) on cumulative Last overflow, got {other:?}"),
+    }
+}
+
+/// Negative sibling of the offered / not-offered subprotocol tests: when the
+/// client offers a DIFFERENT subprotocol than the one configured, the server
+/// must NOT select it (the production filter only echoes the configured value
+/// when the client actually offers it). Without this case, a weaker predicate
+/// that echoes the configured subprotocol whenever ANY is offered would pass
+/// both existing tests.
+#[ntex::test]
+async fn websocket_configured_subprotocol_is_not_echoed_for_a_different_offer() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 1024,
+                ws_channel_buffer: 16,
+                ws_subprotocol: Some("graphql-ws"),
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    // Offer a subprotocol the server does NOT configure.
+    let mut builder = ntex::ws::WsClient::builder(srv.url(EchoWebsocket::PATH));
+    builder
+        .address(srv.addr())
+        .timeout(ntex::time::Seconds(60))
+        .protocols(["other-ws"]);
+    let client = builder
+        .build(ntex::SharedCfg::new("ws-subprotocol-mismatch"))
+        .await
+        .unwrap();
+    let conn = client.connect().await.unwrap();
+
+    assert!(
+        conn.response()
+            .headers()
+            .get(ntex::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .is_none(),
+        "server must not select a subprotocol the client did not offer"
+    );
+
+    conn.sink().send(ws::Message::Close(None)).await.unwrap();
 }
