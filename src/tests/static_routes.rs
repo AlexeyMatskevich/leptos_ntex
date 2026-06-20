@@ -29,19 +29,21 @@ async fn static_route_generator_writes_html() {
 }
 
 /// `StaticRouteGenerator::generate` must skip writing any route whose render
-/// resolves to an error status: leptos's static-file builder calls `was_404`
-/// after each render and, when it returns `true`, sends the HTML back instead
-/// of invoking the writer — the dynamic handler will re-render the real
-/// 404/500 on demand, so caching it as a bare `200 OK` would be wrong. A normal
-/// route (status left at the default) IS written.
+/// resolves to an ERROR status — EVERY 4xx/5xx, not only 404: leptos's
+/// static-file builder calls `was_error_status` after each render and, when it
+/// returns `true`, sends the HTML back instead of invoking the writer, so the
+/// dynamic handler can re-render the real error on demand. Caching an error
+/// render as a bare `200 OK` on disk would otherwise serve it indefinitely.
+/// A normal route (status left at the default) IS written.
 ///
-/// Pins `was_404` end-to-end through the public `generate()` path, asserting
-/// the predicate both ways: `/ok` → file present, `/gone` → file absent.
-/// Replacing `was_404`'s body with `true` would drop `ok.html`; with `false`
-/// would write `gone.html`; flipping its `== NOT_FOUND` discriminant to `!=`
-/// would swap both — every variant breaks one of the two assertions.
+/// Pins `was_error_status` end-to-end through the public `generate()` path:
+/// `/ok` → file present; `/gone` (404) → absent; `/server-error` (500) →
+/// absent. The 500 case is what makes this broader than `leptos_axum` /
+/// `leptos_actix` (whose `was_404` checks only `== NOT_FOUND`): narrowing
+/// `was_error_status` back to `== NOT_FOUND` would write `server-error.html`,
+/// and replacing its body with `true`/`false` breaks the `ok`/error halves.
 #[ntex::test]
-async fn static_generator_skips_writing_404_routes() {
+async fn static_generator_skips_writing_error_routes() {
     let site_root = temp_site_root("static_404");
     let (_routes, generator) = gen_route_list_with_ssg(StaticStatusApp);
     let options = LeptosOptions::builder()
@@ -54,6 +56,7 @@ async fn static_generator_skips_writing_404_routes() {
 
     let ok_path = site_root.join("ok.html");
     let gone_path = site_root.join("gone.html");
+    let server_error_path = site_root.join("server-error.html");
 
     assert!(
         ok_path.exists(),
@@ -61,7 +64,11 @@ async fn static_generator_skips_writing_404_routes() {
     );
     assert!(
         !gone_path.exists(),
-        "a 404 static route must be skipped by `was_404`, not cached to disk as a bare 200"
+        "a 404 static route must be skipped by `was_error_status`, not cached to disk as a bare 200"
+    );
+    assert!(
+        !server_error_path.exists(),
+        "a 500 static route must ALSO be skipped (was_error_status covers every error, not just 404)"
     );
 
     let ok_html = std::fs::read_to_string(&ok_path).unwrap();
@@ -264,6 +271,17 @@ async fn static_route_cached_headers_are_replayed_more_than_once() {
 
     generator.generate(&options).await;
 
+    // Overwrite the pre-rendered file with a sentinel the renderer would never
+    // produce. A genuine cache HIT serves the on-disk file (so the body carries
+    // the sentinel) AND replays the captured headers; a regression that
+    // re-rendered instead would emit "Static Headers" and lose the sentinel.
+    // This is what isolates the cache-hit replay path from a re-render.
+    std::fs::write(
+        site_root.join("headers.html"),
+        "<html><body>SENTINEL_CACHE_HIT</body></html>",
+    )
+    .unwrap();
+
     let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
         register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
     }))
@@ -279,9 +297,29 @@ async fn static_route_cached_headers_are_replayed_more_than_once() {
                 .and_then(|v| v.to_str().ok()),
             Some("preserved")
         );
+        // Captured BEFORE the body is consumed. CB-07: the stale `Content-Length`
+        // the component put on `ResponseOptions` (a deliberately wrong "5") must
+        // NOT survive onto a cache-hit response — the framing-strip drops it so
+        // the on-disk file (`NamedFile`) stays authoritative. (`NamedFile`'s own
+        // length header is applied by the h1 encoder, which `test::call_service`
+        // bypasses, so the observable here is the ABSENCE of the bogus value,
+        // not the presence of the real one.)
+        let content_length = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let body = test::read_body(resp).await;
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Static Headers"));
+        assert!(
+            html.contains("SENTINEL_CACHE_HIT"),
+            "a cache hit must serve the on-disk file (sentinel), not re-render: {html}"
+        );
+        assert_ne!(
+            content_length.as_deref(),
+            Some("5"),
+            "the stale snapshot Content-Length (5) must be stripped on a cache hit, not served over the file's real size"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&site_root);
