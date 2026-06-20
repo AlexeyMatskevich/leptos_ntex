@@ -299,17 +299,19 @@ pub(crate) fn ensure_executor_initialized() {
 /// runtimes (e.g. tokio + ntex, or two Leptos integrations) and you want
 /// to fail fast at startup rather than discover the conflict under load.
 ///
-/// Returns `Err(ExecutorError::AlreadySet)` if *another* executor won the
-/// global one-shot install race. When that happens, Leptos async tasks
-/// run on the foreign executor instead of `ntex::rt`; cross-thread drops
-/// of [`Request`](crate::Request) may leak or panic — see the `Request`
-/// documentation.
-///
 /// Safe to call repeatedly: once this crate has installed its own
 /// executor, later calls return `Ok(())` without touching
 /// `any_spawner` again. If a foreign executor was already installed, the
 /// `AlreadySet` result is cached so later lazy initialization does not
 /// emit misleading diagnostics.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError`](any_spawner::ExecutorError)'s `AlreadySet` variant
+/// if *another* executor won the global one-shot install race. When that
+/// happens, Leptos async tasks run on the foreign executor instead of
+/// `ntex::rt`; cross-thread drops of [`Request`](crate::Request) may leak or
+/// panic — see the [`Request`](crate::Request) documentation.
 pub fn try_init_executor() -> Result<(), any_spawner::ExecutorError> {
     init_ntex_executor()
 }
