@@ -72,13 +72,24 @@ impl NtexPath for Vec<PathSegment> {
     fn to_ntex_path(&self) -> String {
         let mut path = String::new();
         for segment in self {
-            let raw = segment.as_raw_str();
-            if !raw.is_empty() && !raw.starts_with('/') {
-                path.push('/');
-            }
             match segment {
-                PathSegment::Static(s) => path.push_str(s),
+                PathSegment::Static(s) => {
+                    // A multi-segment path arrives as separate `Static`
+                    // segments WITHOUT leading slashes (`/outer/inner` splits),
+                    // while a lone `/about` is stored whole — so insert a
+                    // separator only when the text does not already carry one.
+                    if !s.is_empty() && !s.starts_with('/') {
+                        path.push('/');
+                    }
+                    path.push_str(s);
+                }
                 PathSegment::Param(s) => {
+                    // A param is always its own segment, so its separator does
+                    // NOT depend on the (always-non-empty in practice) name —
+                    // gating the `/` on `!name.is_empty()` while still emitting
+                    // the braces would glue a degenerate `Param("")` onto the
+                    // previous segment as `…{}` with no separator.
+                    path.push('/');
                     path.push('{');
                     path.push_str(s);
                     path.push('}');
@@ -90,19 +101,33 @@ impl NtexPath for Vec<PathSegment> {
                     // silently stops matching at the next `/` (nested URLs
                     // would fall through to the catch-all/fallback). Leptos
                     // splats are always terminal, which is exactly what the
-                    // ntex tail match requires.
+                    // ntex tail match requires. The leading `/` is emitted
+                    // unconditionally for the same reason as `Param`.
+                    path.push('/');
                     path.push('{');
                     path.push_str(s);
                     path.push_str("}*");
                 }
                 PathSegment::Unit => {}
-                PathSegment::OptionalParam(_) => {
+                PathSegment::OptionalParam(s) => {
+                    // `expand_optionals()` runs before this, so an
+                    // `OptionalParam` reaching here is a contract violation
+                    // (a future caller, a bypassed expansion, an upstream
+                    // regression). Log it, but degrade to a matchable
+                    // `Param`-shaped segment rather than silently dropping the
+                    // segment — dropping it produced a *wrong but live* route
+                    // (e.g. `/users/{id}` collapsing to `/users/`).
                     let msg = "to_ntex_path should only be called on expanded paths, \
-                         which do not have OptionalParam any longer";
+                         which do not have OptionalParam any longer; \
+                         falling back to a required param segment";
                     #[cfg(feature = "tracing")]
                     tracing::error!("{msg}");
                     #[cfg(not(feature = "tracing"))]
                     eprintln!("{msg}");
+                    path.push('/');
+                    path.push('{');
+                    path.push_str(s);
+                    path.push('}');
                 }
             }
         }
@@ -355,4 +380,81 @@ where
         });
 
     (routes.into_iter().chain(excluded).collect(), generator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lets_expect::lets_expect;
+
+    // ----- to_ntex_path raw-segment edge cases ---------------------------
+    // `to_ntex_path` runs AFTER `expand_optionals()`, so an `OptionalParam`
+    // reaching it is a contract violation, and an empty-named `Param`/`Splat`
+    // is degenerate input. Both used to fail SILENTLY: the leaked optional
+    // dropped its whole segment (turning `/users/{id}` into a wrong-but-live
+    // `/users/`), and an empty name emitted `{}` / `{}*` glued onto the
+    // previous segment with no `/` separator. Neither shape is reachable
+    // through the public route API (`gen_route_list` expands optionals first
+    // and leptos never emits an empty segment name), so they are pinned here
+    // directly against the private `NtexPath` trait.
+    fn ntex_path(segments: Vec<PathSegment>) -> String {
+        segments.to_ntex_path()
+    }
+
+    lets_expect! {
+        expect(ntex_path(segments)) as the_raw_ntex_path {
+            let segments = vec![
+                PathSegment::Static("users".into()),
+                PathSegment::Param("id".into()),
+            ];
+
+            to renders_a_param_with_its_leading_separator {
+                equal("/users/{id}".to_string())
+            }
+
+            when an_optional_param_leaks_past_expansion {
+                let segments = vec![
+                    PathSegment::Static("users".into()),
+                    PathSegment::OptionalParam("id".into()),
+                ];
+                to degrades_to_a_matchable_param_not_a_dropped_segment {
+                    equal("/users/{id}".to_string())
+                }
+            }
+
+            when a_splat_name_is_empty {
+                let segments = vec![
+                    PathSegment::Static("files".into()),
+                    PathSegment::Splat("".into()),
+                ];
+                to keeps_the_segment_separator {
+                    equal("/files/{}*".to_string())
+                }
+            }
+
+            when a_param_name_is_empty {
+                let segments = vec![
+                    PathSegment::Static("a".into()),
+                    PathSegment::Param("".into()),
+                ];
+                to keeps_the_segment_separator {
+                    equal("/a/{}".to_string())
+                }
+            }
+
+            // The intersection of the two degenerate axes: a LEAKED optional
+            // with an EMPTY name. The separator must still be emitted (it is
+            // driven by the segment kind, not the name), and the optional still
+            // degrades to a `{}` param rather than vanishing.
+            when a_leaked_optional_param_has_an_empty_name {
+                let segments = vec![
+                    PathSegment::Static("a".into()),
+                    PathSegment::OptionalParam("".into()),
+                ];
+                to keeps_the_separator_and_degrades_to_an_empty_param {
+                    equal("/a/{}".to_string())
+                }
+            }
+        }
+    }
 }
