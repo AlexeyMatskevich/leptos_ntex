@@ -20,6 +20,8 @@ Add the dependency:
 ```toml
 [dependencies]
 leptos = { version = "0.8", features = ["ssr", "nonce"] }
+leptos_meta = { version = "0.8", features = ["ssr"] }
+leptos_router = { version = "0.8", features = ["ssr"] }
 leptos-ntex-unofficial = "0.6"
 ntex = "3"
 ```
@@ -70,14 +72,14 @@ async fn main() -> std::io::Result<()> {
 ```
 
 A runnable version of the same example is in
-[`examples/basic.rs`](examples/basic.rs) — try it with:
+[`examples/basic.rs`](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/examples/basic.rs) — try it with:
 
 ```sh
 cargo run --example basic
 ```
 
 There is also a server-function extractor example in
-[`examples/auth_extractor.rs`](examples/auth_extractor.rs):
+[`examples/auth_extractor.rs`](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/examples/auth_extractor.rs):
 
 ```sh
 cargo check --example auth_extractor --features cookie
@@ -154,6 +156,7 @@ signatures, and runnable snippets.
 |---|---|
 | `tracing` | Emit `tracing` spans around route rendering and server-fn dispatch |
 | `islands-router` | Forwards to `leptos/islands-router` |
+| `cookie` | Enable ntex's cookie support (`ntex/cookie`) for cookie-reading extractors; required to build `examples/auth_extractor.rs` |
 
 Nothing is enabled by default.
 
@@ -206,7 +209,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the repository workflow and
+See [`CONTRIBUTING.md`](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/CONTRIBUTING.md) for the repository workflow and
 release checklist.
 
 ## Migrating from `leptos_actix`
@@ -229,8 +232,8 @@ in the repository.
 
 Dual-licensed under either of
 
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-* Apache License 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+* Apache License 2.0 ([LICENSE-APACHE](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 
 at your option.
 
