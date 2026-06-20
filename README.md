@@ -20,6 +20,8 @@ Add the dependency:
 ```toml
 [dependencies]
 leptos = { version = "0.8", features = ["ssr", "nonce"] }
+leptos_meta = { version = "0.8", features = ["ssr"] }
+leptos_router = { version = "0.8", features = ["ssr"] }
 leptos-ntex-unofficial = "0.6"
 ntex = "3"
 ```
