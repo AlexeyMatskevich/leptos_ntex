@@ -291,6 +291,15 @@ fn oversize_response(limit: usize) -> HttpResponse {
 /// # }
 /// ```
 ///
+/// # Routing pattern
+///
+/// Register with the ntex tail pattern **`/{tail}*`**, not actix-web's
+/// `/{tail:.*}`. In ntex, `{name:.*}` matches only a *single* path segment, so
+/// `/api/{tail:.*}` would `404` any server-function endpoint whose path
+/// contains a slash. `{tail}*` is ntex's cross-segment tail match. See
+/// [`file_and_error_handler`](crate::file_and_error_handler) for the same rule
+/// on the file fallback.
+///
 /// ## Provided Context Types
 /// - [`ResponseOptions`](crate::ResponseOptions)
 /// - [`Request`](crate::Request)
@@ -315,6 +324,15 @@ where
 /// are called by the rendering method, while subsequent calls from the
 /// client are handled by this server function handler — both paths need
 /// to see the same context.
+///
+/// # Proxy headers
+///
+/// The dispatcher resolves the request's origin through ntex's `ConnectionInfo`
+/// — which trusts `Forwarded` / `X-Forwarded-Host` / `X-Forwarded-Proto` — to
+/// enforce the same-origin guard on the HTML-form referrer redirect fallback.
+/// Behind a reverse proxy, strip any client-supplied forwarding headers and set
+/// trusted values at the proxy before the request reaches ntex (see the
+/// crate-level "Proxy headers" note).
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(level = "trace", fields(error), skip_all)
