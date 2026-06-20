@@ -509,6 +509,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ACTIX_TO_NTEX_NOTES.md` from the repository (migration notes; was
   already excluded from the published crate).
 
+## [0.1.0] - 2026-04-16
+
 ### Added
 
 - Initial unofficial Leptos adapter for ntex, based on `leptos_actix` with
