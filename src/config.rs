@@ -1,14 +1,15 @@
 //! Configuration knobs for the server-function dispatcher and helpers
-//! that enforce payload limits for non-streaming request bodies.
+//! that enforce payload limits while collecting request bodies.
 
 use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
 use ntex::http::{Payload, header};
 use ntex::web::HttpRequest;
 use std::io;
 
-/// Default maximum payload size accepted by
-/// [`NtexRequest`](crate::NtexRequest) when collecting server-function
-/// request bodies (2 MiB).
+/// Default maximum payload size enforced by
+/// [`NtexRequest`](crate::NtexRequest) for server-function requests — buffered
+/// and streaming HTTP request bodies, and each server-function WebSocket
+/// message (2 MiB).
 ///
 /// Matches ntex's own default [`PayloadConfig`](ntex::web::types::PayloadConfig)
 /// limit. Override per-app by registering a [`LeptosServerFnConfig`] via
@@ -43,15 +44,19 @@ pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct LeptosServerFnConfig {
-    /// Maximum accepted payload body size in bytes for non-streaming
-    /// server-function requests. Requests exceeding this limit are
-    /// rejected with `413 Payload Too Large`, whether the client
-    /// declares size up-front via `Content-Length` (rejected before
-    /// the server function runs) or streams a body whose length is
-    /// unknown to the server (`Transfer-Encoding: chunked`, any body
-    /// without `Content-Length`) and exceeds the limit mid-flight
-    /// (rejected once the excess byte is observed; the partial
-    /// payload is discarded).
+    /// Maximum accepted body size in bytes for a server-function request.
+    /// HTTP requests exceeding this limit are rejected with
+    /// `413 Payload Too Large`, whether the client declares size up-front
+    /// via `Content-Length` (rejected before the server function runs) or
+    /// streams a body whose length is unknown to the server
+    /// (`Transfer-Encoding: chunked`, any body without `Content-Length`)
+    /// and exceeds the limit mid-flight (rejected once the excess byte is
+    /// observed; the partial payload is discarded).
+    ///
+    /// The same limit also bounds each server-function WebSocket message
+    /// (a single frame, or a reassembled fragmented message): exceeding it
+    /// closes the connection with close code `1009` (`Message Too Big`,
+    /// RFC 6455 §7.4.1).
     pub payload_limit: usize,
     /// Buffer size for the WebSocket mpsc channels used by streaming
     /// server functions. Larger values allow bursts at the cost of
@@ -91,8 +96,9 @@ impl LeptosServerFnConfig {
         }
     }
 
-    /// Sets the maximum accepted non-streaming server-function request
-    /// body size in bytes.
+    /// Sets the maximum accepted server-function payload size in bytes — for
+    /// buffered and streaming HTTP request bodies and for WebSocket messages
+    /// (see [`payload_limit`](Self::payload_limit)).
     pub const fn with_payload_limit(mut self, payload_limit: usize) -> Self {
         self.payload_limit = payload_limit;
         self
