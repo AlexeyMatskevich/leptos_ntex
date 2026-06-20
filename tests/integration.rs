@@ -143,7 +143,13 @@ async fn real_server_renders_ssr_and_serves_server_fn() {
     assert_eq!(resp.status(), ntex::http::StatusCode::OK);
     let body = resp.body().await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("7"));
+    // Exact, not substring: the Json codec serializes `Ok(7)` as the bare
+    // number `7`, and `contains("7")` would also pass for 17/70/27.
+    assert_eq!(
+        text.trim(),
+        "7",
+        "sum_two(3,4) must return exactly 7, got {text:?}"
+    );
 }
 
 #[ntex::test]
@@ -190,8 +196,11 @@ async fn real_server_method_specific_routing_rejects_wrong_method() {
     assert_eq!(ok.status(), ntex::http::StatusCode::OK);
 
     // SumTwo is registered as POST via leptos_routes. GET on it should be
-    // rejected at the router level; ntex may surface that as either 404
-    // or 405 depending on resource matching details.
+    // rejected at the router level; ntex may surface that as either 404 or 405
+    // depending on resource-matching details, so the disjunction is INTENTIONAL
+    // (pinning one would couple the test to an ntex internal). The successful
+    // POST asserted just above anchors that the route genuinely exists, so a
+    // bare 404 here is a real wrong-method rejection, not a missing route.
     let resp = srv
         .request(ntex::http::Method::GET, server_url(&srv, SumTwo::PATH))
         .send()
@@ -374,7 +383,12 @@ async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
     assert_eq!(resp.status(), ntex::http::StatusCode::OK);
     let body = resp.body().await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("12"));
+    // Exact, not substring: `contains("12")` would also pass for 112/120/212.
+    assert_eq!(
+        text.trim(),
+        "12",
+        "mul_two_auto_inventory(3,4) must return exactly 12, got {text:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -434,10 +448,12 @@ async fn real_server_roundtrips_cbor_server_fn() {
     assert_eq!(value, 14);
 }
 
-/// RFC 9110 §9.3.2: HEAD shares GET's status and headers but returns no
+/// RFC 9110 §9.3.2: HEAD mirrors GET's status and Content-Type but returns no
 /// body. Verified against the real h1 wire — the test harness’s
 /// `test::call_service` cannot exercise the body-elision path because it
-/// bypasses the encoder.
+/// bypasses the encoder. This pins status + Content-Type + an empty wire body;
+/// it does not compare the FULL header set (GET and HEAD share one handler, so
+/// per-header parity is structural, not separately asserted here).
 #[ntex::test]
 async fn real_server_head_mirrors_get_with_empty_body() {
     let srv = test::server(move || {
@@ -505,9 +521,9 @@ async fn real_server_head_on_missing_route_not_200() {
         .send()
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         resp.status(),
-        ntex::http::StatusCode::OK,
-        "HEAD on a missing route must not falsely report 200"
+        ntex::http::StatusCode::NOT_FOUND,
+        "HEAD on a missing route must fall through to a real 404, not falsely report 200 (or some other non-OK status)"
     );
 }

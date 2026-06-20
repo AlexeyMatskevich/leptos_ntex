@@ -44,8 +44,9 @@ async fn file_and_error_handler_serves_file_then_falls_back() {
 /// The catch-all must reach the handler for *nested* paths (multi-segment),
 /// which the actix `/{tail:.*}` idiom did not in ntex — only `/{tail}*`
 /// does. Pins: a nested asset and an RFC 8615 `.well-known/*` file are
-/// served, while a nested dotfile stays hidden and a deep miss renders the
-/// 404 shell.
+/// served, while a top-level dotfile (`/.env`) stays hidden and a deep miss
+/// renders the 404 shell. (A genuinely *nested* dotfile is covered by
+/// `traversal_dotfile_in_subdirectory_rejected`.)
 #[ntex::test]
 async fn file_and_error_handler_serves_nested_paths_and_well_known() {
     use crate::file_and_error_handler;
@@ -210,7 +211,13 @@ async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
         .get(ntex::http::header::VARY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    assert!(vary.contains("Accept-Encoding"));
+    // Token-match, not substring: a malformed value like `X-Accept-Encoding`
+    // contains the substring but is not the `Accept-Encoding` token.
+    assert!(
+        vary.split(',')
+            .any(|v| v.trim().eq_ignore_ascii_case("Accept-Encoding")),
+        "Vary must list the Accept-Encoding token, got {vary:?}"
+    );
     let body = test::read_body(resp).await;
     assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "br-bytes");
 
@@ -431,17 +438,29 @@ async fn traversal_dotfile_rejected() {
 }
 
 /// A NUL byte in a path segment must be rejected outright — NUL is
-/// illegal in POSIX paths and typically signals a smuggling attempt.
+/// illegal in POSIX paths and typically signals a smuggling attempt. This is
+/// defense-in-depth: the OS would also reject a NUL path, so the test cannot
+/// fully ISOLATE `safe_subpath`'s `contains('\0')` guard from the OS rejection
+/// — but it pins the full safe-rejection contract (404 + shell + no leak of
+/// the sibling file), so a regression to a 500 or an empty body is still
+/// caught.
 #[ntex::test]
 async fn traversal_null_byte_rejected() {
     let site_root = temp_site_root("traversal_nul");
     std::fs::create_dir_all(&site_root).unwrap();
-    std::fs::write(site_root.join("ok.txt"), "ok").unwrap();
+    std::fs::write(site_root.join("ok.txt"), "NUL_SENTINEL_BODY").unwrap();
 
     let app = traversal_app!(&site_root);
     let req = test::TestRequest::with_uri("/ok%00hidden.txt").to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Shell"), "must render the fallback shell");
+    assert!(
+        !text.contains("NUL_SENTINEL_BODY"),
+        "must not serve the sibling file body"
+    );
 
     let _ = std::fs::remove_dir_all(&site_root);
 }
@@ -457,7 +476,19 @@ async fn traversal_symlink_escape_rejected() {
     std::fs::write(parent.join("outside.txt"), "OUTSIDE").unwrap();
     let site_root = parent.join("public");
     std::fs::create_dir_all(&site_root).unwrap();
-    let _ = std::os::unix::fs::symlink(parent.join("outside.txt"), site_root.join("escape.txt"));
+    // Must NOT be `let _ =`: if symlink creation fails, `/escape.txt` would be
+    // a missing file and the 404-shell-no-leak assertions below would all pass
+    // vacuously WITHOUT ever exercising the symlink-escape boundary. Fail loud
+    // instead, and confirm the link really is a symlink before the request.
+    std::os::unix::fs::symlink(parent.join("outside.txt"), site_root.join("escape.txt"))
+        .expect("symlink fixture must be created for this test to be meaningful");
+    assert!(
+        std::fs::symlink_metadata(site_root.join("escape.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "escape.txt must be a symlink pointing outside the root before the request"
+    );
 
     let app = traversal_app!(&site_root);
     let req = test::TestRequest::with_uri("/escape.txt").to_request();
