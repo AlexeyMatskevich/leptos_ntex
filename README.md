@@ -22,7 +22,7 @@ Add the dependency:
 leptos = { version = "0.8", features = ["ssr", "nonce"] }
 leptos_meta = { version = "0.8", features = ["ssr"] }
 leptos_router = { version = "0.8", features = ["ssr"] }
-leptos-ntex-unofficial = "0.6"
+leptos-ntex-unofficial = "0.7"
 ntex = "3"
 ```
 
