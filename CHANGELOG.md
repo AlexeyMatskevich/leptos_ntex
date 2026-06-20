@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-21
+
+### Fixed
+
+- The `docs.rs` build no longer fails on current nightly toolchains. The crate
+  gated its documentation cfg badges behind `#![feature(doc_auto_cfg)]`, which
+  was removed in Rust 1.92 and folded into `doc_cfg` (RFC 3631); the gate is now
+  `#![feature(doc_cfg)]`. Only the `docsrs` documentation build is affected — the
+  library itself builds on stable as before.
+
 ## [0.7.0] - 2026-06-20
 
 ### Security
@@ -528,7 +538,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.4.2...v0.5.0
