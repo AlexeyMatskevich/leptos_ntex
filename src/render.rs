@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[ntex::test]
-    async fn islands_router_header_is_a_no_op_when_the_feature_is_off() {
+    async fn islands_router_header_toggles_supports_ooo_only_when_the_feature_is_on() {
         use leptos::prelude::*;
 
         async fn supports_ooo_seen_for(with_header: bool) -> bool {
@@ -593,10 +593,21 @@ mod tests {
             without_header,
             "supports_ooo must be true without the header (no island-router navigation)"
         );
-        assert_eq!(
-            with_header, without_header,
-            "with the islands-router feature off, the Islands-Router header must not change supports_ooo"
-        );
+        // `is_island_router_navigation` is `cfg!(feature = "islands-router")
+        // && <header present>`, so the header only has an effect when the
+        // crate is actually built with the feature on — this test must hold
+        // (and exercise the real branch) under both build configurations.
+        if cfg!(feature = "islands-router") {
+            assert!(
+                !with_header,
+                "with the islands-router feature on, the Islands-Router header must disable supports_ooo"
+            );
+        } else {
+            assert_eq!(
+                with_header, without_header,
+                "with the islands-router feature off, the Islands-Router header must not change supports_ooo"
+            );
+        }
     }
 
     // `leptos_corrected_path` builds the `RequestUrl` leptos routes on. The
