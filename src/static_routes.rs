@@ -20,7 +20,7 @@ use leptos_router::{
     RouteList,
     static_routes::{RegenerationFn, ResolvedStaticPath},
 };
-use ntex::http::header;
+use ntex::http::{StatusCode, header};
 use ntex::web::error::StateExtractorError;
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
 use or_poisoned::OrPoisoned;
@@ -235,6 +235,31 @@ fn was_error_status(owner: &Owner) -> bool {
     let resp = owner.with(|| expect_context::<ResponseOptions>());
     let status = resp.0.read().or_poisoned().status;
     status.is_some_and(|status| status.is_client_error() || status.is_server_error())
+}
+
+/// Whether `status` is one that `NamedFile::into_response` derived from the
+/// current request's conditional (`If-None-Match`/`If-Modified-Since`/
+/// `If-Match`/`If-Unmodified-Since`) or `Range` headers: `304 Not Modified`,
+/// `412 Precondition Failed`, `206 Partial Content`, `416 Range Not
+/// Satisfiable`, or `400 Bad Request` for a `Range` header that is not valid
+/// text. These are exactly the non-`200` statuses `ntex_files`'
+/// `NamedFile::into_response` can produce — it builds on a base `200 OK` and
+/// overrides it only for these request-derived cases.
+///
+/// On the file-serving branch a captured `ResponseOptions` status describes the
+/// *full* representation (e.g. an app-set `201`); it must not overwrite one of
+/// these, or a conditional/range request would get a wrong status (RFC 9110
+/// §13, §14.4, §15.4.5). A plain `200 OK` full serve is not in this set, so the
+/// app's status still applies there.
+fn is_conditional_or_range_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_MODIFIED
+            | StatusCode::PRECONDITION_FAILED
+            | StatusCode::PARTIAL_CONTENT
+            | StatusCode::RANGE_NOT_SATISFIABLE
+            | StatusCode::BAD_REQUEST
+    )
 }
 
 fn static_path(options: &LeptosOptions, path: &str) -> Option<PathBuf> {
@@ -671,8 +696,9 @@ where
                     // `Content-Length`) would otherwise overwrite the
                     // authoritative one and desync the framing from the real
                     // body. Drop them from the snapshot so `NamedFile` wins;
-                    // the app's status and its non-framing headers (cookies,
-                    // `Cache-Control`, custom `x-*`) still apply.
+                    // the app's status (on a plain `200` full serve) and its
+                    // non-framing headers (cookies, `Cache-Control`, custom
+                    // `x-*`) still apply.
                     for key in [
                         header::CONTENT_LENGTH,
                         header::CONTENT_TYPE,
@@ -684,6 +710,20 @@ where
                         header::LAST_MODIFIED,
                     ] {
                         options.headers.remove(key);
+                    }
+                    // `NamedFile::into_response` also derives the response
+                    // STATUS from this request's validators and `Range`:
+                    // `304`/`412` for a conditional GET, `206`/`416` for a
+                    // range request, `400` for a malformed `Range` header. A
+                    // captured status describes the *full* representation (e.g.
+                    // an app-set `201`); letting it overwrite one of those would
+                    // break the caching / range contract — a client sending
+                    // `If-None-Match` would get a `201` with an empty body
+                    // instead of `304`. Drop the captured status on those
+                    // responses so `NamedFile` wins; a plain `200 OK` full serve
+                    // still takes the app's status.
+                    if is_conditional_or_range_status(res.0.status()) {
+                        options.status = None;
                     }
                 }
                 res.extend_response_parts(options);
@@ -721,6 +761,58 @@ mod tests {
     /// the directory need not exist for these assertions.
     fn under_site_root(rel: &str) -> Option<PathBuf> {
         Some(Path::new(TEST_SITE_ROOT).join(rel))
+    }
+
+    // ----- is_conditional_or_range_status: exhaustive spec --------------
+    // The predicate that keeps a captured `ResponseOptions` status from
+    // clobbering the status `NamedFile` derived from THIS request's
+    // conditional / `Range` headers. It must return `true` for exactly the
+    // five such statuses (304/412/206/416/400 — the complete non-200 set
+    // `NamedFile::into_response` can produce) and `false` for everything the
+    // full-serve path produces — a plain `200`, an app-set `201`, an error
+    // `500` — so the app's own status still applies on a full serve. A
+    // regression dropping or widening any `matches!` arm flips one leaf.
+    lets_expect! {
+        expect(is_conditional_or_range_status(status)) {
+            let status = StatusCode::OK;
+
+            to does_not_protect_a_full_200_serve { be_false }
+
+            when the_status_is_304_not_modified {
+                let status = StatusCode::NOT_MODIFIED;
+                to is_protected { be_true }
+            }
+
+            when the_status_is_412_precondition_failed {
+                let status = StatusCode::PRECONDITION_FAILED;
+                to is_protected { be_true }
+            }
+
+            when the_status_is_206_partial_content {
+                let status = StatusCode::PARTIAL_CONTENT;
+                to is_protected { be_true }
+            }
+
+            when the_status_is_416_range_not_satisfiable {
+                let status = StatusCode::RANGE_NOT_SATISFIABLE;
+                to is_protected { be_true }
+            }
+
+            when the_status_is_400_bad_request_from_a_malformed_range {
+                let status = StatusCode::BAD_REQUEST;
+                to is_protected { be_true }
+            }
+
+            when the_status_is_an_app_set_201_created {
+                let status = StatusCode::CREATED;
+                to is_not_protected_so_the_app_status_applies { be_false }
+            }
+
+            when the_status_is_a_500_server_error {
+                let status = StatusCode::INTERNAL_SERVER_ERROR;
+                to is_not_protected { be_false }
+            }
+        }
     }
 
     // ----- static_path: exhaustive spec --------------------------------

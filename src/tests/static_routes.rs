@@ -324,3 +324,76 @@ async fn static_route_cached_headers_are_replayed_more_than_once() {
 
     let _ = std::fs::remove_dir_all(&site_root);
 }
+
+/// A captured `ResponseOptions` status must not overwrite the status
+/// `NamedFile` computes from the request's validators / `Range` on the
+/// file-serving branch (RFC 9110 §13, §14.4, §15.4.5). The `/headers` route
+/// sets `201` during its static render; a full serve keeps that `201`, but a
+/// conditional (`If-None-Match`) or range request must report `NamedFile`'s
+/// `304` / `206` instead — otherwise a client sending `If-None-Match` would
+/// receive `201` with an empty body and drop its valid cache. Upstream
+/// `leptos_axum` / `leptos_actix` overwrite unconditionally; this is a
+/// deliberate divergence.
+#[ntex::test]
+async fn static_route_captured_status_yields_to_namedfile_conditional_and_range() {
+    let site_root = temp_site_root("static_conditional_status");
+    let (routes, generator) = gen_route_list_with_ssg(StaticHeaderApp);
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_static_conditional_status")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    generator.generate(&options).await;
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
+    }))
+    .await;
+
+    // A full serve keeps the app's captured status and exposes NamedFile's ETag.
+    let full = test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
+    assert_eq!(
+        full.status(),
+        StatusCode::CREATED,
+        "a full serve must keep the app's captured 201"
+    );
+    let etag = full
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .expect("NamedFile must set an ETag on the served static file");
+
+    // If-None-Match matches the file's ETag: NamedFile computes 304, and the
+    // captured 201 must NOT overwrite it.
+    let conditional = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/headers")
+            .header(header::IF_NONE_MATCH, etag.as_str())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        conditional.status(),
+        StatusCode::NOT_MODIFIED,
+        "If-None-Match match must report 304, not the captured 201"
+    );
+
+    // A satisfiable Range: NamedFile computes 206, and the captured 201 must
+    // NOT overwrite it.
+    let ranged = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/headers")
+            .header(header::RANGE, "bytes=0-3")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        ranged.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "a satisfiable Range must report 206, not the captured 201"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
