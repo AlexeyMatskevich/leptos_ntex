@@ -252,6 +252,38 @@ where
     generate_route_list_with_exclusions_and_ssg_and_context(app_fn, excluded_routes, || {})
 }
 
+// Another async executor (tokio, glib, futures-executor, or a different
+// Leptos integration) was installed first. `any_spawner` is globally
+// one-shot, so Leptos tasks will now run on *that* executor instead of
+// `ntex::rt`. Apps that want to fail fast should call `try_init_executor()`
+// at startup.
+//
+// Always emit to stderr so the conflict is visible in the default feature
+// configuration (no `tracing` feature), and additionally emit a structured
+// record via `tracing` when that feature is enabled so it integrates with
+// the app's subscriber setup.
+//
+// Factored out of `ensure_executor_initialized`'s `Once` closure so it can
+// be exercised directly against a synthetic error — the `Once`/global
+// executor-state machine only ever reaches this branch once per process,
+// on whichever test happens to run first, which cannot be pinned
+// deterministically from a shared test binary.
+pub(crate) fn emit_foreign_executor_diagnostic(err: &any_spawner::ExecutorError) {
+    let msg = format!(
+        "leptos_ntex_unofficial: another async executor is already installed \
+         via `any_spawner` (error: {err}). Leptos async tasks will run on \
+         that executor instead of ntex::rt. Call \
+         `leptos_ntex_unofficial::try_init_executor()` at startup to surface \
+         this error deterministically. See the `Request` wrapper docs for \
+         cross-thread-drop caveats."
+    );
+    // `tracing::warn!` only lives when the feature is on; `eprintln!` runs
+    // unconditionally so the conflict is not silent in the default build.
+    #[cfg(feature = "tracing")]
+    tracing::warn!(error = ?err, "{msg}");
+    eprintln!("warning: {msg}");
+}
+
 pub(crate) fn ensure_executor_initialized() {
     // The outer `Once` keeps this call zero-allocation on the fast path
     // after the first init. `any_spawner::Executor::init_custom_executor`
@@ -261,32 +293,7 @@ pub(crate) fn ensure_executor_initialized() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         if let Err(err) = init_ntex_executor() {
-            // Another async executor (tokio, glib, futures-executor, or
-            // a different Leptos integration) was installed first.
-            // `any_spawner` is globally one-shot, so Leptos tasks will
-            // now run on *that* executor instead of `ntex::rt`. Apps
-            // that want to fail fast should call
-            // `try_init_executor()` at startup.
-            //
-            // Always emit to stderr so the conflict is visible in the
-            // default feature configuration (no `tracing` feature), and
-            // additionally emit a structured record via `tracing` when
-            // that feature is enabled so it integrates with the app's
-            // subscriber setup.
-            let msg = format!(
-                "leptos_ntex_unofficial: another async executor is already installed \
-                 via `any_spawner` (error: {err}). Leptos async tasks will run on \
-                 that executor instead of ntex::rt. Call \
-                 `leptos_ntex_unofficial::try_init_executor()` at startup to surface \
-                 this error deterministically. See the `Request` wrapper docs for \
-                 cross-thread-drop caveats."
-            );
-            // `tracing::warn!` only lives when the feature is on;
-            // `eprintln!` runs unconditionally so the conflict is not
-            // silent in the default build.
-            #[cfg(feature = "tracing")]
-            tracing::warn!(error = ?err, "{msg}");
-            eprintln!("warning: {msg}");
+            emit_foreign_executor_diagnostic(&err);
         }
     });
 }
@@ -456,6 +463,115 @@ mod tests {
                 to keeps_the_separator_and_degrades_to_an_empty_param {
                     equal("/a/{}".to_string())
                 }
+            }
+
+            // `Unit` is the empty-tuple root-segment marker; it must contribute
+            // no text at all, even when sandwiched between two real segments.
+            when a_unit_segment_is_present {
+                let segments = vec![
+                    PathSegment::Static("a".into()),
+                    PathSegment::Unit,
+                    PathSegment::Param("id".into()),
+                ];
+                to contributes_no_text_to_the_path {
+                    equal("/a/{id}".to_string())
+                }
+            }
+
+            // A lone whole-path `Static` segment already carries its own
+            // leading slash (see the comment on the guard above) — the
+            // separator-insertion must not double it up.
+            when a_static_segment_already_has_a_leading_slash {
+                let segments = vec![PathSegment::Static("/about".into())];
+                to keeps_the_single_leading_slash {
+                    equal("/about".to_string())
+                }
+            }
+
+            // The sibling of the three degenerate-name contexts above: an
+            // empty `Static` segment must not push an extra separator beyond
+            // what the following `Param` already adds.
+            when a_static_segment_is_empty {
+                let segments = vec![
+                    PathSegment::Static("".into()),
+                    PathSegment::Param("id".into()),
+                ];
+                to adds_no_extra_separator {
+                    equal("/{id}".to_string())
+                }
+            }
+
+            // The zero-segment boundary: no loop iterations must run at all.
+            when the_segment_vector_is_empty {
+                let segments: Vec<PathSegment> = vec![];
+                to returns_an_empty_string {
+                    equal(String::new())
+                }
+            }
+        }
+    }
+
+    // ----- generate_route_list_with_exclusions_and_ssg_and_context -------
+    // The "most general form" backing every public `generate_route_list*`
+    // entry point. Two behaviors are otherwise untested anywhere in the
+    // repo: (1) the `additional_context` closure actually runs during route
+    // generation, and (2) the placeholder listing synthesized for an
+    // excluded path carries the documented defaults (not leaked real route
+    // data) alongside `exclude == true`.
+    use leptos::prelude::*;
+
+    #[component]
+    fn ContextProbeApp() -> impl IntoView {
+        leptos_meta::provide_meta_context();
+        view! { <h1>"probe"</h1> }
+    }
+
+    // Runs `generate_route_list_with_exclusions_and_ssg_and_context`, marking
+    // `ran` once `additional_context` executes inside route generation.
+    fn context_ran_during_generation(excluded: Option<Vec<String>>) -> bool {
+        let ran = Arc::new(Mutex::new(false));
+        let ran_inner = ran.clone();
+        let _ = generate_route_list_with_exclusions_and_ssg_and_context(
+            ContextProbeApp,
+            excluded,
+            move || {
+                *ran_inner.lock().expect("ran mutex poisoned") = true;
+            },
+        );
+        *ran.lock().expect("ran mutex poisoned")
+    }
+
+    lets_expect! {
+        expect(context_ran_during_generation(None)) as whether_additional_context_ran {
+            to runs_the_additional_context_closure_during_generation {
+                be_true
+            }
+        }
+    }
+
+    // The excluded-tail placeholder listing: built directly from the
+    // `excluded_routes` list, independent of whether that path also
+    // happens to be a real route. Its `mode`/`methods`/`regenerate` must
+    // stay the documented placeholder defaults while `exclude` is `true`.
+    fn excluded_placeholder_listing() -> NtexRouteListing {
+        let (routes, _generator) = generate_route_list_with_exclusions_and_ssg_and_context(
+            ContextProbeApp,
+            Some(vec!["/not-a-real-route".to_string()]),
+            || {},
+        );
+        routes
+            .into_iter()
+            .find(|listing| listing.exclude)
+            .expect("an excluded placeholder listing must be present")
+    }
+
+    lets_expect! {
+        expect(excluded_placeholder_listing()) as the_excluded_placeholder_listing {
+            to carries_the_documented_placeholder_defaults {
+                have(mode()) equal(SsrMode::default()),
+                have(methods().collect::<Vec<_>>()) equal(Vec::<Method>::new()),
+                have(regenerate.is_empty()) be_true,
+                have(exclude) be_true,
             }
         }
     }
