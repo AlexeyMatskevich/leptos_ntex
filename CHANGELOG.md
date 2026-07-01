@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **redirect** (e.g. a `302` + `Location` from a `SsrMode::Static` route that
   calls `redirect()`, which SSG caches because the error-skip predicate covers
   only `4xx`/`5xx`) is not a representation status, so it still fires on such
-  hits. This extends the file-serving snapshot reconciliation (which already
-  strips body-framing headers) to the status line; it is a deliberate
-  divergence from the upstream `leptos_axum` / `leptos_actix` adapters, which
+  hits — as a bare redirect, without the file's range/conditional artifacts (a
+  `206`'s `Content-Range` header and partial body are dropped). This extends the
+  file-serving snapshot reconciliation (which already strips body-framing
+  headers) to the status line; it is a deliberate divergence from the upstream
+  `leptos_axum` / `leptos_actix` adapters, which
   overwrite the status unconditionally.
 
 ## [0.7.1] - 2026-06-21

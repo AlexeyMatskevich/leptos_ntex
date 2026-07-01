@@ -449,7 +449,9 @@ async fn static_route_captured_redirect_survives_conditional_and_range() {
         "a conditional hit to a static redirect must keep 302, not become 304"
     );
 
-    // A range request must STILL redirect (302), not collapse to NamedFile's 206.
+    // A range request must STILL redirect (302), not collapse to NamedFile's
+    // 206 — and the redirect must not carry NamedFile's range artifacts
+    // (`Content-Range` header + partial file body).
     let ranged = test::call_service(
         &app,
         test::TestRequest::with_uri("/go")
@@ -461,6 +463,17 @@ async fn static_route_captured_redirect_survives_conditional_and_range() {
         ranged.status(),
         StatusCode::FOUND,
         "a range request to a static redirect must keep 302, not become 206"
+    );
+    let ranged_has_content_range = ranged.headers().get(header::CONTENT_RANGE).is_some();
+    let ranged_body = test::read_body(ranged).await;
+    assert!(
+        !ranged_has_content_range,
+        "a redirect must not carry NamedFile's `Content-Range` range artifact"
+    );
+    assert!(
+        ranged_body.is_empty(),
+        "a redirect must not carry NamedFile's partial file body, got {} bytes",
+        ranged_body.len()
     );
 
     let _ = std::fs::remove_dir_all(&site_root);
