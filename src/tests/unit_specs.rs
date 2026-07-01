@@ -374,6 +374,56 @@ lets_expect! {
     }
 }
 
+// ----- ResponseOptions::insert_header / append_header -----------------
+// `ResponseOptions` is the `Arc<RwLock<ResponseParts>>` wrapper actually
+// injected as context and used by app/component/server-fn code, so its own
+// `insert_header`/`append_header` need a direct spec independent of the
+// inner `ResponseParts` methods they delegate to: `insert_header` must
+// REPLACE any previous value for the same key, while `append_header` must
+// APPEND, keeping both (the multi-value guarantee repeated `Set-Cookie`
+// calls rely on). A `append_header` regression that called `.insert(...)`
+// instead of `.headers.append(...)` would silently drop the earlier value.
+fn response_options_header_values(
+    second_call: fn(&crate::ResponseOptions, header::HeaderName, header::HeaderValue),
+) -> Vec<String> {
+    let name = header::HeaderName::from_static("x-test");
+    let options = crate::ResponseOptions::default();
+    options.insert_header(name.clone(), header::HeaderValue::from_static("first"));
+    second_call(
+        &options,
+        name.clone(),
+        header::HeaderValue::from_static("second"),
+    );
+    options
+        .0
+        .read()
+        .unwrap()
+        .headers
+        .get_all(&name)
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect()
+}
+
+lets_expect! {
+    expect(response_options_header_values(second_call)) as the_response_options_header_values {
+        let second_call: fn(&crate::ResponseOptions, header::HeaderName, header::HeaderValue) =
+            crate::ResponseOptions::insert_header;
+
+        to keeps_only_the_latest_value_when_inserted_twice {
+            equal(vec!["second".to_string()])
+        }
+
+        when the_same_key_is_appended_instead {
+            let second_call: fn(&crate::ResponseOptions, header::HeaderName, header::HeaderValue) =
+                crate::ResponseOptions::append_header;
+            to keeps_both_values_in_insertion_order {
+                equal(vec!["first".to_string(), "second".to_string()])
+            }
+        }
+    }
+}
+
 // ----- render::ntex_method: exhaustive leptos→ntex method map -------
 // Every `leptos_router::Method` variant maps to its ntex counterpart;
 // a collapse to `Method::default()` (GET) would misroute POST/PUT/etc.
@@ -441,6 +491,31 @@ lets_expect! {
         when the_listing_was_built_in_order {
             let mode = leptos_router::SsrMode::InOrder;
             to echoes_that_mode { equal(leptos_router::SsrMode::InOrder) }
+        }
+
+        // The type's own `#[default]` variant, pinned precisely because it IS
+        // the default: a `mode()` rewrite that collapses any other variant
+        // onto `SsrMode::default()` would otherwise still pass this leaf.
+        when the_listing_was_built_out_of_order {
+            let mode = leptos_router::SsrMode::OutOfOrder;
+            to echoes_that_mode { equal(leptos_router::SsrMode::OutOfOrder) }
+        }
+
+        // No other leaf here builds a `PartiallyBlocked` listing.
+        when the_listing_was_built_partially_blocked {
+            let mode = leptos_router::SsrMode::PartiallyBlocked;
+            to echoes_that_mode { equal(leptos_router::SsrMode::PartiallyBlocked) }
+        }
+
+        // The `Static(StaticRoute)` payload variant: a getter that clones the
+        // wrong inner value (or re-defaults the payload) would still satisfy
+        // `matches!(mode, SsrMode::Static(_))` checks elsewhere in the crate,
+        // but only an exact-value check like this one catches it.
+        when the_listing_was_built_static {
+            let mode = leptos_router::SsrMode::Static(leptos_router::static_routes::StaticRoute::new());
+            to echoes_that_mode {
+                equal(leptos_router::SsrMode::Static(leptos_router::static_routes::StaticRoute::new()))
+            }
         }
     }
 }
