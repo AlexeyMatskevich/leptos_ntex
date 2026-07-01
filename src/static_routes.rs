@@ -202,11 +202,8 @@ impl StaticRouteGenerator {
 /// custom status/headers (the body keeps serving from disk).
 static STATIC_HEADERS: LazyLock<RwLock<lru::LruCache<String, ResponseParts>>> =
     LazyLock::new(|| {
-        let capacity = std::env::var(STATIC_HEADERS_CAPACITY_ENV)
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .and_then(NonZeroUsize::new)
-            .unwrap_or(STATIC_HEADERS_DEFAULT_CAPACITY);
+        let capacity =
+            static_headers_capacity(std::env::var(STATIC_HEADERS_CAPACITY_ENV).ok().as_deref());
         RwLock::new(lru::LruCache::new(capacity))
     });
 
@@ -219,6 +216,18 @@ const STATIC_HEADERS_DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(10
 
 /// Environment variable that overrides [`STATIC_HEADERS_DEFAULT_CAPACITY`].
 const STATIC_HEADERS_CAPACITY_ENV: &str = "LEPTOS_STATIC_HEADERS_CACHE_SIZE";
+
+/// Resolves the [`STATIC_HEADERS`] LRU capacity from the raw
+/// `LEPTOS_STATIC_HEADERS_CACHE_SIZE` value (or `None` if unset): a missing,
+/// unparseable, or zero value falls back to
+/// [`STATIC_HEADERS_DEFAULT_CAPACITY`]; a valid positive value is used as-is.
+/// Extracted from the [`STATIC_HEADERS`] initializer so it is testable without
+/// mutating process-wide environment state.
+fn static_headers_capacity(raw: Option<&str>) -> NonZeroUsize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or(STATIC_HEADERS_DEFAULT_CAPACITY)
+}
 
 /// Whether a static render produced an ERROR status that must NOT be cached
 /// to disk. leptos takes this as its `was_404` / `was_error` hook: when it
@@ -524,6 +533,27 @@ async fn write_static_route(
     Ok(())
 }
 
+/// Test-only seam: fires exactly once, right after a successful on-demand
+/// regeneration's write completes and before the handler re-opens the file
+/// it just wrote. Lets a test deterministically inject a failure at that
+/// precise point (e.g. delete the file/root) instead of racing a background
+/// thread against OS task scheduling. `#[cfg(test)]`-gated end to end, so it
+/// costs nothing (not even the `Mutex`) outside the crate's own unit tests.
+///
+/// Keyed by `root` (each test uses its own uniquely-named `site_root`): the
+/// crate's own test suite runs `#[ntex::test]`s in parallel, and more than
+/// one of them exercises this same branch (any on-demand-regeneration test,
+/// not just the one that arms this hook) — an unkeyed "fires for the very
+/// next call" hook would let an unrelated concurrent request consume it at
+/// the wrong time. The call site only takes the hook when its own `root`
+/// matches, leaving a non-matching hook armed for whichever call it was
+/// actually meant for.
+#[cfg(test)]
+type RegenReopenTestHook = Option<(PathBuf, Box<dyn FnOnce() + Send>)>;
+#[cfg(test)]
+pub(crate) static REGEN_REOPEN_TEST_HOOK: std::sync::Mutex<RegenReopenTestHook> =
+    std::sync::Mutex::new(None);
+
 pub(crate) fn handle_static_route<IV, Err>(
     additional_context: impl Fn() + 'static + Clone + Send,
     app_fn: impl Fn() -> IV + Clone + Send + 'static,
@@ -618,6 +648,20 @@ where
                 // to an un-pregenerated static route. Mirrors `leptos_axum`
                 // (`ServeDir`) and `leptos_actix` (`NamedFile::open`).
                 if html.is_none() {
+                    #[cfg(test)]
+                    {
+                        let mut slot = REGEN_REOPEN_TEST_HOOK
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot
+                            .as_ref()
+                            .is_some_and(|(hook_root, _)| *hook_root == root)
+                        {
+                            let (_, hook) = slot.take().unwrap();
+                            drop(slot);
+                            hook();
+                        }
+                    }
                     let (reopened, paired_headers) = match ntex::rt::spawn_blocking({
                         let root = root.clone();
                         let path_buf = path_buf.clone();
@@ -782,6 +826,39 @@ mod tests {
         Some(Path::new(TEST_SITE_ROOT).join(rel))
     }
 
+    // ----- static_headers_capacity: exhaustive spec ---------------------
+    // The `LEPTOS_STATIC_HEADERS_CACHE_SIZE` contract documented on
+    // `STATIC_HEADERS`: missing, unparseable, or zero -> the crate default;
+    // a valid positive value -> used as-is. Extracted to a plain function of
+    // `Option<&str>` so every branch is testable without mutating (or racing
+    // on) process-wide environment state.
+    lets_expect! {
+        expect(static_headers_capacity(raw)) as the_resolved_capacity {
+            let raw: Option<&str> = None;
+
+            to falls_back_to_the_default_when_missing {
+                equal(STATIC_HEADERS_DEFAULT_CAPACITY)
+            }
+
+            when the_value_is_unparseable {
+                let raw = Some("not_a_number");
+                to falls_back_to_the_default { equal(STATIC_HEADERS_DEFAULT_CAPACITY) }
+            }
+
+            when the_value_is_zero {
+                let raw = Some("0");
+                to falls_back_to_the_default { equal(STATIC_HEADERS_DEFAULT_CAPACITY) }
+            }
+
+            when the_value_is_a_valid_positive_number {
+                let raw = Some("64");
+                to is_used_as_the_capacity {
+                    equal(NonZeroUsize::new(64).unwrap())
+                }
+            }
+        }
+    }
+
     // ----- is_conditional_or_range_status: exhaustive spec --------------
     // The predicate that keeps a captured `ResponseOptions` status from
     // clobbering the status `NamedFile` derived from THIS request's
@@ -831,6 +908,15 @@ mod tests {
                 let status = StatusCode::INTERNAL_SERVER_ERROR;
                 to is_not_protected { be_false }
             }
+
+            // Adjacent to (but distinct from) the protected 400/416 cluster.
+            // Pins that this is an EXACT five-way enumeration, not a numeric
+            // range check — a range rewrite (e.g. "400..=416") would still
+            // pass every leaf above but wrongly protect 405 too.
+            when the_status_is_405_method_not_allowed {
+                let status = StatusCode::METHOD_NOT_ALLOWED;
+                to is_not_protected { be_false }
+            }
         }
     }
 
@@ -867,6 +953,17 @@ mod tests {
                 let path = "//about";
                 to collapses_them_and_resolves_the_html_file {
                     equal(under_site_root("about.html"))
+                }
+            }
+
+            // The segment loop skips every empty split (`if segment.is_empty()
+            // { continue; }`), so a redundant slash is NOT special-cased to the
+            // leading position — an interior doubled "/" collapses exactly like
+            // a leading one, rather than being rejected as malformed input.
+            when the_path_has_a_redundant_interior_slash {
+                let path = "/blog//post-1";
+                to collapses_it_and_resolves_the_same_file_as_a_single_slash {
+                    equal(under_site_root("blog/post-1.html"))
                 }
             }
 
@@ -956,6 +1053,133 @@ mod tests {
             when a_segment_is_not_valid_utf8_after_decoding {
                 let path = "/file%FFname";
                 to is_rejected { be_none }
+            }
+        }
+    }
+
+    /// Throwaway per-test directory under the system temp dir, uniquely named
+    /// with pid + a process-local counter (a nanosecond clock alone collides
+    /// under parallel test runs — see the temp-path flakiness fixed elsewhere
+    /// in this crate).
+    fn temp_dir_for(name: &str) -> PathBuf {
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "leptos_ntex_{name}_{}_{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    // ----- validate_static_parent: exhaustive spec ----------------------
+    // Guards `write_static_route` against writing outside `site_root`: `Ok`
+    // when the resolved file's parent is under the root, and
+    // `Err(InvalidInput)` when the candidate path has no parent at all. The
+    // third state — `Err(PermissionDenied)` when the parent is reached only
+    // after a symlink resolves outside the root — needs a real OS symlink and
+    // is pinned separately by the Unix-only
+    // `validate_static_parent_rejects_a_symlinked_parent_outside_the_root`
+    // test below (a `#[cfg(unix)]` `when` leaf here would silently degrade to
+    // a plain missing-parent case on other platforms, for which `Ok` — not
+    // `PermissionDenied` — is the correct result, so it cannot share this
+    // spec's fixed assertion).
+    lets_expect! {
+        expect(validate_static_parent(&root, &file_path)) as the_validation_result {
+            let root = temp_dir_for("validate_parent_root");
+            let file_path = root.join("blog").join("post-1.html");
+
+            to allows_a_file_whose_parent_is_under_the_root { be_ok }
+
+            when the_candidate_path_has_no_parent {
+                let file_path = PathBuf::from("/");
+                to is_rejected_as_invalid_input {
+                    make(matches!(
+                        validate_static_parent(&root, &file_path),
+                        Err(ref e) if e.kind() == io::ErrorKind::InvalidInput
+                    )) be_true
+                }
+            }
+        }
+    }
+
+    // Inverting or dropping the `!canon_parent.starts_with(&canon_root)`
+    // check in `validate_static_parent` would let a symlinked directory
+    // escape `site_root` silently — this pins the guard directly. Unix-only:
+    // needs a real symlink (`std::os::windows::fs::symlink_dir` requires
+    // elevated privileges, so there is no unprivileged Windows equivalent),
+    // mirroring `traversal_symlink_escape_rejected` in
+    // `src/tests/file_fallback.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn validate_static_parent_rejects_a_symlinked_parent_outside_the_root() {
+        let root = temp_dir_for("validate_parent_root_symlink");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp_dir_for("validate_parent_outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("escape");
+        // Must NOT be `let _ =`: if symlink creation fails, `link` would
+        // stay a missing path and `validate_static_parent` would legitimately
+        // return `Ok` after creating it as a plain directory, making the
+        // assertion below pass vacuously without exercising the symlink-
+        // escape guard at all. Fail loud instead.
+        std::os::unix::fs::symlink(&outside, &link)
+            .expect("symlink fixture must be created for this test to be meaningful");
+        let file_path = link.join("page.html");
+
+        assert!(
+            matches!(
+                validate_static_parent(&root, &file_path),
+                Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied
+            ),
+            "a parent reached only via a symlink resolving outside root must be rejected"
+        );
+    }
+
+    // ----- validate_static_file: exhaustive spec ------------------------
+    // Guards the SERVE side: `Some(canon_target)` when the resolved file is
+    // under `root`, `None` when `root` itself cannot be canonicalized (e.g.
+    // missing), and `None` when the target — again possibly only via a
+    // symlink — canonicalizes outside `root`. A regression dropping the
+    // `.then_some(canon_target)` guard (always `Some` regardless of
+    // `starts_with`) would let a symlink-escaped file be served under the
+    // wrong `site_root`; the escape leaf below pins that this cannot happen.
+    lets_expect! {
+        expect(validate_static_file(&root, &file_path)) as the_validated_file {
+            // `root` is created (as a directory that exists on disk) ONLY in
+            // the happy path's own `let`; the missing-root context below
+            // overrides `root` with a path nobody creates, so it stays absent.
+            let root = {
+                let dir = temp_dir_for("validate_file_root");
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            };
+            let file_path = {
+                let target = root.join("page.html");
+                fs::write(&target, b"hello").unwrap();
+                target
+            };
+
+            to returns_the_canonicalized_file_under_the_root {
+                equal(Some(root.canonicalize().unwrap().join("page.html")))
+            }
+
+            when the_root_does_not_exist {
+                let root = temp_dir_for("validate_file_missing_root");
+                let file_path = root.join("page.html");
+                to is_none { be_none }
+            }
+
+            when the_file_is_a_symlink_that_resolves_outside_the_root {
+                let file_path = {
+                    let outside = temp_dir_for("validate_file_outside");
+                    fs::create_dir_all(&outside).unwrap();
+                    let outside_target = outside.join("secret.html");
+                    fs::write(&outside_target, b"secret").unwrap();
+                    let link = root.join("escape.html");
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+                    link
+                };
+                to is_none_because_the_target_escapes_the_root { be_none }
             }
         }
     }
@@ -1094,5 +1318,110 @@ mod tests {
             static_write_lock(&via_index),
         ));
         assert_eq!(static_header_key(&via_slash), static_header_key(&via_index));
+    }
+
+    /// A unique `LeptosOptions` (distinct `site_root`) per call, so each test
+    /// below gets its own `STATIC_HEADERS` key space — `site_root` is part of
+    /// the cache key (see `STATIC_HEADERS`'s doc comment), so tests running in
+    /// parallel never share an entry.
+    fn unique_options(name: &str) -> LeptosOptions {
+        let root = temp_dir_for(name);
+        LeptosOptions::builder()
+            .output_name(name)
+            .site_root(root.to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build()
+    }
+
+    // `write_static_route` + `open_paired_static_file`, called directly
+    // (not through the full HTTP handler): `Some(response_options)` must
+    // write the file to disk AND populate the `STATIC_HEADERS` cache under
+    // the resolved file's key, so a subsequent paired open returns both the
+    // file and the captured snapshot. Closes the gap where neither helper had
+    // a direct call+assertion in this file.
+    #[ntex::test]
+    async fn write_static_route_with_response_options_caches_the_snapshot() {
+        let options = unique_options("write_static_route_some");
+        let response_options = ResponseOptions::default();
+        response_options.set_status(StatusCode::CREATED);
+
+        write_static_route(
+            &options,
+            Some(response_options),
+            "/page",
+            "hello".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let root = PathBuf::from(&*options.site_root);
+        let file_path = static_path(&options, "/page").unwrap();
+        let header_key = static_header_key(&file_path);
+
+        let (opened, headers) = open_paired_static_file(&root, &file_path, &header_key);
+        assert!(
+            opened.is_some(),
+            "the file must exist on disk after write_static_route"
+        );
+        assert_eq!(
+            headers.and_then(|parts| parts.status),
+            Some(StatusCode::CREATED),
+            "the captured status must be readable back through open_paired_static_file"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The `None` counterpart: `write_static_route` must still write the file
+    // when no `ResponseOptions` was captured (a plain default-status render),
+    // but must NOT insert a `STATIC_HEADERS` entry for it — a regression that
+    // wrote to the cache even on `None` would make an unrelated later request
+    // to the same path observe a snapshot that was never actually captured.
+    #[ntex::test]
+    async fn write_static_route_without_response_options_caches_nothing() {
+        let options = unique_options("write_static_route_none");
+
+        write_static_route(&options, None, "/page", "hello".to_string())
+            .await
+            .unwrap();
+
+        let root = PathBuf::from(&*options.site_root);
+        let file_path = static_path(&options, "/page").unwrap();
+        let header_key = static_header_key(&file_path);
+
+        let (opened, headers) = open_paired_static_file(&root, &file_path, &header_key);
+        assert!(
+            opened.is_some(),
+            "the file must still be written to disk with no captured ResponseOptions"
+        );
+        assert!(
+            headers.is_none(),
+            "no STATIC_HEADERS entry must exist when response_options was None"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // `open_paired_static_file` on a path whose file was never written (no
+    // regeneration happened yet) must report a clean miss on BOTH halves of
+    // the pair, not just the file — a real cache hit is defined as
+    // `opened.is_some()`, so headers must never be populated when the file
+    // itself is absent.
+    #[ntex::test]
+    async fn open_paired_static_file_reports_a_clean_miss_for_an_absent_file() {
+        let options = unique_options("open_paired_missing");
+        let root = PathBuf::from(&*options.site_root);
+        fs::create_dir_all(&root).unwrap();
+        let file_path = static_path(&options, "/never-written").unwrap();
+        let header_key = static_header_key(&file_path);
+
+        let (opened, headers) = open_paired_static_file(&root, &file_path, &header_key);
+        assert!(opened.is_none(), "an absent file must not open");
+        assert!(
+            headers.is_none(),
+            "headers must not be reported for a file that failed to open"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
