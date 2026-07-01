@@ -653,7 +653,13 @@ mod tests {
         // (unlike `/`), so this materializes the backslash-guard rejection
         // leaf's target on disk too: without the guard, the decoded segment
         // `foo\bar` would actually resolve to this file instead of being
-        // rejected by "file absent".
+        // rejected by "file absent". Unix-only: on Windows, `\` in a `Path`
+        // component is a directory separator, so `root.join("foo\\bar")`
+        // would try to create a `foo` subdirectory instead of a same-level
+        // file named `foo\bar`, and the backslash leaf's own rejection would
+        // pass vacuously there regardless (the guard itself is not
+        // platform-specific — only this stronger fixture is).
+        #[cfg(unix)]
         std::fs::write(root.join("foo\\bar"), "backslash-target").unwrap();
         let canon_root = root.canonicalize().unwrap();
         let resolved = safe_subpath(&canon_root, path).is_some();
