@@ -195,6 +195,17 @@ fn safe_subpath(canon_root: &Path, raw_path: &str) -> Option<PathBuf> {
     }
     let candidate = canon_root.join(&rel);
     let canon_target = candidate.canonicalize().ok()?;
+    if !canon_target.is_file() {
+        // Rejects a bare-root request (`""` / `"/"`, where every split
+        // segment is empty and `rel` stays empty so `candidate` resolves to
+        // `canon_root` itself) as well as any other directory target, so the
+        // caller never hands a directory fd to `NamedFile::open` — which
+        // would succeed on Unix (`std::fs::File::open` opens directories)
+        // and be treated as an openable file instead of falling through to
+        // the 404 shell. Matches `ntex_files::Files`, which explicitly
+        // guards `path.is_dir()` before opening.
+        return None;
+    }
     canon_target.starts_with(canon_root).then_some(canon_target)
 }
 
@@ -516,10 +527,14 @@ mod tests {
     // prior layer already set, and must leave a wildcard `Vary: *` alone. A
     // fresh response (default) can't distinguish the dedup branch from a
     // blanket append — only a pre-existing Vary does — so both non-default
-    // contexts carry one.
-    fn vary_after_precompress(existing_vary: Option<&'static str>) -> Vec<String> {
+    // contexts carry one. `existing_vary` is a list of separately-appended
+    // Vary header LINES (not one comma-joined value) — `.header()` on the
+    // builder appends, so this also exercises `get_all`'s cross-line
+    // iteration, matching how multiple middlewares each calling `.append`
+    // would show up on the wire.
+    fn vary_after_precompress(existing_vary: &'static [&'static str]) -> Vec<String> {
         let mut builder = ntex::web::HttpResponse::Ok();
-        if let Some(v) = existing_vary {
+        for v in existing_vary {
             builder.header(header::VARY, HeaderValue::from_static(v));
         }
         let mut res = builder.finish();
@@ -534,21 +549,21 @@ mod tests {
 
     lets_expect! {
         expect(vary_after_precompress(existing)) as the_precompressed_vary_header {
-            let existing: Option<&'static str> = None;
+            let existing: &'static [&'static str] = &[];
 
             to appends_accept_encoding_once {
                 equal(vec!["Accept-Encoding".to_string()])
             }
 
             when accept_encoding_is_already_advertised {
-                let existing: Option<&'static str> = Some("Accept-Encoding");
+                let existing: &'static [&'static str] = &["Accept-Encoding"];
                 to is_not_duplicated {
                     equal(vec!["Accept-Encoding".to_string()])
                 }
             }
 
             when a_wildcard_vary_is_present {
-                let existing: Option<&'static str> = Some("*");
+                let existing: &'static [&'static str] = &["*"];
                 to leaves_the_wildcard_untouched {
                     equal(vec!["*".to_string()])
                 }
@@ -558,15 +573,47 @@ mod tests {
             // token, so neither a lowercase value nor `Accept-Encoding` buried
             // in a list gets a duplicate appended.
             when accept_encoding_is_already_advertised_in_lowercase {
-                let existing: Option<&'static str> = Some("accept-encoding");
+                let existing: &'static [&'static str] = &["accept-encoding"];
                 to is_not_duplicated_case_insensitively {
                     equal(vec!["accept-encoding".to_string()])
                 }
             }
 
             when accept_encoding_is_one_token_in_a_comma_list {
-                let existing: Option<&'static str> = Some("Origin, Accept-Encoding");
+                let existing: &'static [&'static str] = &["Origin, Accept-Encoding"];
                 to is_not_duplicated_within_the_list {
+                    equal(vec!["Origin".to_string(), "Accept-Encoding".to_string()])
+                }
+            }
+
+            // An empty existing Vary value is a distinct no-type-domain
+            // state: an already-set-but-vacuous header some middleware might
+            // leave behind. It contributes no dedup-relevant token, so the
+            // append still happens — asserted as an exact two-element
+            // result (not just "contains Accept-Encoding"), pinning that the
+            // empty split token is preserved rather than silently dropped.
+            when the_existing_vary_value_is_empty {
+                let existing: &'static [&'static str] = &[""];
+                to still_appends_accept_encoding {
+                    equal(vec!["".to_string(), "Accept-Encoding".to_string()])
+                }
+            }
+
+            when the_existing_vary_value_is_whitespace_only {
+                let existing: &'static [&'static str] = &["   "];
+                to still_appends_accept_encoding {
+                    equal(vec!["".to_string(), "Accept-Encoding".to_string()])
+                }
+            }
+
+            // Two separately-appended Vary header LINES (as multiple
+            // middlewares calling `.append` would produce), not one
+            // comma-joined value — exercises `get_all`'s iteration across
+            // distinct header instances rather than just `split(',')`
+            // within a single line.
+            when accept_encoding_is_already_advertised_on_a_separate_vary_line {
+                let existing: &'static [&'static str] = &["Origin", "Accept-Encoding"];
+                to is_not_duplicated_across_lines {
                     equal(vec!["Origin".to_string(), "Accept-Encoding".to_string()])
                 }
             }
@@ -602,6 +649,18 @@ mod tests {
         // `..` traversal out of `.well-known`.
         std::fs::write(root.join(".well-known/.secret"), "nested-secret").unwrap();
         std::fs::write(root.join("public.txt"), "public").unwrap();
+        // A literal backslash is a legal filename byte on Unix filesystems
+        // (unlike `/`), so this materializes the backslash-guard rejection
+        // leaf's target on disk too: without the guard, the decoded segment
+        // `foo\bar` would actually resolve to this file instead of being
+        // rejected by "file absent". Unix-only: on Windows, `\` in a `Path`
+        // component is a directory separator, so `root.join("foo\\bar")`
+        // would try to create a `foo` subdirectory instead of a same-level
+        // file named `foo\bar`, and the backslash leaf's own rejection would
+        // pass vacuously there regardless (the guard itself is not
+        // platform-specific — only this stronger fixture is).
+        #[cfg(unix)]
+        std::fs::write(root.join("foo\\bar"), "backslash-target").unwrap();
         let canon_root = root.canonicalize().unwrap();
         let resolved = safe_subpath(&canon_root, path).is_some();
         let _ = std::fs::remove_dir_all(&root);
@@ -631,6 +690,32 @@ mod tests {
                 // dotfile — `public.txt` exists on disk, so a dropped `..`
                 // guard would actually resolve it.
                 let path = "/.well-known/../public.txt";
+                to is_rejected { be_false }
+            }
+
+            // Regression: every split segment of a bare root is empty and
+            // skipped, so `rel` stayed empty and `candidate` resolved to
+            // `canon_root` itself — a directory, which `canonicalize()`
+            // and `starts_with` both accept trivially. Without the
+            // `is_file()` guard this returned `Some(canon_root)`, and
+            // `open_static_file` would hand that directory to
+            // `NamedFile::open`, which succeeds on Unix.
+            when the_path_is_the_bare_root_with_a_leading_slash {
+                let path = "/";
+                to is_rejected { be_false }
+            }
+
+            when the_path_is_a_bare_root_with_no_leading_slash {
+                let path = "";
+                to is_rejected { be_false }
+            }
+
+            // The documented backslash-rejection guard (`s.contains('\\')`)
+            // has a dedicated branch but was never exercised by any leaf: a
+            // percent-encoded backslash smuggled inside a segment must be
+            // rejected just like a literal `..` traversal would be.
+            when a_percent_encoded_backslash_is_smuggled_in_a_segment {
+                let path = "/foo%5Cbar";
                 to is_rejected { be_false }
             }
         }
@@ -789,6 +874,82 @@ mod tests {
             when a_token_is_refused_then_re_offered {
                 let accept_encoding: &[&str] = &["br;q=0, br;q=0.9"];
                 to takes_the_last_weight_and_accepts { equal(vec!["br"]) }
+            }
+
+            // A leading/trailing/doubled comma produces an empty
+            // `split(',')` item; `token` becomes `""`, which must match
+            // neither the `br`/`gzip` branches nor the `*` wildcard branch —
+            // it is silently ignored, not silently accepted. These three
+            // leaves deliberately offer ONLY `gzip` (never `br`), so a
+            // regression that let the empty token wrongly match the
+            // wildcard branch (e.g. `token.is_empty() || token == "*"`)
+            // would backfill `br` too and diverge from the expected
+            // single-element result — a fixture that also offered `br`
+            // explicitly would pass either way and not isolate the bug.
+            when the_header_has_a_leading_comma {
+                let accept_encoding: &[&str] = &[",gzip"];
+                to ignores_the_leading_empty_item_and_does_not_backfill_brotli {
+                    equal(vec!["gzip"])
+                }
+            }
+
+            when the_header_has_a_trailing_comma {
+                let accept_encoding: &[&str] = &["gzip,"];
+                to ignores_the_trailing_empty_item_and_does_not_backfill_brotli {
+                    equal(vec!["gzip"])
+                }
+            }
+
+            when the_header_has_a_whitespace_only_item {
+                let accept_encoding: &[&str] = &["gzip,   "];
+                to ignores_the_whitespace_only_item_and_does_not_backfill_brotli {
+                    equal(vec!["gzip"])
+                }
+            }
+        }
+    }
+
+    // A header line whose bytes fail `HeaderValue::to_str` (not valid
+    // visible ASCII) must be SKIPPED — not treated as a reason to abandon
+    // parsing the other, well-formed header lines. Constructed directly via
+    // `HeaderValue::from_bytes`, since a `&str` literal can never carry
+    // invalid bytes.
+    fn preference_with_raw_headers(values: &[HeaderValue]) -> Vec<&'static str> {
+        let mut req = ntex::web::test::TestRequest::default();
+        for value in values {
+            req = req.header(header::ACCEPT_ENCODING, value.clone());
+        }
+        precompressed_preference(accepted_encodings(&req.to_http_request()))
+            .into_iter()
+            .map(Precompressed::header_value)
+            .collect()
+    }
+
+    lets_expect! {
+        expect(preference_with_raw_headers(&values)) as the_encoding_preference_with_malformed_header_bytes {
+            let values: Vec<HeaderValue> = vec![HeaderValue::from_static("br")];
+
+            to accepts_the_one_well_formed_line { equal(vec!["br"]) }
+
+            when a_non_utf8_line_precedes_a_well_formed_one {
+                // `to_str()` rejects any non-visible-ASCII byte (see
+                // `HeaderValue::to_str`), so `0xFF` alone is enough to make
+                // this line fail to parse as a string.
+                let values: Vec<HeaderValue> = vec![
+                    HeaderValue::from_bytes(&[0xFF]).unwrap(),
+                    HeaderValue::from_static("br"),
+                ];
+                to skips_only_the_malformed_line_and_still_accepts_the_valid_one {
+                    equal(vec!["br"])
+                }
+            }
+
+            when a_non_utf8_line_follows_a_well_formed_one {
+                let values: Vec<HeaderValue> = vec![
+                    HeaderValue::from_static("gzip"),
+                    HeaderValue::from_bytes(&[0xFF]).unwrap(),
+                ];
+                to still_accepts_the_earlier_valid_line { equal(vec!["gzip"]) }
             }
         }
     }
