@@ -711,19 +711,38 @@ where
                     ] {
                         options.headers.remove(key);
                     }
-                    // `NamedFile::into_response` also derives the response
-                    // STATUS from this request's validators and `Range`:
-                    // `304`/`412` for a conditional GET, `206`/`416` for a
-                    // range request, `400` for a malformed `Range` header. A
-                    // captured status describes the *full* representation (e.g.
-                    // an app-set `201`); letting it overwrite one of those would
-                    // break the caching / range contract — a client sending
-                    // `If-None-Match` would get a `201` with an empty body
-                    // instead of `304`. Drop the captured status on those
-                    // responses so `NamedFile` wins; a plain `200 OK` full serve
-                    // still takes the app's status.
+                    // `NamedFile::into_response` also derives the response STATUS
+                    // from this request's validators and `Range`: `304`/`412` for
+                    // a conditional GET, `206`/`416` for a range request, `400`
+                    // for a malformed `Range` header.
                     if is_conditional_or_range_status(res.0.status()) {
-                        options.status = None;
+                        match options.status {
+                            // A captured *success* status describes the full
+                            // representation (e.g. an app-set `201`); letting it
+                            // overwrite one of the above would break the caching /
+                            // range contract — a conditional GET would get `201`
+                            // with an empty body instead of `304`. Drop it so
+                            // `NamedFile`'s status wins.
+                            Some(status) if status.is_success() => {
+                                options.status = None;
+                            }
+                            // A captured redirect (`302` + `Location` from
+                            // `redirect()`, which SSG caches because
+                            // `was_error_status` skips only 4xx/5xx) is not a
+                            // representation status and must still fire. But
+                            // `NamedFile`'s `res` carries range/conditional
+                            // artifacts (a `206`'s `Content-Range` + partial file
+                            // body) that a redirect must not, so rebuild an
+                            // empty-bodied response of the captured status; its
+                            // non-framing snapshot headers (`Location`, cookies,
+                            // custom `x-*`) are applied below. `options.status` is
+                            // cleared because the status now lives on `res`.
+                            Some(status) => {
+                                res = NtexResponse(HttpResponse::build(status).finish());
+                                options.status = None;
+                            }
+                            None => {}
+                        }
                     }
                 }
                 res.extend_response_parts(options);
