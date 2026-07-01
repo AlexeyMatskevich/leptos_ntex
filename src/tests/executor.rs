@@ -32,8 +32,32 @@ fn generate_routes_without_a_ntex_runtime() {
 // off any ntex arbiter — NOT executor initialization (which this leaf does not
 // observe). The clean-start install success is pinned out-of-process by
 // `tests/executor_clean_start.rs`.
+//
+// NOR does this leaf (or any other test in this file) observe the
+// arbiter-PRESENT case: that is exercised elsewhere in the suite instead —
+// `src/tests/rendering.rs` and `src/tests/server_fn_http.rs` call
+// `gen_route_list` from `#[ntex::test]`s, and `tests/integration.rs` calls
+// `generate_route_list` directly inside `#[ntex::test]` — so
+// `ensure_executor_initialized`/`init_ntex_executor` are also exercised from
+// inside a running ntex arbiter, just not documented or pinned in this file.
 lets_expect! {
     expect(generate_routes_without_a_ntex_runtime()) as route_generation_without_a_ntex_runtime {
+        to not_panic
+    }
+}
+
+// ----- ForeignInstalled diagnostic branch -----------------------------
+// `ensure_executor_initialized()`'s `Once` closure only reaches the
+// diagnostic-formatting branch (`emit_foreign_executor_diagnostic`) once per
+// process, on whichever test happens to touch the executor first — not
+// something a `when` in a shared test binary can force deterministically
+// (see `repeated_executor_init` below). `emit_foreign_executor_diagnostic`
+// is factored out precisely so this branch can be pinned directly, against
+// a synthetic error, independent of the process-global executor race.
+lets_expect! {
+    expect(crate::routes::emit_foreign_executor_diagnostic(
+        &any_spawner::ExecutorError::AlreadySet,
+    )) as the_foreign_executor_diagnostic {
         to not_panic
     }
 }

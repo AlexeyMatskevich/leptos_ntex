@@ -743,6 +743,24 @@ where
     crate::generate_route_list_with_exclusions(app_fn, excluded)
 }
 
+/// Serialized [`generate_route_list_with_exclusions_and_ssg_and_context`] —
+/// see [`ROUTE_GEN_VS_RENDER`].
+pub(super) fn gen_route_list_with_exclusions_and_ssg_and_context<IV>(
+    app_fn: impl Fn() -> IV + 'static + Send + Clone,
+    excluded_routes: Option<Vec<String>>,
+    additional_context: impl Fn() + 'static + Send + Clone,
+) -> (Vec<crate::NtexRouteListing>, crate::StaticRouteGenerator)
+where
+    IV: leptos::IntoView + 'static,
+{
+    let _guard = gen_write_guard();
+    crate::generate_route_list_with_exclusions_and_ssg_and_context(
+        app_fn,
+        excluded_routes,
+        additional_context,
+    )
+}
+
 mod executor;
 mod file_fallback;
 mod rendering;
