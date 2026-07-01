@@ -32,8 +32,11 @@ async fn recv_ws_frame<E: std::fmt::Debug>(
 /// connection, the bridge must notice the disconnect and release its
 /// input-sender clone, so the server fn sees EOF and its OUTPUT stream is
 /// dropped. The sibling state of the shutdown axis — the SERVER ending its
-/// output first — is pinned by `websocket_close_is_echoed` (the bridge
-/// sends `Close` when the output channel ends).
+/// output first, with the CLIENT never closing — is pinned by
+/// `websocket_bridge_sends_unprompted_close_when_output_stream_ends_first`
+/// (the bridge sends an unprompted `Close(None)` when the output channel
+/// ends on its own). `websocket_close_is_echoed` is a DIFFERENT state: the
+/// client sends `Close` first and the bridge echoes it back.
 #[ntex::test]
 async fn websocket_client_close_releases_the_server_fn_output_stream() {
     use std::sync::atomic::Ordering;
@@ -305,6 +308,63 @@ async fn websocket_fragmented_text_with_invalid_utf8_closes_with_invalid() {
             );
         }
         other => panic!("expected Close(Invalid) on invalid-UTF-8 text, got {other:?}"),
+    }
+}
+
+/// A reassembled `Last` frame that is SIMULTANEOUSLY over the payload limit
+/// AND invalid UTF-8: production code checks the overflow condition
+/// (`LastAction::Overflow`) strictly BEFORE the UTF-8 validation, which only
+/// runs inside `LastAction::Complete`. A doubly-violating frame must
+/// therefore close with `CloseCode::Size` (1009), not `CloseCode::Invalid`
+/// (1007) — pinning this precedence directly, since the existing tests only
+/// ever violate one axis at a time.
+#[ntex::test]
+async fn websocket_last_fragment_over_limit_and_invalid_utf8_closes_with_size() {
+    use crate::LeptosServerFnConfig;
+    use ntex::ws::{CloseCode, Item};
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 4,
+                ws_channel_buffer: 16,
+                ..Default::default()
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    // First(2) installs the buffer under the 4-byte limit; Last(4) carries
+    // the running total to 6 > 4 (overflow) AND its bytes (0xFF, invalid
+    // UTF-8 anywhere) would also fail validation if reached.
+    sink.send(ws::Message::Continuation(Item::FirstText(
+        vec![b'a', b'b'].into(),
+    )))
+    .await
+    .unwrap();
+    sink.send(ws::Message::Continuation(Item::Last(
+        vec![0xffu8, 0xfeu8, b'c', b'd'].into(),
+    )))
+    .await
+    .unwrap();
+
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Close(Some(reason)) => {
+            assert_eq!(
+                reason.code,
+                CloseCode::Size,
+                "overflow must win over the UTF-8 check on a doubly-violating frame, got {:?}",
+                reason.code
+            );
+        }
+        other => panic!("expected Close(Size) on a doubly-violating Last frame, got {other:?}"),
     }
 }
 
@@ -830,6 +890,52 @@ async fn websocket_configured_subprotocol_is_echoed_when_offered() {
     conn.sink().send(ws::Message::Close(None)).await.unwrap();
 }
 
+/// Multi-protocol offer sibling: `web::ws::subprotocols` yields ALL offered
+/// values, but every other test here offers a set of size 0 or 1. This
+/// offers TWO protocols with the configured one present but NOT first — a
+/// regression that only checked the first offered protocol (rather than
+/// `.any(...)` over all offered) would pass every other test in this file
+/// but silently break a real multi-protocol client.
+#[ntex::test]
+async fn websocket_configured_subprotocol_is_echoed_when_offered_among_several() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 1024,
+                ws_channel_buffer: 16,
+                ws_subprotocol: Some("graphql-ws"),
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let mut builder = ntex::ws::WsClient::builder(srv.url(EchoWebsocket::PATH));
+    builder
+        .address(srv.addr())
+        .timeout(ntex::time::Seconds(60))
+        .protocols(["other-ws", "graphql-ws"]);
+    let client = builder
+        .build(ntex::SharedCfg::new("ws-subprotocol-multi-test"))
+        .await
+        .unwrap();
+    let conn = client.connect().await.unwrap();
+
+    assert_eq!(
+        conn.response()
+            .headers()
+            .get(ntex::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok()),
+        Some("graphql-ws"),
+        "server must select the configured subprotocol even when it is not the first offered"
+    );
+
+    conn.sink().send(ws::Message::Close(None)).await.unwrap();
+}
+
 #[ntex::test]
 async fn websocket_configured_subprotocol_is_not_echoed_unless_offered() {
     use crate::LeptosServerFnConfig;
@@ -1033,4 +1139,280 @@ async fn websocket_configured_subprotocol_is_not_echoed_for_a_different_offer() 
     );
 
     conn.sink().send(ws::Message::Close(None)).await.unwrap();
+}
+
+/// The combination no other test exercises: `ws_subprotocol` left at its
+/// default `None` AND the client actually offers a protocol. A regression
+/// treating `None` as "accept whatever the client offers" (e.g. echoing the
+/// first offered protocol whenever the config has none configured) would
+/// pass every existing test in this file, since none of them offers a
+/// protocol while the config's `ws_subprotocol` is `None`.
+#[ntex::test]
+async fn websocket_no_configured_subprotocol_is_not_echoed_even_when_client_offers_one() {
+    register_explicit::<EchoWebsocket>();
+
+    // Default app config: `ws_subprotocol` is `None`.
+    let srv =
+        test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let mut builder = ntex::ws::WsClient::builder(srv.url(EchoWebsocket::PATH));
+    builder
+        .address(srv.addr())
+        .timeout(ntex::time::Seconds(60))
+        .protocols(["graphql-ws"]);
+    let client = builder
+        .build(ntex::SharedCfg::new("ws-subprotocol-none-config"))
+        .await
+        .unwrap();
+    let conn = client.connect().await.unwrap();
+
+    assert!(
+        conn.response()
+            .headers()
+            .get(ntex::http::header::SEC_WEBSOCKET_PROTOCOL)
+            .is_none(),
+        "with no configured subprotocol, the response must not select one even if the client offers it"
+    );
+
+    conn.sink().send(ws::Message::Close(None)).await.unwrap();
+}
+
+// ----- ws_channel_buffer: lossless delivery under a minimal buffer -----
+
+/// This test does NOT force the bounded `ws_channel_buffer` channel to be
+/// genuinely full at send time (the ntex test client's frame reader drains
+/// the wire into an unbounded local queue regardless of whether the test
+/// calls `rx.recv()`, so simply deferring reads never backs up the server
+/// side). It only pins ordered, lossless echo under a minimal
+/// (`ws_channel_buffer: 1`) configuration: sends 20 messages back-to-back
+/// against a channel buffer of 1 BEFORE reading any reply, then drains and
+/// asserts all 20 arrive, in order, none lost. The sibling test
+/// `websocket_slow_producer_without_losing_or_reordering_messages` below
+/// pins the same lossless-delivery property from the opposite angle (a
+/// naturally slow producer instead of a fast burst) — see that test's doc
+/// comment for why this crate's bounded channels turn out to be
+/// unobservable as an actual bottleneck through this local-loopback
+/// harness in either direction, so neither test can claim to pin genuine
+/// full-buffer backpressure.
+#[ntex::test]
+async fn websocket_bursts_more_messages_than_the_channel_buffer_without_losing_any() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<EchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 1024,
+                ws_channel_buffer: 1,
+                ws_subprotocol: None,
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let conn = srv.ws_at(EchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    let messages: Vec<String> = (0..20).map(|i| format!("msg-{i}")).collect();
+    for message in &messages {
+        sink.send(ws::Message::Binary(serialize_ws_ok(message).into()))
+            .await
+            .unwrap();
+    }
+
+    for expected in &messages {
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(
+                    &echoed, expected,
+                    "messages must arrive in order with none lost or reordered"
+                );
+            }
+            other => panic!("expected a Binary echo, got {other:?}"),
+        }
+    }
+
+    sink.send(ws::Message::Close(None)).await.unwrap();
+}
+
+/// A server-fn that echoes each input item back, but only after an
+/// artificial per-item delay — a deliberately slow PRODUCER of the output
+/// stream that the server-fn runtime forwards into the bounded
+/// `response_sink_tx` channel (`request.rs`). Investigating what this
+/// fixture can pin (see the doc comment on
+/// `websocket_slow_producer_without_losing_or_reordering_messages` below)
+/// established that neither direction's `ws_channel_buffer` capacity is
+/// actually the bottleneck in this local-loopback harness: the pacing here
+/// comes entirely from this fixture's own delay, not from the channel
+/// filling up. It is kept as a real, narrower regression pin for lossless,
+/// ordered delivery when the producer is naturally slow.
+#[server(
+    name = SlowEchoWebsocket,
+    prefix = "/api",
+    endpoint = "slow_echo_websocket",
+    protocol = server_fn::Websocket<server_fn::codec::JsonEncoding, server_fn::codec::JsonEncoding>,
+    server = crate::NtexServerFnBackend
+)]
+async fn slow_echo_websocket(
+    input: server_fn::BoxedStream<String, ServerFnError>,
+) -> Result<server_fn::BoxedStream<String, ServerFnError>, ServerFnError> {
+    use futures::StreamExt;
+
+    let input: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<String, ServerFnError>> + Send>,
+    > = input.into();
+    Ok(input
+        .then(|item| async move {
+            ntex::time::sleep(ntex::time::Millis(200)).await;
+            item
+        })
+        .into())
+}
+
+/// NOT a `ws_channel_buffer`-fullness test (see the fixture's doc comment):
+/// this crate's bounded channels turn out to be effectively unobservable as
+/// a bottleneck through a local-loopback single-client harness in EITHER
+/// direction —
+///
+/// - INBOUND: the WS frame-processing closure (`request.rs`) clones a fresh
+///   `mpsc::Sender` per frame, and `futures::channel::mpsc` guarantees every
+///   sender clone at least one reserved slot beyond the nominal buffer size,
+///   so a burst of sends never measurably fills the channel regardless of
+///   `ws_channel_buffer` (confirmed experimentally: swapping the inbound
+///   `tx.send(...).await` for a non-blocking `try_send(...)` did not change
+///   this test's outcome — every `try_send` succeeded immediately). See the
+///   "ADDITIONAL BUG FOUND" note in the accompanying change summary.
+/// - OUTBOUND: the bridge task's `outbound_sink.send(...).await` is a local,
+///   effectively non-blocking wire write (confirmed experimentally: setting
+///   `ws_channel_buffer` to 100 instead of 1 did not change this test's
+///   timing at all), so the channel almost never backs up regardless of
+///   whether the client is reading.
+///
+/// What IS pinned here: `SlowEchoWebsocket` is a naturally slow producer
+/// (one item every 200ms) with a client that sends a burst up front and
+/// only reads replies afterward. Despite the pacing mismatch, every message
+/// must still arrive, in order, with none lost.
+#[ntex::test]
+async fn websocket_slow_producer_without_losing_or_reordering_messages() {
+    use crate::LeptosServerFnConfig;
+
+    register_explicit::<SlowEchoWebsocket>();
+
+    let srv = test::server(async || {
+        NtexApp::new()
+            .state(LeptosServerFnConfig {
+                payload_limit: 1024,
+                ws_channel_buffer: 1,
+                ws_subprotocol: None,
+            })
+            .route("/api/{tail}*", handle_server_fns())
+    })
+    .await;
+
+    let conn = srv.ws_at(SlowEchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    let messages: Vec<String> = (0..5).map(|i| format!("slow-msg-{i}")).collect();
+
+    for message in &messages {
+        sink.send(ws::Message::Binary(serialize_ws_ok(message).into()))
+            .await
+            .unwrap();
+    }
+
+    // No message may be lost or reordered despite the producer's pacing.
+    for expected in &messages {
+        let frame = recv_ws_frame(&rx).await;
+        match frame {
+            ws::Frame::Binary(bytes) => {
+                let echoed: String = deserialize_ws_ok(&bytes);
+                assert_eq!(
+                    &echoed, expected,
+                    "messages must arrive in order with none lost or reordered \
+                     even from a naturally slow producer"
+                );
+            }
+            other => panic!("expected a Binary echo, got {other:?}"),
+        }
+    }
+
+    sink.send(ws::Message::Close(None)).await.unwrap();
+}
+
+// ----- unprompted server-side Close (output stream ends first) ---------
+
+/// A server-fn whose OUTPUT stream completes on its own after exactly two
+/// items — regardless of whether the client keeps sending or the connection
+/// stays open. Mirrors `EchoWebsocket`'s echo shape but bounds the output
+/// with `.take(2)`, so the outbound-sink task's `None => break` branch
+/// (`request.rs`, the `response_sink_rx.next()` arm) fires without any
+/// client-side close.
+#[server(
+    name = FiniteEchoWebsocket,
+    prefix = "/api",
+    endpoint = "finite_echo_websocket",
+    protocol = server_fn::Websocket<server_fn::codec::JsonEncoding, server_fn::codec::JsonEncoding>,
+    server = crate::NtexServerFnBackend
+)]
+async fn finite_echo_websocket(
+    input: server_fn::BoxedStream<String, ServerFnError>,
+) -> Result<server_fn::BoxedStream<String, ServerFnError>, ServerFnError> {
+    use futures::StreamExt;
+
+    let input: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<String, ServerFnError>> + Send>,
+    > = input.into();
+    Ok(input.take(2).into())
+}
+
+/// A doc comment on `websocket_client_close_releases_the_server_fn_output_stream`
+/// claims the sibling "server ends output first" state is pinned by
+/// `websocket_close_is_echoed` — but that test only exercises the CLIENT
+/// sending `Close`, never the bridge's OWN unprompted `Close(None)` when the
+/// server-fn output stream ends naturally while the client stays connected.
+/// This drives that case directly: `FiniteEchoWebsocket` completes its
+/// output after two echoed messages, and the client — which never sends a
+/// `Close` itself — must still receive an unprompted `Close(None)` once the
+/// output stream ends.
+#[ntex::test]
+async fn websocket_bridge_sends_unprompted_close_when_output_stream_ends_first() {
+    register_explicit::<FiniteEchoWebsocket>();
+
+    let srv =
+        test::server(async || NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let conn = srv.ws_at(FiniteEchoWebsocket::PATH).await.unwrap();
+    let sink = conn.sink();
+    let rx = conn.receiver();
+
+    sink.send(ws::Message::Binary(serialize_ws_ok(&"one").into()))
+        .await
+        .unwrap();
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Binary(bytes) => assert_eq!(deserialize_ws_ok::<String>(&bytes), "one"),
+        other => panic!("expected the first echo, got {other:?}"),
+    }
+
+    sink.send(ws::Message::Binary(serialize_ws_ok(&"two").into()))
+        .await
+        .unwrap();
+    let frame = recv_ws_frame(&rx).await;
+    match frame {
+        ws::Frame::Binary(bytes) => assert_eq!(deserialize_ws_ok::<String>(&bytes), "two"),
+        other => panic!("expected the second echo, got {other:?}"),
+    }
+
+    // The client never sends Close. The output stream ends on its own after
+    // the second item, so the bridge must send an UNPROMPTED Close(None).
+    let frame = recv_ws_frame(&rx).await;
+    assert!(
+        matches!(frame, ws::Frame::Close(None)),
+        "expected an unprompted Close(None) once the output stream ended, got {frame:?}"
+    );
 }
