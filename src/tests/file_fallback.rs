@@ -162,15 +162,77 @@ async fn file_and_error_handler_file_hit_applies_context_response_options() {
     let _ = std::fs::remove_dir_all(&site_root);
 }
 
+/// `additional_context` must also run on the 404/miss branch (after
+/// `provide_contexts` has already provided `ResponseOptions`), not only on a
+/// file hit — the doc comment on `file_and_error_handler_with_context`
+/// states the miss path as its primary documented purpose. A regression
+/// that dropped or reordered the call on that branch would silently stop
+/// setting the header on 404s while this exact closure kept working on
+/// hits.
 #[ntex::test]
-async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
-    use crate::file_and_error_handler;
+async fn file_and_error_handler_miss_applies_context_response_options() {
+    use crate::file_and_error_handler_with_context;
 
-    let site_root = temp_site_root("file_handler_br");
+    let site_root = temp_site_root("file_handler_context_miss");
+    std::fs::create_dir_all(&site_root).unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_file_handler_context_miss")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler_with_context(
+            || {
+                let res = use_context::<crate::ResponseOptions>()
+                    .expect("ResponseOptions should be provided on a miss too");
+                res.insert_header(
+                    ntex::http::header::HeaderName::from_static("x-miss-hit"),
+                    ntex::http::header::HeaderValue::from_static("yes"),
+                );
+            },
+            |_opts: LeptosOptions| view! { <h1>"Not Found Shell"</h1> },
+        ),
+    ))
+    .await;
+
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/missing").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        resp.headers()
+            .get("x-miss-hit")
+            .and_then(|v| v.to_str().ok()),
+        Some("yes"),
+        "additional_context must also fire on the 404 shell branch"
+    );
+    let body = test::read_body(resp).await;
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("Not Found Shell")
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// Builds the shared `app.js` + `.br` + `.gz` fixture used by the three
+/// encoding-negotiation tests below, under a fresh `site_root`.
+fn precompressed_site_root(name: &str) -> std::path::PathBuf {
+    let site_root = temp_site_root(name);
     std::fs::create_dir_all(&site_root).unwrap();
     std::fs::write(site_root.join("app.js"), "console.log('plain');").unwrap();
     std::fs::write(site_root.join("app.js.br"), "br-bytes").unwrap();
     std::fs::write(site_root.join("app.js.gz"), "gzip-bytes").unwrap();
+    site_root
+}
+
+#[ntex::test]
+async fn file_and_error_handler_serves_br_with_original_mime() {
+    use crate::file_and_error_handler;
+
+    let site_root = precompressed_site_root("file_handler_br");
 
     let options = LeptosOptions::builder()
         .output_name("leptos_ntex_file_handler_br")
@@ -221,6 +283,33 @@ async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
     let body = test::read_body(resp).await;
     assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "br-bytes");
 
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// All three encodings explicitly refused (`br;q=0, gzip;q=0`) with a
+/// wildcard also offered (`*;q=1`) must NOT backfill either, since an
+/// explicit refusal outranks the wildcard — so the plain, uncompressed file
+/// is served, with its original Content-Type intact.
+#[ntex::test]
+async fn file_and_error_handler_falls_back_to_plain_file_when_all_encodings_refused() {
+    use crate::file_and_error_handler;
+
+    let site_root = precompressed_site_root("file_handler_plain_fallback");
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_file_handler_plain_fallback")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
     let resp = test::call_service(
         &app,
         test::TestRequest::with_uri("/app.js")
@@ -237,11 +326,44 @@ async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
             .get(ntex::http::header::CONTENT_ENCODING)
             .is_none()
     );
+    assert_eq!(
+        resp.headers()
+            .get(ntex::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/javascript"),
+        "the plain-file fallback must still report the original MIME"
+    );
     let body = test::read_body(resp).await;
     assert_eq!(
         String::from_utf8(body.to_vec()).unwrap(),
         "console.log('plain');"
     );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// Only `gzip` is accepted (no `br` token at all) — the gzip sibling is
+/// served, and its Content-Type is still the original file's MIME, not the
+/// compressed sibling's.
+#[ntex::test]
+async fn file_and_error_handler_serves_gzip_when_only_gzip_is_accepted() {
+    use crate::file_and_error_handler;
+
+    let site_root = precompressed_site_root("file_handler_gzip_only");
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_file_handler_gzip_only")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
 
     let resp = test::call_service(
         &app,
@@ -256,6 +378,13 @@ async fn file_and_error_handler_serves_precompressed_br_with_original_mime() {
             .get(ntex::http::header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok()),
         Some("gzip")
+    );
+    assert_eq!(
+        resp.headers()
+            .get(ntex::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/javascript"),
+        "the gzip sibling must still report the original MIME"
     );
     let body = test::read_body(resp).await;
     assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "gzip-bytes");
@@ -548,6 +677,224 @@ async fn traversal_encoded_slash_dotfile_rejected() {
     assert!(
         !text.contains("SECRET=encoded"),
         "encoded slash must not bypass dotfile filtering"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// The route is registered with a union guard
+/// (`Any(Get()).or(Head())`) specifically so HEAD mirrors GET — the doc
+/// comment on `file_and_error_handler_with_context` calls this out
+/// explicitly because `.method()` AND-combines incompatibly across two
+/// methods. A regression back to an AND-combined method guard would
+/// silently stop matching HEAD for the entire fallback route. (Wire-level
+/// body elision is ntex's h1 writer's job and is not observable through
+/// `test::call_service`, which calls the service directly — so this test
+/// pins status + Content-Type/Content-Length parity with GET, matching the
+/// convention established by `head_request_on_static_route_mirrors_get` in
+/// `static_routes.rs`.)
+#[ntex::test]
+async fn file_and_error_handler_head_mirrors_get_on_a_file_hit() {
+    use crate::file_and_error_handler;
+
+    let site_root = temp_site_root("head_file_hit");
+    std::fs::create_dir_all(&site_root).unwrap();
+    std::fs::write(site_root.join("hello.txt"), "world!").unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_head_file_hit")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
+    let get_resp =
+        test::call_service(&app, test::TestRequest::with_uri("/hello.txt").to_request()).await;
+    let get_status = get_resp.status();
+    let get_content_type = get_resp
+        .headers()
+        .get(ntex::http::header::CONTENT_TYPE)
+        .cloned();
+    let get_content_length = get_resp
+        .headers()
+        .get(ntex::http::header::CONTENT_LENGTH)
+        .cloned();
+
+    let head_resp = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/hello.txt")
+            .method(ntex::http::Method::HEAD)
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(head_resp.status(), StatusCode::OK);
+    assert_eq!(head_resp.status(), get_status);
+    assert_eq!(
+        head_resp.headers().get(ntex::http::header::CONTENT_TYPE),
+        get_content_type.as_ref(),
+        "HEAD must report the same Content-Type as GET"
+    );
+    assert_eq!(
+        head_resp.headers().get(ntex::http::header::CONTENT_LENGTH),
+        get_content_length.as_ref(),
+        "HEAD must report the same Content-Length as GET"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// HEAD must also mirror GET on the 404/miss branch — same status and
+/// Content-Type as the equivalent GET request.
+#[ntex::test]
+async fn file_and_error_handler_head_mirrors_get_on_a_miss() {
+    use crate::file_and_error_handler;
+
+    let site_root = temp_site_root("head_file_miss");
+    std::fs::create_dir_all(&site_root).unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_head_file_miss")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
+    let get_resp =
+        test::call_service(&app, test::TestRequest::with_uri("/missing").to_request()).await;
+    let get_status = get_resp.status();
+    let get_content_type = get_resp
+        .headers()
+        .get(ntex::http::header::CONTENT_TYPE)
+        .cloned();
+
+    let head_resp = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/missing")
+            .method(ntex::http::Method::HEAD)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(head_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(head_resp.status(), get_status);
+    assert_eq!(
+        head_resp.headers().get(ntex::http::header::CONTENT_TYPE),
+        get_content_type.as_ref(),
+        "HEAD must report the same Content-Type as GET on a miss"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// A disallowed method (POST) must not be served by the file/shell logic at
+/// all — it should fall through at the router level (a bare 405/404, no
+/// shell body), not render the 404 shell as if it were a GET/HEAD miss.
+#[ntex::test]
+async fn file_and_error_handler_rejects_post() {
+    use crate::file_and_error_handler;
+
+    let site_root = temp_site_root("post_rejected");
+    std::fs::create_dir_all(&site_root).unwrap();
+    std::fs::write(site_root.join("hello.txt"), "world!").unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_post_rejected")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/hello.txt")
+            .method(ntex::http::Method::POST)
+            .to_request(),
+    )
+    .await;
+    // The union guard (`Any(Get()).or(Head())`) simply doesn't match POST, so
+    // the request falls through to the app's default "no route matched"
+    // handling, which is a bare 404 (ntex only returns 405 if a route path
+    // matched but every guard on it rejected the method AND a `Method Not
+    // Allowed` responder were wired up — this app registers no such thing).
+    // Pinning the exact code (not just `!= OK`) catches a regression that
+    // swapped in some other non-200 status (e.g. a 500) and still "rejected"
+    // the request without truly falling through to the router's default.
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "POST must not be served by the file/shell handler"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("Not Found Shell"),
+        "POST must not fall through to the shell render path, got body = {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}
+
+/// Regression: `safe_subpath` used to skip every empty split segment of a
+/// bare root, leaving `rel` empty so `candidate` resolved to `canon_root`
+/// itself — a directory. `canonicalize()` and `starts_with` both accepted it
+/// trivially, and `NamedFile::open` succeeds on a directory on Unix, so a
+/// bare-root request would have been served as if it were an openable file
+/// instead of falling through to the 404 shell. Fixed by rejecting any
+/// `safe_subpath` target that is not a regular file.
+#[ntex::test]
+async fn file_and_error_handler_bare_root_falls_back_to_shell() {
+    use crate::file_and_error_handler;
+
+    let site_root = temp_site_root("bare_root");
+    std::fs::create_dir_all(&site_root).unwrap();
+    std::fs::write(site_root.join("hello.txt"), "world!").unwrap();
+
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_bare_root")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).route(
+        "/{tail}*",
+        file_and_error_handler(|_opts: LeptosOptions| {
+            view! { <h1>"Not Found Shell"</h1> }
+        }),
+    ))
+    .await;
+
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a bare root request must render the 404 shell, not open the site_root directory"
+    );
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("Not Found Shell"),
+        "must render the fallback shell"
     );
 
     let _ = std::fs::remove_dir_all(&site_root);
