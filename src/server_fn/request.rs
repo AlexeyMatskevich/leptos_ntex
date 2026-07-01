@@ -719,9 +719,42 @@ mod tests {
                 to returns_that_value { equal(Some("other-value".to_string())) }
             }
 
+            when the_header_is_present_but_empty {
+                // An explicitly-present, empty-string header value is
+                // distinct from an ABSENT header — `Some("")`, not `None`.
+                // A regression collapsing an empty value to "absent" would
+                // slip through if this boundary were never exercised.
+                let headers: &[(&str, &str)] = &[("x-probe", "")];
+                to returns_an_empty_string { equal(Some("".to_string())) }
+            }
+
             when the_header_is_absent {
                 let headers: &[(&str, &str)] = &[];
                 to returns_none { be_none }
+            }
+        }
+    }
+
+    // `header()`'s shared primitive uses `String::from_utf8_lossy`, silently
+    // replacing malformed bytes with U+FFFD rather than failing. No existing
+    // leaf supplies a non-UTF-8 header value, so this axis was unpinned.
+    fn header_value_from_bytes(value: &'static [u8]) -> Option<String> {
+        let req = test::TestRequest::with_uri("/")
+            .header("x-probe", value)
+            .to_http_parts();
+        NtexRequest::from(req)
+            .header("x-probe")
+            .map(|value| value.into_owned())
+    }
+
+    lets_expect! {
+        expect(header_value_from_bytes(value)) as the_request_header_lossy_decode {
+            // `0xFF` is never a valid UTF-8 byte anywhere in a sequence, so
+            // `from_utf8_lossy` replaces it with U+FFFD rather than erroring.
+            let value: &'static [u8] = b"hello\xffworld";
+
+            to replaces_the_invalid_byte_with_u_fffd {
+                equal(Some("hello\u{fffd}world".to_string()))
             }
         }
     }
@@ -795,6 +828,18 @@ mod tests {
                 equal(Some("http://example.test/form".to_string()))
             }
 
+            // A SECOND present value with different content, mirroring the
+            // sibling pattern used by `the_request_header`/`_content_type`/
+            // `_accept`: pins that `referer()` returns the ACTUAL header
+            // value, not a fixture constant the first leaf alone couldn't
+            // distinguish from a hardcoded return.
+            when a_different_value_is_present {
+                let headers: &[(&str, &str)] = &[("Referer", "http://example.test/other")];
+                to returns_that_value {
+                    equal(Some("http://example.test/other".to_string()))
+                }
+            }
+
             when the_referer_is_absent {
                 let headers: &[(&str, &str)] = &[];
                 to returns_none { be_none }
@@ -842,6 +887,64 @@ mod tests {
         }
     }
 
+    // `close_send_failure`'s `reason` parameter is interpolated directly into
+    // the close description — pin that pass-through so a regression that
+    // hardcodes a static description (ignoring `reason`) is caught.
+    fn close_description(msg: &web::ws::Message) -> Option<String> {
+        match msg {
+            web::ws::Message::Close(Some(reason)) => {
+                reason.description.as_ref().map(|d| d.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    lets_expect! {
+        expect(close_description(&close_send_failure(reason))) as the_send_failure_close_description {
+            let reason = "send failed";
+
+            to carries_the_given_reason_as_the_description {
+                equal(Some("send failed".to_string()))
+            }
+
+            when a_different_reason_is_given {
+                let reason = "connection reset by peer";
+                to carries_that_reason_as_the_description {
+                    equal(Some("connection reset by peer".to_string()))
+                }
+            }
+        }
+    }
+
+    // ----- try_into_string: invalid-UTF-8 body ---------------------------
+    // `try_into_string` has two fallible steps: `collect_payload`'s Err
+    // (payload-overflow) and `String::from_utf8`'s Err (malformed bytes).
+    // Only the overflow path was ever exercised; a body that collects fine
+    // but is not valid UTF-8 must surface as a structured `Args` error, not
+    // panic and not silently lose/replace the bad bytes.
+    #[ntex::test]
+    async fn try_into_string_reports_invalid_utf8_as_a_structured_args_error() {
+        let http_req = test::TestRequest::default().to_http_request();
+        // 0xFF is never a valid UTF-8 byte anywhere in a sequence.
+        let chunks = futures::stream::iter(vec![Ok::<_, ntex::http::error::PayloadError>(
+            ntex::util::Bytes::from_static(&[b'o', b'k', 0xff]),
+        )]);
+        let req = NtexRequest::from((http_req, Payload::from_stream(chunks)));
+
+        let result = <NtexRequest as Req<E, E, E>>::try_into_string(req).await;
+
+        match result {
+            Err(ServerFnError::Args(message)) => {
+                // Exact message from `FromUtf8Error`'s `Display` impl for this
+                // byte sequence (`ok\xff`, the single invalid byte at index 2).
+                assert_eq!(message, "invalid utf-8 sequence of 1 bytes from index 2");
+            }
+            other => {
+                panic!("expected Err(ServerFnError::Args(_)) for invalid-UTF-8 body, got {other:?}")
+            }
+        }
+    }
+
     // ----- try_into_stream cumulative overflow ACROSS chunks ------------
     // The per-chunk guard carries the running total between chunks
     // (`next = so_far + b.len()`). A single HTTP test payload is delivered as
@@ -875,14 +978,24 @@ mod tests {
             .expect("try_into_stream must build the stream");
         let items: Vec<_> = stream.collect().await;
 
-        // First chunk (10) is under the limit and streams through Ok; the second
-        // pushes the running total to 20 > 16 and yields the error frame.
-        assert!(
-            items.first().is_some_and(|r| r.is_ok()),
-            "the first under-limit chunk must stream through Ok, got {items:?}"
+        // Exactly two items: the passthrough Ok chunk, then the error frame —
+        // and the stream terminates there (a regression that kept polling
+        // after the error would produce a THIRD item).
+        assert_eq!(
+            items.len(),
+            2,
+            "expected exactly [Ok(first chunk), Err(overflow)], got {items:?}"
+        );
+        // The first item's CONTENT is the actual first chunk, not just "some
+        // Ok" — a regression returning `Ok(SfBytes::new())` would still pass
+        // a bare `is_ok()` check.
+        assert_eq!(
+            items[0].as_ref().ok(),
+            Some(&SfBytes::from(vec![b'A'; 10])),
+            "the first under-limit chunk must stream through with its actual bytes, got {items:?}"
         );
         assert!(
-            items.iter().any(|r| r.is_err()),
+            items[1].is_err(),
             "the cumulative total crossing the limit on the SECOND chunk must yield an error frame"
         );
         // ...and the request-scoped marker is set so the dispatcher promotes it
@@ -894,5 +1007,102 @@ mod tests {
                 .is_some(),
             "the PayloadTooLarge marker must be set on cumulative overflow"
         );
+    }
+
+    // Positive sibling of the overflow test above: 2+ chunks whose cumulative
+    // total stays strictly UNDER the limit must ALL stream through as Ok —
+    // pinning the running-total arithmetic from the passing side (a subtle
+    // regression there could false-reject a legitimate multi-chunk stream,
+    // undetected if only the overflow direction were tested).
+    #[ntex::test]
+    async fn try_into_stream_streams_multiple_under_limit_chunks_through_as_ok() {
+        use futures::StreamExt;
+        use ntex::http::Payload;
+        use ntex::util::Bytes as NBytes;
+
+        let http_req = test::TestRequest::default()
+            .state(crate::LeptosServerFnConfig {
+                payload_limit: 16,
+                ..Default::default()
+            })
+            .to_http_request();
+
+        // Two 6-byte chunks: cumulative 12 stays strictly under the 16 limit.
+        let chunks = futures::stream::iter(vec![
+            Ok::<_, ntex::http::error::PayloadError>(NBytes::from(vec![b'A'; 6])),
+            Ok(NBytes::from(vec![b'B'; 6])),
+        ]);
+        let req = NtexRequest::from((http_req.clone(), Payload::from_stream(chunks)));
+
+        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
+            .expect("try_into_stream must build the stream");
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(
+            items.len(),
+            2,
+            "both under-limit chunks must stream through, got {items:?}"
+        );
+        assert_eq!(items[0].as_ref().ok(), Some(&SfBytes::from(vec![b'A'; 6])));
+        assert_eq!(items[1].as_ref().ok(), Some(&SfBytes::from(vec![b'B'; 6])));
+        assert!(
+            http_req
+                .extensions()
+                .get::<crate::config::PayloadTooLarge>()
+                .is_none(),
+            "an under-limit multi-chunk stream must not set the PayloadTooLarge marker"
+        );
+    }
+
+    // ----- try_into_stream: underlying payload error (not overflow) ------
+    // `try_into_stream`'s `stream::unfold` has TWO distinct error-producing
+    // branches: cumulative overflow (above) and the underlying `Payload`
+    // itself yielding an `Err` chunk (e.g. a connection reset mid-body).
+    // Only the overflow branch had a direct test; this drives the `Err(e)`
+    // match arm with a `Payload::from_stream` that yields an error chunk.
+    #[ntex::test]
+    async fn try_into_stream_surfaces_the_underlying_payload_error() {
+        use futures::StreamExt;
+        use ntex::http::Payload;
+        use ntex::http::error::PayloadError;
+        use server_fn::error::FromServerFnError;
+
+        let http_req = test::TestRequest::default().to_http_request();
+
+        let chunks = futures::stream::iter(vec![Err::<ntex::util::Bytes, _>(
+            PayloadError::Incomplete(None),
+        )]);
+        let req = NtexRequest::from((http_req, Payload::from_stream(chunks)));
+
+        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
+            .expect("try_into_stream must build the stream");
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(
+            items.len(),
+            1,
+            "a single underlying payload error must yield exactly one error frame, got {items:?}"
+        );
+        let bytes = items[0]
+            .as_ref()
+            .err()
+            .cloned()
+            .expect("the underlying payload error must surface as an Err frame");
+        // Decode the serialized error frame back into the concrete error type
+        // and assert its EXACT content, not just that it is an `Err` — the
+        // production code wraps `PayloadError::Incomplete(None).to_string()`
+        // in a `ServerFnErrorErr::Args`, so the decoded message must match
+        // that `Display` output verbatim.
+        match E::de(bytes) {
+            ServerFnError::Args(message) => {
+                assert_eq!(
+                    message, "A payload reached EOF, but is not complete. With error: None",
+                    "the Args error must carry the underlying PayloadError's exact message"
+                );
+            }
+            other => {
+                panic!("expected Err(ServerFnError::Args(_)) for the payload error, got {other:?}")
+            }
+        }
     }
 }
