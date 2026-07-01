@@ -767,6 +767,205 @@ mod tests {
                     equal(Some("application/json".to_string()))
                 }
             }
+
+            // Boundary of the `preset: Option<&str>` domain: an EMPTY-but-PRESENT
+            // header value. `headers.contains_key` is true for `Some("")`, so the
+            // guard must still treat it as "already present" and leave it alone —
+            // pinning that the check is presence-based, not non-empty-based.
+            when the_existing_content_type_is_an_empty_string {
+                let preset = Some("");
+                to leaves_the_empty_content_type_unchanged {
+                    equal(Some("".to_string()))
+                }
+            }
+        }
+    }
+
+    // ----- redirect(): reactive-context presence and Accept-header specs ---
+    // `redirect()` has three characteristics of its own, independent of
+    // `accept_header_includes_html`'s own exhaustive spec above (which covers
+    // the STRING PARSING of an Accept value once one is in hand):
+    //   1. reactive-context presence: both Request and ResponseOptions
+    //      present (the only state that can do anything) vs. either/both
+    //      missing (the `else` branch: warn and no-op);
+    //   2. Accept-header presence: present-and-parseable vs. ABSENT
+    //      (`headers().get(..)` is `None`) vs. present-but-NOT-valid-UTF-8
+    //      (`to_str()` is `Err`) — both of the latter must fall through to
+    //      `unwrap_or(false)`, i.e. "does not accept html", so a client
+    //      redirect header is emitted rather than a raw 302;
+    //   3. within "context present", whether the resolved accepts-html verdict
+    //      is true or false, driving 302-vs-REDIRECT_HEADER.
+    // The oracle is the full observable outcome (Location + status +
+    // REDIRECT_HEADER presence), not just one field, so a wrong `Location`
+    // that happens to pick the same status can't slip through.
+
+    /// Which of the two reactive-context values (`Request`, `ResponseOptions`)
+    /// are provided to the `Owner` running `redirect()`.
+    enum ContextSetup {
+        Both,
+        OnlyRequest,
+        OnlyResponseOptions,
+        Neither,
+    }
+
+    /// The observable outcome of one `redirect()` call: the `Location` header
+    /// value (if any), the overridden status (if any), and whether the
+    /// client-redirect header was set. `None`/`false` for all three is the
+    /// "no-op" outcome of the missing-context branch.
+    #[derive(Debug, PartialEq)]
+    struct RedirectOutcome {
+        location: Option<String>,
+        status: Option<StatusCode>,
+        redirect_header_present: bool,
+    }
+
+    /// Builds a mock ntex request with the given `Accept` header state, runs
+    /// `redirect(path)` inside an `Owner` seeded per `ctx`, and reports the
+    /// resulting `ResponseOptions` state. When `ctx` withholds the
+    /// `ResponseOptions` context, the outcome is read from a SEPARATE
+    /// `ResponseOptions` that was never given to `redirect()` — any change
+    /// on it would mean `redirect()` reached through to the wrong instance,
+    /// which cannot happen, so its all-`None`/`false` value simply confirms
+    /// "no-op" the same way the with-Request case does.
+    fn redirect_outcome(ctx: ContextSetup, accept: Option<&HeaderValue>) -> RedirectOutcome {
+        let mut req_builder = ntex::web::test::TestRequest::with_uri("/");
+        if let Some(accept) = accept {
+            req_builder = req_builder.header(header::ACCEPT, accept.clone());
+        }
+        let http_req = req_builder.to_http_request();
+
+        let owner = Owner::new();
+        let res_options = ResponseOptions::default();
+        owner.with(|| {
+            match ctx {
+                ContextSetup::Both => {
+                    provide_context(crate::request::Request::new(&http_req));
+                    provide_context(res_options.clone());
+                }
+                ContextSetup::OnlyRequest => {
+                    provide_context(crate::request::Request::new(&http_req));
+                }
+                ContextSetup::OnlyResponseOptions => {
+                    provide_context(res_options.clone());
+                }
+                ContextSetup::Neither => {}
+            }
+
+            redirect("/target");
+        });
+
+        let parts = res_options.0.read().or_poisoned();
+        RedirectOutcome {
+            location: parts
+                .headers
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            status: parts.status,
+            redirect_header_present: parts
+                .headers
+                .contains_key(HeaderName::from_static(REDIRECT_HEADER)),
+        }
+    }
+
+    lets_expect! {
+        expect(redirect_outcome(ctx, accept.as_ref())) {
+            // Default: both contexts present, Accept accepts html -> 302 + Location.
+            let ctx = ContextSetup::Both;
+            let accept: Option<HeaderValue> = Some(HeaderValue::from_static("text/html"));
+
+            to sets_location_and_a_302_for_an_html_accepting_client {
+                equal(RedirectOutcome {
+                    location: Some("/target".to_string()),
+                    status: Some(StatusCode::FOUND),
+                    redirect_header_present: false,
+                })
+            }
+
+            when the_client_does_not_accept_html {
+                let accept: Option<HeaderValue> = Some(HeaderValue::from_static("application/json"));
+                to sets_location_and_the_client_redirect_header_instead_of_a_302 {
+                    equal(RedirectOutcome {
+                        location: Some("/target".to_string()),
+                        status: None,
+                        redirect_header_present: true,
+                    })
+                }
+            }
+
+            // `headers().get(ACCEPT)` is `None` — the `Option` chain's absent
+            // state, distinct from a present-but-unparseable value below.
+            // Must fall through the SAME `unwrap_or(false)` as a rejected
+            // Accept header, i.e. NOT accept html.
+            when the_accept_header_is_absent {
+                let accept: Option<HeaderValue> = None;
+                to treats_a_missing_accept_header_as_not_accepting_html {
+                    equal(RedirectOutcome {
+                        location: Some("/target".to_string()),
+                        status: None,
+                        redirect_header_present: true,
+                    })
+                }
+            }
+
+            // Present, but its bytes are not valid UTF-8, so `to_str()` is
+            // `Err` and `.ok()` collapses it to `None` — same fallthrough as
+            // "absent" above, exercised via the OTHER branch of the `Option`
+            // chain (`Some(header) -> to_str().ok() == None`, rather than
+            // `headers().get(..) == None`). A byte `>= 0x80` is a VALID
+            // header-value byte (only control bytes are rejected) but is
+            // never valid UTF-8 on its own, so `HeaderValue::from_bytes`
+            // succeeds while `to_str()` fails — this is the only way to
+            // reach that branch without panicking.
+            when the_accept_header_is_present_but_not_valid_utf8 {
+                let accept: Option<HeaderValue> =
+                    Some(HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap());
+                to treats_a_non_utf8_accept_header_as_not_accepting_html {
+                    equal(RedirectOutcome {
+                        location: Some("/target".to_string()),
+                        status: None,
+                        redirect_header_present: true,
+                    })
+                }
+            }
+
+            // Reactive-context-presence axis: `redirect()` requires BOTH a
+            // `Request` and a `ResponseOptions` in context; any state short of
+            // "both" takes the `else` (warn-and-no-op) branch. Each state
+            // below observes the SAME never-touched `res_options` the harness
+            // builds, confirming no Location/status/redirect-header was set.
+            when the_reactive_context_is_missing_response_options {
+                let ctx = ContextSetup::OnlyRequest;
+                to performs_no_side_effect {
+                    equal(RedirectOutcome {
+                        location: None,
+                        status: None,
+                        redirect_header_present: false,
+                    })
+                }
+            }
+
+            when the_reactive_context_is_missing_the_request {
+                let ctx = ContextSetup::OnlyResponseOptions;
+                to performs_no_side_effect {
+                    equal(RedirectOutcome {
+                        location: None,
+                        status: None,
+                        redirect_header_present: false,
+                    })
+                }
+            }
+
+            when the_reactive_context_is_missing_both {
+                let ctx = ContextSetup::Neither;
+                to performs_no_side_effect {
+                    equal(RedirectOutcome {
+                        location: None,
+                        status: None,
+                        redirect_header_present: false,
+                    })
+                }
+            }
         }
     }
 }
