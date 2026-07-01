@@ -75,6 +75,39 @@ fn StaticHeaderApp() -> impl IntoView {
     }
 }
 
+/// A `SsrMode::Static` route whose render captures a `302 Found` redirect
+/// (status + `Location`) instead of a success status. `was_error_status` does
+/// not skip 3xx, so the route is written to disk and its redirect snapshot is
+/// cached — a conditional / range request to it must still redirect (`302`),
+/// not be turned into `NamedFile`'s `304` / `206`.
+#[component]
+fn StaticRedirectApp() -> impl IntoView {
+    provide_meta_context();
+
+    view! {
+        <Router>
+            <main>
+                <Routes fallback=|| view! { <h1>"Not Found"</h1> }>
+                    <Route
+                        path=path!("/go")
+                        ssr=SsrMode::Static(StaticRoute::new())
+                        view=|| {
+                            if let Some(res) = use_context::<crate::ResponseOptions>() {
+                                res.set_status(ntex::http::StatusCode::FOUND);
+                                res.insert_header(
+                                    ntex::http::header::LOCATION,
+                                    ntex::http::header::HeaderValue::from_static("/elsewhere"),
+                                );
+                            }
+                            view! { <h1>"Redirecting"</h1> }
+                        }
+                    />
+                </Routes>
+            </main>
+        </Router>
+    }
+}
+
 /// Static route whose every render stamps a fresh epoch number into BOTH the
 /// body and an `x-render-epoch` header, so a served response can be audited
 /// for body/header consistency: a body from render N must always arrive under

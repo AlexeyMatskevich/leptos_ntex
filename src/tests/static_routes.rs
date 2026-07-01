@@ -397,3 +397,71 @@ async fn static_route_captured_status_yields_to_namedfile_conditional_and_range(
 
     let _ = std::fs::remove_dir_all(&site_root);
 }
+
+/// A `SsrMode::Static` route that captured a *redirect* (`302` + `Location`)
+/// must keep redirecting on conditional / range hits: the captured status is
+/// not a success representation, so `NamedFile`'s `304` / `206` must NOT
+/// replace it — otherwise the client is stranded on a `304` / `206` carrying a
+/// `Location` instead of following the redirect. Only a captured `2xx` yields
+/// to `NamedFile`'s conditional/range status.
+#[ntex::test]
+async fn static_route_captured_redirect_survives_conditional_and_range() {
+    let site_root = temp_site_root("static_redirect_status");
+    let (routes, generator) = gen_route_list_with_ssg(StaticRedirectApp);
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_static_redirect_status")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
+
+    generator.generate(&options).await;
+
+    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), StaticRedirectApp);
+    }))
+    .await;
+
+    // A full serve keeps the captured redirect and exposes NamedFile's ETag.
+    let full = test::call_service(&app, test::TestRequest::with_uri("/go").to_request()).await;
+    assert_eq!(
+        full.status(),
+        StatusCode::FOUND,
+        "a full serve must keep the captured 302 redirect"
+    );
+    let etag = full
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .expect("NamedFile must set an ETag on the served static file");
+
+    // A conditional hit must STILL redirect (302), not collapse to NamedFile's 304.
+    let conditional = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/go")
+            .header(header::IF_NONE_MATCH, etag.as_str())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        conditional.status(),
+        StatusCode::FOUND,
+        "a conditional hit to a static redirect must keep 302, not become 304"
+    );
+
+    // A range request must STILL redirect (302), not collapse to NamedFile's 206.
+    let ranged = test::call_service(
+        &app,
+        test::TestRequest::with_uri("/go")
+            .header(header::RANGE, "bytes=0-3")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        ranged.status(),
+        StatusCode::FOUND,
+        "a range request to a static redirect must keep 302, not become 206"
+    );
+
+    let _ = std::fs::remove_dir_all(&site_root);
+}

@@ -19,20 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A `SsrMode::Static` route that captured a custom status via
+- A `SsrMode::Static` route that captured a custom **success** status via
   `ResponseOptions::set_status` no longer overwrites the conditional / range
   status `NamedFile` computes from a request's validators or `Range`. A
-  captured status (e.g. `201`) still applies to a full `200` serve, but an
+  captured `2xx` (e.g. `201`) still applies to a full `200` serve, but on an
   `If-None-Match` / `If-Modified-Since` hit (`304`), a precondition failure
   (`412`), a range response (`206` / `416`), or a malformed `Range` header
-  (`400`) now keeps `NamedFile`'s status rather than being replaced —
+  (`400`) it now keeps `NamedFile`'s status rather than being replaced —
   previously a conditional GET could receive `201` with an empty body and drop
   its valid cache (RFC 9110 §13, §14.4, §15.4.5). These are exactly the
-  non-`200` statuses `NamedFile::into_response` produces. This extends the
-  file-serving snapshot reconciliation (which already strips body-framing
-  headers) to the status line; it is a deliberate divergence from the upstream
-  `leptos_axum` / `leptos_actix` adapters, which overwrite the status
-  unconditionally.
+  non-`200` statuses `NamedFile::into_response` produces. A captured
+  **redirect** (e.g. a `302` + `Location` from a `SsrMode::Static` route that
+  calls `redirect()`, which SSG caches because the error-skip predicate covers
+  only `4xx`/`5xx`) is not a representation status, so it still fires on such
+  hits. This extends the file-serving snapshot reconciliation (which already
+  strips body-framing headers) to the status line; it is a deliberate
+  divergence from the upstream `leptos_axum` / `leptos_actix` adapters, which
+  overwrite the status unconditionally.
 
 ## [0.7.1] - 2026-06-21
 

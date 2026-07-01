@@ -715,14 +715,19 @@ where
                     // STATUS from this request's validators and `Range`:
                     // `304`/`412` for a conditional GET, `206`/`416` for a
                     // range request, `400` for a malformed `Range` header. A
-                    // captured status describes the *full* representation (e.g.
-                    // an app-set `201`); letting it overwrite one of those would
-                    // break the caching / range contract — a client sending
-                    // `If-None-Match` would get a `201` with an empty body
-                    // instead of `304`. Drop the captured status on those
-                    // responses so `NamedFile` wins; a plain `200 OK` full serve
-                    // still takes the app's status.
-                    if is_conditional_or_range_status(res.0.status()) {
+                    // captured *success* status describes the full representation
+                    // (e.g. an app-set `201`); letting it overwrite one of those
+                    // would break the caching / range contract — a client sending
+                    // `If-None-Match` would get a `201` with an empty body instead
+                    // of `304`. Drop only a captured `2xx` on those responses so
+                    // `NamedFile` wins. A captured redirect (e.g. `302` + `Location`
+                    // from `redirect()`, which SSG caches because `was_error_status`
+                    // skips only 4xx/5xx) is NOT a representation status and must
+                    // still fire on a conditional/range hit, so it is preserved; a
+                    // plain `200 OK` full serve also keeps the app's status.
+                    if is_conditional_or_range_status(res.0.status())
+                        && options.status.is_some_and(|status| status.is_success())
+                    {
                         options.status = None;
                     }
                 }
