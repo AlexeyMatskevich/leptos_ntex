@@ -21,7 +21,22 @@ use std::io;
 /// so the server-function runtime can build responses of the expected
 /// content-type. ntex's [`HttpResponse`] is not [`Send`], hence the
 /// [`SendWrapper`].
-pub struct NtexServerResponse(pub SendWrapper<HttpResponse>);
+///
+/// # Panics
+///
+/// [`SendWrapper`] panics if the wrapped response is accessed or dropped on a
+/// thread other than the one that created it. ntex pins request handling to a
+/// single worker thread, so this never fires in normal use; the hazard only
+/// appears if the response is deliberately moved across threads — the same
+/// cross-thread invariant documented on [`Request`](crate::request::Request).
+///
+/// The inner field is crate-private, mirroring `server_fn`'s `ActixResponse`:
+/// build one with [`NtexServerResponse::from`] and consume it with
+/// [`NtexServerResponse::take`]. Narrowing the field only removes direct `.0`
+/// access; the cross-thread panic above still applies to the value itself, as
+/// [`take`](NtexServerResponse::take) and dropping it off the origin thread
+/// both trip the [`SendWrapper`] thread check.
+pub struct NtexServerResponse(pub(crate) SendWrapper<HttpResponse>);
 
 impl NtexServerResponse {
     /// Consumes the wrapper and returns the inner ntex response.
