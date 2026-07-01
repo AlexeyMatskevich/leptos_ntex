@@ -526,12 +526,15 @@ mod tests {
         view! { <h1>"probe"</h1> }
     }
 
-    // Runs `generate_route_list_with_exclusions_and_ssg_and_context`, marking
+    // Runs `generate_route_list_with_exclusions_and_ssg_and_context` (through
+    // the test suite's `ROUTE_GEN_VS_RENDER`-serialized wrapper — see
+    // `crate::tests` — so this cannot race a concurrently-running rendering
+    // test's first `Resource` poll under the parallel test harness), marking
     // `ran` once `additional_context` executes inside route generation.
     fn context_ran_during_generation(excluded: Option<Vec<String>>) -> bool {
         let ran = Arc::new(Mutex::new(false));
         let ran_inner = ran.clone();
-        let _ = generate_route_list_with_exclusions_and_ssg_and_context(
+        let _ = crate::tests::gen_route_list_with_exclusions_and_ssg_and_context(
             ContextProbeApp,
             excluded,
             move || {
@@ -553,8 +556,10 @@ mod tests {
     // `excluded_routes` list, independent of whether that path also
     // happens to be a real route. Its `mode`/`methods`/`regenerate` must
     // stay the documented placeholder defaults while `exclude` is `true`.
+    // Also goes through the serialized wrapper — see
+    // `context_ran_during_generation` above.
     fn excluded_placeholder_listing() -> NtexRouteListing {
-        let (routes, _generator) = generate_route_list_with_exclusions_and_ssg_and_context(
+        let (routes, _generator) = crate::tests::gen_route_list_with_exclusions_and_ssg_and_context(
             ContextProbeApp,
             Some(vec!["/not-a-real-route".to_string()]),
             || {},

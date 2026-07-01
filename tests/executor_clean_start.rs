@@ -1,29 +1,23 @@
-//! Isolated, own-process check of the executor clean-start branch.
+//! Isolated, own-process check of the executor clean-start branch — the lazy,
+//! `Once`-guarded `ensure_executor_initialized()` reached through every
+//! rendering/SSG/file-serving entry point (public surface: `generate_route_list`
+//! and friends).
 //!
 //! Each `tests/*.rs` file is a SEPARATE test binary, so this process is
 //! guaranteed to start with `ExecutorInitState::Unknown` and no competing
-//! `any_spawner` executor. The FIRST call that touches the executor must
-//! therefore take the clean-install path and succeed — whether that call is
-//! the direct, error-propagating `try_init_executor()`, or the crate's real
-//! internal call site, the `Once`-guarded lazy `ensure_executor_initialized()`
-//! reached through every rendering/SSG/file-serving entry point (public
-//! surface: `generate_route_list` and friends).
+//! `any_spawner` executor. The sibling binary
+//! `executor_direct_init_clean_start.rs` covers the OTHER first-caller entry
+//! point — a direct `try_init_executor()` call, first, in its own fresh
+//! process — in its own process, so the two documented entry points never
+//! race each other over the process-global executor state (see that file's
+//! doc comment).
 //!
-//! The in-crate `repeated_executor_init` spec cannot pin either branch: it
-//! shares the main test binary, whose executor state is already installed
+//! The in-crate `repeated_executor_init` spec cannot pin this branch either:
+//! it shares the main test binary, whose executor state is already installed
 //! (and unknowable) by the time it runs, so it has to accept the
 //! `(Err(AlreadySet), ...)` pair. This binary closes that gap by observing
-//! both installers directly, in a process where they are the only things
-//! that touch the executor.
-//!
-//! Both scenarios are asserted from a single test function (rather than two
-//! independent `#[test]`s) because `any_spawner`'s global executor, and this
-//! crate's own install-state cache, are one-shot for the whole process: two
-//! separate tests both wanting to be "the first call in a fresh process"
-//! would race against each other under the default parallel test harness.
-//! Sequencing them inside one function makes the order deterministic: the
-//! lazy path runs first (as the gap-closing observation), then the direct
-//! path's idempotent-Ok guarantee is checked on top of that same install.
+//! the lazy installer directly, in a process where it is the only thing that
+//! touches the executor.
 
 use leptos::prelude::*;
 use leptos_meta::provide_meta_context;
