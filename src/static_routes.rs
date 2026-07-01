@@ -533,6 +533,27 @@ async fn write_static_route(
     Ok(())
 }
 
+/// Test-only seam: fires exactly once, right after a successful on-demand
+/// regeneration's write completes and before the handler re-opens the file
+/// it just wrote. Lets a test deterministically inject a failure at that
+/// precise point (e.g. delete the file/root) instead of racing a background
+/// thread against OS task scheduling. `#[cfg(test)]`-gated end to end, so it
+/// costs nothing (not even the `Mutex`) outside the crate's own unit tests.
+///
+/// Keyed by `root` (each test uses its own uniquely-named `site_root`): the
+/// crate's own test suite runs `#[ntex::test]`s in parallel, and more than
+/// one of them exercises this same branch (any on-demand-regeneration test,
+/// not just the one that arms this hook) — an unkeyed "fires for the very
+/// next call" hook would let an unrelated concurrent request consume it at
+/// the wrong time. The call site only takes the hook when its own `root`
+/// matches, leaving a non-matching hook armed for whichever call it was
+/// actually meant for.
+#[cfg(test)]
+type RegenReopenTestHook = Option<(PathBuf, Box<dyn FnOnce() + Send>)>;
+#[cfg(test)]
+pub(crate) static REGEN_REOPEN_TEST_HOOK: std::sync::Mutex<RegenReopenTestHook> =
+    std::sync::Mutex::new(None);
+
 pub(crate) fn handle_static_route<IV, Err>(
     additional_context: impl Fn() + 'static + Clone + Send,
     app_fn: impl Fn() -> IV + Clone + Send + 'static,
@@ -627,6 +648,20 @@ where
                 // to an un-pregenerated static route. Mirrors `leptos_axum`
                 // (`ServeDir`) and `leptos_actix` (`NamedFile::open`).
                 if html.is_none() {
+                    #[cfg(test)]
+                    {
+                        let mut slot = REGEN_REOPEN_TEST_HOOK
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot
+                            .as_ref()
+                            .is_some_and(|(hook_root, _)| *hook_root == root)
+                        {
+                            let (_, hook) = slot.take().unwrap();
+                            drop(slot);
+                            hook();
+                        }
+                    }
                     let (reopened, paired_headers) = match ntex::rt::spawn_blocking({
                         let root = root.clone();
                         let path_buf = path_buf.clone();
@@ -1037,12 +1072,16 @@ mod tests {
 
     // ----- validate_static_parent: exhaustive spec ----------------------
     // Guards `write_static_route` against writing outside `site_root`: `Ok`
-    // when the resolved file's parent is under the root, `Err(InvalidInput)`
-    // when the candidate path has no parent at all, and `Err(PermissionDenied)`
-    // when the parent — possibly reached only after a symlink is resolved —
-    // canonicalizes to somewhere outside the root. Inverting or dropping the
-    // `!canon_parent.starts_with(&canon_root)` check would let a symlinked
-    // directory escape `site_root` silently, which the last leaf below pins.
+    // when the resolved file's parent is under the root, and
+    // `Err(InvalidInput)` when the candidate path has no parent at all. The
+    // third state — `Err(PermissionDenied)` when the parent is reached only
+    // after a symlink resolves outside the root — needs a real OS symlink and
+    // is pinned separately by the Unix-only
+    // `validate_static_parent_rejects_a_symlinked_parent_outside_the_root`
+    // test below (a `#[cfg(unix)]` `when` leaf here would silently degrade to
+    // a plain missing-parent case on other platforms, for which `Ok` — not
+    // `PermissionDenied` — is the correct result, so it cannot share this
+    // spec's fixed assertion).
     lets_expect! {
         expect(validate_static_parent(&root, &file_path)) as the_validation_result {
             let root = temp_dir_for("validate_parent_root");
@@ -1059,26 +1098,40 @@ mod tests {
                     )) be_true
                 }
             }
-
-            when the_parent_is_a_symlink_that_resolves_outside_the_root {
-                let file_path = {
-                    fs::create_dir_all(&root).unwrap();
-                    let outside = temp_dir_for("validate_parent_outside");
-                    fs::create_dir_all(&outside).unwrap();
-                    let link = root.join("escape");
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&outside, &link).unwrap();
-                    link.join("page.html")
-                };
-
-                to is_rejected_as_permission_denied {
-                    make(matches!(
-                        validate_static_parent(&root, &file_path),
-                        Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied
-                    )) be_true
-                }
-            }
         }
+    }
+
+    // Inverting or dropping the `!canon_parent.starts_with(&canon_root)`
+    // check in `validate_static_parent` would let a symlinked directory
+    // escape `site_root` silently — this pins the guard directly. Unix-only:
+    // needs a real symlink (`std::os::windows::fs::symlink_dir` requires
+    // elevated privileges, so there is no unprivileged Windows equivalent),
+    // mirroring `traversal_symlink_escape_rejected` in
+    // `src/tests/file_fallback.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn validate_static_parent_rejects_a_symlinked_parent_outside_the_root() {
+        let root = temp_dir_for("validate_parent_root_symlink");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp_dir_for("validate_parent_outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("escape");
+        // Must NOT be `let _ =`: if symlink creation fails, `link` would
+        // stay a missing path and `validate_static_parent` would legitimately
+        // return `Ok` after creating it as a plain directory, making the
+        // assertion below pass vacuously without exercising the symlink-
+        // escape guard at all. Fail loud instead.
+        std::os::unix::fs::symlink(&outside, &link)
+            .expect("symlink fixture must be created for this test to be meaningful");
+        let file_path = link.join("page.html");
+
+        assert!(
+            matches!(
+                validate_static_parent(&root, &file_path),
+                Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied
+            ),
+            "a parent reached only via a symlink resolving outside root must be rejected"
+        );
     }
 
     // ----- validate_static_file: exhaustive spec ------------------------

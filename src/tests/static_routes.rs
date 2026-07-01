@@ -858,101 +858,58 @@ async fn static_route_cold_regeneration_preserves_captured_status_and_redirect()
 /// If the just-written `.html` vanishes between `write_static_route`'s atomic
 /// rename and `handle_static_route`'s post-regeneration re-open (e.g. deleted
 /// or moved out from under the server), the handler must report `500`, not
-/// panic, hang, or silently serve an empty `200`. Forces the race with a
-/// background watcher thread that removes the `site_root` directory the
-/// instant the target file first appears on disk — racing to win before the
-/// handler's own re-open.
+/// panic, hang, or silently serve an empty `200`.
 ///
-/// The watcher winning is NOT guaranteed on a single attempt (it depends on
-/// OS scheduling), so a single run finishing with `won_race == false` must
-/// NOT be allowed to pass silently without ever exercising the 500 branch —
-/// that would make this a vacuous regression test. Instead the whole
-/// attempt (fresh, uniquely-named `site_root` each time, so no state leaks
-/// across attempts) is retried up to `MAX_ATTEMPTS` times; the test panics
-/// loudly if the race is never won in any attempt, so CI failure (rather
-/// than a silent pass) is what a flaky watcher produces.
+/// Deterministic by construction: `REGEN_REOPEN_TEST_HOOK` fires exactly once,
+/// synchronously, at the precise point between the write completing and the
+/// re-open starting — no background thread racing OS scheduling, so this
+/// cannot flake on a loaded/fast CI runner the way a timing-based watcher
+/// could (an earlier version of this test used one; see git history).
 #[ntex::test]
 async fn static_route_reopen_failure_after_regeneration_reports_500() {
-    const MAX_ATTEMPTS: usize = 50;
+    let site_root = temp_site_root("static_regen_vanish");
+    std::fs::create_dir_all(&site_root).unwrap();
+    let (routes, _generator) = gen_route_list_with_ssg(StaticApp);
+    let options = LeptosOptions::builder()
+        .output_name("leptos_ntex_static_regen_vanish")
+        .site_root(site_root.to_string_lossy().to_string())
+        .site_pkg_dir("pkg")
+        .build();
 
-    for attempt in 0..MAX_ATTEMPTS {
-        let site_root = temp_site_root("static_regen_vanish");
-        std::fs::create_dir_all(&site_root).unwrap();
-        let (routes, _generator) = gen_route_list_with_ssg(StaticApp);
-        let options = LeptosOptions::builder()
-            .output_name("leptos_ntex_static_regen_vanish")
-            .site_root(site_root.to_string_lossy().to_string())
-            .site_pkg_dir("pkg")
-            .build();
-
-        let target = site_root.join("index.html");
-        let won_race = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watcher = {
-            let target = target.clone();
-            let site_root = site_root.clone();
-            let won_race = won_race.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    if target.exists() {
-                        // Remove the whole directory (not just the file): a
-                        // regenerating re-open re-canonicalizes `root` too, so
-                        // this also covers a root that disappears mid-race.
-                        if std::fs::remove_dir_all(&site_root).is_ok() {
-                            won_race.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        return;
-                    }
-                }
-            })
-        };
-
-        let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-            register_leptos_routes(cfg, routes.clone(), StaticApp);
-        }))
-        .await;
-
-        let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watcher.join();
-
-        let _ = std::fs::remove_dir_all(&site_root);
-
-        if won_race.load(std::sync::atomic::Ordering::Relaxed) {
-            if resp.status() == StatusCode::INTERNAL_SERVER_ERROR {
-                return;
-            }
-            // Deleting the file does not invalidate an already-open file
-            // descriptor on Unix, so "won the deletion race" and "the
-            // handler's re-open actually failed" are not quite the same
-            // event: on a narrow timing window the handler can open the file
-            // just before the watcher's `remove_dir_all` lands, and the read
-            // still succeeds against the now-unlinked inode. That is a test
-            // harness limitation, not evidence the 500 path is broken, so
-            // retry instead of failing outright — the loop's own exhaustion
-            // panic below is still the backstop if the 500 branch is never
-            // actually reached in any attempt.
-            eprintln!(
-                "static_route_reopen_failure_after_regeneration_reports_500: \
-                 won the deletion race on attempt {attempt} but the handler's open() \
-                 raced ahead of it (status {:?}), retrying",
-                resp.status()
-            );
-            continue;
-        }
-
-        eprintln!(
-            "static_route_reopen_failure_after_regeneration_reports_500: \
-             watcher lost the race on attempt {attempt}, retrying"
-        );
+    {
+        // Remove the whole directory (not just the file): a regenerating
+        // re-open re-canonicalizes `root` too, so this also covers a root
+        // that disappears mid-race. Keyed by `site_root` — see
+        // `REGEN_REOPEN_TEST_HOOK`'s doc comment — so a concurrently running
+        // on-demand-regeneration test (e.g.
+        // `static_route_on_demand_regeneration_serves_html`) cannot consume
+        // this hook for its own, different, request.
+        let hook_root = site_root.clone();
+        let site_root_to_remove = site_root.clone();
+        *crate::static_routes::REGEN_REOPEN_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+            hook_root,
+            Box::new(move || {
+                std::fs::remove_dir_all(&site_root_to_remove)
+                    .expect("site_root must still be removable at the reopen seam");
+            }),
+        ));
     }
 
-    panic!(
-        "static_route_reopen_failure_after_regeneration_reports_500: never observed a genuine \
-         500 from the re-open branch in {MAX_ATTEMPTS} attempts (either the watcher never won \
-         the deletion race, or it always lost the narrower race against the handler's open())"
+    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
+        register_leptos_routes(cfg, routes.clone(), StaticApp);
+    }))
+    .await;
+
+    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
+
+    let _ = std::fs::remove_dir_all(&site_root);
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a re-open failure right after a successful regeneration must report 500"
     );
 }
 
