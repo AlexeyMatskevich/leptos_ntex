@@ -470,13 +470,32 @@ mod tests {
         let req = test::TestRequest::post().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Mirror the exact-body pin from `unsupported_ssr_mode_serves_500`:
+        // both branches currently funnel into the same handler closure, so a
+        // body regression specific to the non-GET branch must be caught here
+        // too, not just on the GET branch's own test.
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "This rendering mode is not supported."
+        );
     }
 
     // The route must reject a MISMATCHED method (it is not an all-method
-    // catch-all): a POST to a `Method::Get` route, and a GET to a `Method::Post`
-    // route, must NOT 500 — they fall through to the router's method rejection.
+    // catch-all): a POST to a `Method::Get` route must NOT 500. `App::route`
+    // (ntex-3.9.6 src/web/app.rs:227-233) hoists the route's guards — the
+    // method guard included — onto the wrapping `Resource` via
+    // `take_guards()`/`add_guards()`, so a mismatched method fails the
+    // Resource-level guard match itself: the app's router never selects this
+    // Resource at all, and it falls through to the app's own 404 default
+    // handler. `Resource`'s inner `MethodNotAllowed` (resource.rs:520) is
+    // reached only when the Resource IS selected but no route inside it
+    // matches (e.g. several `.route()` calls sharing a `web::resource(..)`
+    // without per-route method guards) — not this crate's single-route-per-
+    // path registration. Verified by direct repro against ntex-3.9.6, not
+    // assumed from source alone.
     #[ntex::test]
-    async fn unsupported_ssr_mode_rejects_a_mismatched_method() {
+    async fn unsupported_ssr_mode_get_route_rejects_post() {
         let get_route = test::init_service(App::new().route(
             "/",
             unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
@@ -484,12 +503,19 @@ mod tests {
         .await;
         let resp =
             test::call_service(&get_route, test::TestRequest::post().uri("/").to_request()).await;
-        assert!(
-            resp.status().is_client_error(),
-            "POST to a GET-only route must be rejected by the router, got {}",
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "POST to a GET-only route must be rejected with exactly 404, got {}",
             resp.status()
         );
+    }
 
+    // The `Method::Post` sibling: a GET to a `Method::Post` route must NOT
+    // 500 either — same 404 rejection (see comment above), its own pass/fail
+    // signal.
+    #[ntex::test]
+    async fn unsupported_ssr_mode_post_route_rejects_get() {
         let post_route = test::init_service(App::new().route(
             "/",
             unsupported_ssr_mode_route(Method::Post, &SsrMode::Async),
@@ -497,11 +523,91 @@ mod tests {
         .await;
         let resp =
             test::call_service(&post_route, test::TestRequest::get().uri("/").to_request()).await;
-        assert!(
-            resp.status().is_client_error(),
-            "GET to a POST-only route must be rejected by the router, got {}",
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET to a POST-only route must be rejected with exactly 404, got {}",
             resp.status()
         );
+    }
+
+    // `is_island_router_navigation` (islands-router header detection) drives
+    // the `supports_ooo` flag threaded into the stream builder. This crate is
+    // built with the `islands-router` feature OFF by default, so
+    // `cfg!(feature = "islands-router")` is `false` here and the whole
+    // expression short-circuits to `false` regardless of the header — the
+    // header must be a strict no-op in that configuration. Capture the
+    // `supports_ooo` value the stream builder actually observes (rather than
+    // inspecting the body, which carries no visible trace of the flag) so a
+    // broken/inverted header-detection predicate is caught even though the
+    // feature is off.
+    // `stream_builder` must be a plain `fn` pointer (no captures), so the
+    // observed `supports_ooo` value is smuggled out through a thread-local
+    // instead of a closure capture. `#[ntex::test]` runs single-threaded, so
+    // the thread-local is set and read on the same thread within each call.
+    thread_local! {
+        static SEEN_SUPPORTS_OOO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[ntex::test]
+    async fn islands_router_header_toggles_supports_ooo_only_when_the_feature_is_on() {
+        use leptos::prelude::*;
+
+        async fn supports_ooo_seen_for(with_header: bool) -> bool {
+            SEEN_SUPPORTS_OOO.with(|cell| cell.set(None));
+            let app = test::init_service(App::new().route(
+                "/",
+                ntex::web::get().to(|req: HttpRequest| async move {
+                    handle_response_inner(
+                        || {},
+                        || view! { <h1>"IslandsProbe"</h1> },
+                        req,
+                        |app, chunks, supports_ooo| {
+                            SEEN_SUPPORTS_OOO.with(|cell| cell.set(Some(supports_ooo)));
+                            Box::pin(async move {
+                                let app = app.to_html_stream_in_order().collect::<String>().await;
+                                Box::pin(once(async move { app }).chain(chunks()))
+                                    as PinnedStream<String>
+                            })
+                        },
+                    )
+                    .await
+                }),
+            ))
+            .await;
+
+            let mut req = test::TestRequest::get().uri("/");
+            if with_header {
+                req = req.header("Islands-Router", "1");
+            }
+            let resp = test::call_service(&app, req.to_request()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            SEEN_SUPPORTS_OOO
+                .with(|cell| cell.get())
+                .expect("stream_builder must have run and recorded supports_ooo")
+        }
+
+        let without_header = supports_ooo_seen_for(false).await;
+        let with_header = supports_ooo_seen_for(true).await;
+        assert!(
+            without_header,
+            "supports_ooo must be true without the header (no island-router navigation)"
+        );
+        // `is_island_router_navigation` is `cfg!(feature = "islands-router")
+        // && <header present>`, so the header only has an effect when the
+        // crate is actually built with the feature on — this test must hold
+        // (and exercise the real branch) under both build configurations.
+        if cfg!(feature = "islands-router") {
+            assert!(
+                !with_header,
+                "with the islands-router feature on, the Islands-Router header must disable supports_ooo"
+            );
+        } else {
+            assert_eq!(
+                with_header, without_header,
+                "with the islands-router feature off, the Islands-Router header must not change supports_ooo"
+            );
+        }
     }
 
     // `leptos_corrected_path` builds the `RequestUrl` leptos routes on. The
