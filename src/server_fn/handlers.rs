@@ -451,6 +451,185 @@ mod tests {
                 let value = "https://example.test:8080/form";
                 to is_rejected { equal(None) }
             }
+
+            when the_value_is_a_bare_origin_with_no_path {
+                // Pins the business behavior: a bare-origin absolute URI
+                // (no path at all) is same-origin and resolves to `/`.
+                // NOTE: `http::Uri::path_and_query()` is `Some(&"/")` here
+                // (it is only `None` when NO scheme is present at all), so
+                // this does not actually drive the `map_or("/", ...)`
+                // default's `None` arm on line 205 — that default appears
+                // to be unreachable once `scheme_str()?` above it has
+                // already succeeded. See the audit note in this module's
+                // doc comment / task summary.
+                let value = "http://example.test:8080";
+                to defaults_to_root { equal(Some("/".to_string())) }
+            }
+
+            when the_value_uses_a_different_case_but_same_origin {
+                // `eq_ignore_ascii_case` on both scheme and authority: a
+                // mixed-case scheme/host must still be recognized as the
+                // same origin as the lowercase connection tuple.
+                let value = "HTTP://Example.Test:8080/form";
+                to is_still_treated_as_same_origin {
+                    equal(Some("/form".to_string()))
+                }
+            }
+
+            when the_value_is_a_scheme_less_relative_reference {
+                // No leading `/` and no scheme: `scheme_str()` returns `None`
+                // for a relative reference, so this must fail closed rather
+                // than being treated as same-origin by default.
+                let value = "evil.test/path";
+                to is_rejected { equal(None) }
+            }
+
+            when the_value_is_a_javascript_scheme_uri {
+                // The docstring explicitly calls out `javascript:`-style
+                // schemes as a rejected case — `alert(1)` here parses as a
+                // URI opaque part, not an authority, so `authority()` is
+                // `None`.
+                let value = "javascript:alert(1)";
+                to is_rejected { equal(None) }
+            }
+        }
+    }
+
+    // A bare (non-UTF-8) `HeaderValue` cannot be built from a `&str`, so the
+    // invalid-UTF-8 leaf below constructs the fixture directly rather than
+    // reusing the `same_origin(value: &str)` helper.
+    fn same_origin_from_header(value: HeaderValue) -> Option<String> {
+        same_origin_location("http", "example.test:8080", &value)
+            .and_then(|v| v.to_str().ok().map(str::to_owned))
+    }
+
+    lets_expect! {
+        expect(same_origin_from_header(value.clone())) as the_same_origin_location_header_decode {
+            // `to_str()` requires visible ASCII; `0xFA` is a legal header
+            // BYTE (`from_bytes` accepts 32..=255 excluding 127) but fails
+            // `to_str()`, driving the `value.to_str().ok()?` Err arm on
+            // line 182 — unreachable from any `&str`-built fixture.
+            let value = HeaderValue::from_bytes(b"hello\xfa").unwrap();
+
+            to is_rejected_as_unparseable { equal(None) }
+        }
+    }
+
+    // ----- location_matches_referrer: the referer-echo detector ------------
+    // Detects whether server_fn's post-run `Location` is an echo of the
+    // request's `Referer` (its form-redirect fallback's signature), tolerating
+    // a bare trailing `?` server_fn may append. Reached from
+    // `dispatch_server_fn`, but never spec'd directly until now.
+    fn matches_referrer(location: &str, referrer: &str) -> bool {
+        location_matches_referrer(
+            &HeaderValue::from_str(location).unwrap(),
+            &HeaderValue::from_str(referrer).unwrap(),
+        )
+    }
+
+    lets_expect! {
+        expect(matches_referrer(location, referrer)) as location_matches_referrer_fn {
+            let location = "/form";
+            let referrer = "/form";
+
+            to matches_on_an_exact_match { be_true }
+
+            when the_location_has_a_trailing_bare_question_mark {
+                // server_fn's form-redirect fallback may append a bare `?`
+                // to the referer; the detector must still recognize it as
+                // an echo.
+                let location = "/form?";
+                let referrer = "/form";
+                to still_matches { be_true }
+            }
+
+            when the_location_does_not_match_the_referrer {
+                let location = "/form?evil=1";
+                let referrer = "/form";
+                to does_not_match { be_false }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(location_matches_referrer(&location, &referrer)) as location_matches_referrer_decode_failures {
+            // Both sides start out valid so only the varied side's `to_str()`
+            // Err arm is exercised per context.
+            let location = HeaderValue::from_str("/form").unwrap();
+            let referrer = HeaderValue::from_str("/form").unwrap();
+
+            when the_location_is_not_valid_utf8 {
+                let location = HeaderValue::from_bytes(b"hello\xfa").unwrap();
+                to is_rejected_as_non_matching { equal(false) }
+            }
+
+            when the_referrer_is_not_valid_utf8 {
+                let referrer = HeaderValue::from_bytes(b"hello\xfa").unwrap();
+                to is_rejected_as_non_matching { equal(false) }
+            }
+
+            when both_sides_fail_to_decode_identically {
+                // Both sides carry the SAME invalid-UTF-8 bytes: a
+                // regression that swallowed the `to_str()` Err with
+                // `unwrap_or_default()` (collapsing both to `""`) would
+                // wrongly report a match here, since `"" == ""` is `true`.
+                // The one-sided contexts above cannot catch that specific
+                // regression, because a lone empty side never equals the
+                // other side's real value either way.
+                let location = HeaderValue::from_bytes(b"hello\xfa").unwrap();
+                let referrer = HeaderValue::from_bytes(b"hello\xfa").unwrap();
+                to still_does_not_match { equal(false) }
+            }
+        }
+    }
+
+    // ----- reset_status_after_redirect_strip: post-strip status repair -----
+    // Resets the status of a response whose `Location` was just stripped.
+    // Only fires when the CURRENT status is a redirection; a non-redirect
+    // status must be left untouched — that no-op branch was previously
+    // reachable only indirectly (and never independently pinned).
+    fn reset_status(status: StatusCode, with_error_header: bool) -> StatusCode {
+        let mut response = HttpResponse::build(status);
+        if with_error_header {
+            response.header(
+                SERVER_FN_ERROR_HEADER,
+                HeaderValue::from_static("ServerFnError"),
+            );
+        }
+        let mut res = NtexServerResponse::from(response.finish());
+        reset_status_after_redirect_strip(&mut res);
+        res.0.status()
+    }
+
+    lets_expect! {
+        expect(reset_status(status, with_error_header)) as reset_status_after_redirect_strip_fn {
+            let status = StatusCode::FOUND;
+            let with_error_header = false;
+
+            to resets_a_stripped_success_redirect_to_200 { equal(StatusCode::OK) }
+
+            when the_response_carries_the_server_fn_error_header {
+                let with_error_header = true;
+                to resets_a_stripped_error_redirect_to_500 {
+                    equal(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+
+            when the_status_is_not_a_redirection {
+                // The `is_redirection()` guard's false branch: called on a
+                // response that never had a redirect at all — must be a
+                // strict no-op, not just "not 500".
+                let status = StatusCode::OK;
+                to leaves_the_status_unchanged { equal(StatusCode::OK) }
+            }
+
+            when the_status_is_not_a_redirection_and_not_ok {
+                // A second non-redirection status (404), so the no-op isn't
+                // merely coincidental with the 200 default already used
+                // elsewhere in this table.
+                let status = StatusCode::NOT_FOUND;
+                to leaves_the_status_unchanged { equal(StatusCode::NOT_FOUND) }
+            }
         }
     }
 }
