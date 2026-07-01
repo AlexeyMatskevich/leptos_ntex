@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The inner `SendWrapper` field of the server-function newtypes `NtexRequest`
+  and `NtexServerResponse` is now crate-private (`pub(crate)`), matching
+  `server_fn`'s own `ActixRequest` / `ActixResponse`. Both types are still
+  constructed with `From` and consumed with `take()`; the `SendWrapper`
+  cross-thread-panic hazard (accessing or dropping the value off its origin
+  thread) is now documented on each. **Breaking:** code that reached into the
+  `.0` field directly must use `take()` instead.
+
 ## [0.7.1] - 2026-06-21
 
 ### Fixed

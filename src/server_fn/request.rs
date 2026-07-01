@@ -26,8 +26,24 @@ use crate::server_fn::response::NtexServerResponse;
 /// Implements [`server_fn::request::Req`] so the generic server-function
 /// runtime can pull bytes, strings, streams, and websockets out of the
 /// request. ntex's types are not [`Send`], so the pair is wrapped in
-/// [`SendWrapper`].
-pub struct NtexRequest(pub SendWrapper<(HttpRequest, Payload)>);
+/// [`SendWrapper`] to satisfy the `Send` bound the generic runtime requires.
+///
+/// # Panics
+///
+/// [`SendWrapper`] panics if the wrapped value is accessed or dropped on a
+/// thread other than the one that created it. ntex pins request handling to a
+/// single worker thread, so in normal request handling this never fires; the
+/// hazard only appears if the request is deliberately moved onto another
+/// thread (e.g. `spawn_blocking`) and touched there — the same cross-thread
+/// invariant documented on [`Request`](crate::request::Request).
+///
+/// The inner field is crate-private, mirroring `server_fn`'s `ActixRequest`:
+/// build one with [`NtexRequest::from`] and consume it with
+/// [`NtexRequest::take`]. Narrowing the field only removes direct `.0`
+/// access; the cross-thread panic above still applies to the value itself, as
+/// [`take`](NtexRequest::take) and dropping it off the origin thread both trip
+/// the [`SendWrapper`] thread check.
+pub struct NtexRequest(pub(crate) SendWrapper<(HttpRequest, Payload)>);
 
 impl NtexRequest {
     /// Consumes the wrapper and returns the original ntex request/payload.
