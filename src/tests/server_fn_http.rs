@@ -237,8 +237,7 @@ async fn server_fn_redirect_sets_client_redirect_header_for_xhr() {
 /// A redirect target that is not a valid HTTP header value (e.g. one
 /// carrying a CR/LF/control byte, as an attacker-influenced `?next=` or
 /// `<Redirect>` path might) must degrade gracefully: no Location, no
-/// status change, and crucially no panic in the request handler. Contrast
-/// with a valid path, which still sets Location + 302 for an HTML form.
+/// status change, and crucially no panic in the request handler.
 #[ntex::test]
 async fn redirect_with_invalid_path_degrades_without_panic() {
     use leptos::context::provide_context;
@@ -267,8 +266,22 @@ async fn redirect_with_invalid_path_degrades_without_panic() {
             "invalid redirect path must not change the status"
         );
     });
+}
 
-    // Valid path: still behaves correctly (Location + 302 for HTML).
+/// Contrast with the invalid-path degrade case above: a VALID redirect path
+/// still sets Location + 302 for an HTML form. Kept as its own test (rather
+/// than a second assertion block bundled into the degrade test) so a CI
+/// failure here is correctly attributed to the success path, not misread as
+/// a regression in the invalid-path handling.
+#[ntex::test]
+async fn redirect_with_valid_path_still_sets_location_and_302() {
+    use leptos::context::provide_context;
+    use leptos::reactive::owner::Owner;
+
+    let mock_req = test::TestRequest::with_uri("/")
+        .header("Accept", "text/html")
+        .to_http_request();
+
     let owner = Owner::new();
     owner.with(|| {
         provide_context(crate::request::Request::new(&mock_req));
@@ -289,6 +302,19 @@ async fn redirect_with_invalid_path_degrades_without_panic() {
     });
 }
 
+// NOTE: this is ALSO the success-path exercise of `dispatch_server_fn`'s
+// referer-echo branch (handlers.rs:85-88, `location_is_referrer == true`
+// with `referrer.clone()` present): server_fn's OWN `run_on_server` always
+// calls `res.redirect(referer)` when `accepts_html` — for both `Ok` and
+// `Err` outcomes — so `EchoName` (an Ok-returning fn with no explicit
+// redirect of its own) already has server_fn set `Location` to the exact
+// Referer before `dispatch_server_fn` ever runs its post-processing. That
+// makes `location_is_referrer` true and drives the SUCCESS sibling of the
+// branch pinned on the error side by
+// `server_fn_html_form_same_origin_error_redirect_is_preserved` — replacing
+// `referrer.clone()` with the raw, un-normalized `Referer` header (e.g.
+// dropping the `same_origin_location` normalization) fails this test's
+// exact-location assertion below.
 #[ntex::test]
 async fn server_fn_html_form_falls_back_to_same_origin_referrer() {
     register_explicit::<EchoName>();
@@ -328,6 +354,47 @@ async fn server_fn_html_form_does_not_fallback_to_different_port_referrer() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers().get("location").is_none());
+}
+
+/// The genuine "nothing to fall back to" case: an HTML-accepting client that
+/// sends NO `Referer` header at all. Every other referer-fallback test in
+/// this file sends a Referer (matching-origin or wrong-origin); none omits
+/// it entirely while still requesting `Accept: text/html` against an `Ok`,
+/// no-redirect server fn.
+///
+/// With no Referer, server_fn's OWN `run_on_server` still calls
+/// `res.redirect(referer.as_deref().unwrap_or("/"))` for any HTML-accepting
+/// request — Ok or Err — so the response is a `302` to the bare root `/`,
+/// NOT a plain `200`. `raw_referrer` is `None` on our side, so
+/// `location_is_referrer` is false and the bare-200 same-origin fallback
+/// (handlers.rs:93-99) never fires either; the `/` root IS same-origin, so
+/// the wholesale same-origin guard leaves it untouched. This pins that
+/// exact shape: a regression that suppressed this fallback (e.g. treating
+/// `referer.unwrap_or("/")`'s default target as somehow un-routable) would
+/// change the observed status/Location here.
+#[ntex::test]
+async fn server_fn_html_form_with_no_referer_redirects_to_bare_root() {
+    register_explicit::<EchoName>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri(EchoName::PATH)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/html")
+        .set_payload("name=Alice")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "server_fn's own form-redirect fallback defaults to the bare root when no Referer is present"
+    );
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/"),
+        "with no Referer present, the fallback target is the bare root '/'"
+    );
 }
 
 #[ntex::test]
@@ -713,7 +780,13 @@ async fn payload_limit_streaming_overflow_returns_413() {
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let body = test::read_body(resp).await;
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("10"), "body should mention limit: {text:?}");
+    // Exact match, not `.contains("10")`: the configured limit (10) is a
+    // fixed, known value here, so the full production format string
+    // (`oversize_response`'s `"payload exceeds limit of {limit} bytes"`) is
+    // fully determined. A substring check would also pass for a regression
+    // that reported the observed body size instead of the configured limit
+    // (e.g. "...limit of 105 bytes", which still contains "10").
+    assert_eq!(text, "payload exceeds limit of 10 bytes");
 }
 
 /// Oversize request declared via `Content-Length` is rejected by the
@@ -862,6 +935,58 @@ async fn server_fn_paths_and_get_service_roundtrip() {
     assert!(missing.is_none());
 }
 
+/// `handle_server_fns_with_context`'s else-branch has two HTTP-level
+/// outcomes when `get_server_fn_service` returns `None`: a 400 with a
+/// diagnostic body when NO path matches at all (`allowed.is_empty()`), or a
+/// 405 with an `Allow` header when the path matches but the method doesn't
+/// (`catchall_handle_server_fns_returns_405_on_method_mismatch` in
+/// `tests/integration.rs`). Only the 405 sibling was ever driven through the
+/// actual route; this pins the negative direction: a wholly unregistered
+/// path must 400 and name the requested route in the body.
+#[ntex::test]
+async fn catchall_returns_400_for_a_wholly_unregistered_path() {
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/does_not_exist")
+        .set_payload("")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    // Exact body from `handle_server_fns_with_context`'s `allowed.is_empty()` branch.
+    assert_eq!(
+        text,
+        "Could not find a server function at the route /api/does_not_exist. \n\nIt's likely that either\n1. The API prefix you specify in the `#[server]` macro doesn't match the prefix at which your server function handler is mounted, or\n2. You are on a platform that doesn't support automatic server function registration and you need to call register_explicit() on the server function type, somewhere in your `main` function."
+    );
+}
+
+/// Sibling of the 400 test above: a GET to a POST-only registered server fn
+/// must 405 with an EXACT `Allow: POST` header — the direct HTTP-level
+/// analog of `catchall_handle_server_fns_returns_405_on_method_mismatch` in
+/// `tests/integration.rs`, driven here against `EchoName` through
+/// `handle_server_fns()` in this file's own app-building style.
+#[ntex::test]
+async fn catchall_returns_405_with_allow_header_on_method_mismatch() {
+    register_explicit::<EchoName>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::get().uri(EchoName::PATH).to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        resp.headers()
+            .get(header::ALLOW)
+            .and_then(|v| v.to_str().ok()),
+        Some("POST"),
+        "the Allow header must name exactly the registered method"
+    );
+}
+
 // -- Payload boundary tests ----------------------------------------
 
 /// Payload exactly at the limit must be accepted (the check is `>`,
@@ -928,4 +1053,48 @@ async fn payload_limit_one_over_limit_returns_413() {
 
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// -- GET-method server fn dispatch ----------------------------------
+
+/// A GET-method server fn (`input = GetUrl`): every other fixture driven
+/// through `handle_server_fns()`/`register_leptos_routes` in this file uses
+/// the `#[server]` macro's default POST method, so no test here ever drove
+/// an actual GET request through either handler's method-dispatch logic —
+/// the only GET-related assertion elsewhere is a pure registry-level lookup
+/// (`server_fn_paths_and_get_service_roundtrip`), which never touches HTTP
+/// dispatch at all.
+#[server(
+    name = EchoNameGet,
+    prefix = "/api",
+    endpoint = "echo_name_get",
+    input = server_fn::codec::GetUrl,
+    server = crate::NtexServerFnBackend
+)]
+async fn echo_name_get(name: String) -> Result<String, ServerFnError> {
+    Ok(format!("Hello, {name}"))
+}
+
+/// Closes the method-dispatch gap: a GET request to a GET-registered server
+/// fn must dispatch through `handle_server_fns()` and return the expected
+/// body — pinning that `.method(server_fn.method())` (and the equivalent
+/// generic `req.method()` branch in the catchall) is not hardcoded/defaulted
+/// to POST.
+#[ntex::test]
+async fn handles_server_fn_get() {
+    register_explicit::<EchoNameGet>();
+    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+
+    let req = test::TestRequest::get()
+        .uri(&format!("{}?name=Carol", EchoNameGet::PATH))
+        .header("Accept", "application/json")
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    // Exact JSON-encoded server_fn output, not a substring.
+    assert_eq!(text, "\"Hello, Carol\"");
 }
