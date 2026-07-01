@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-thread-panic hazard (accessing or dropping the value off its origin
   thread) is now documented on each. **Breaking:** code that reached into the
   `.0` field directly must use `take()` instead.
+- The minimum `ntex` requirement is now `3.10.0` (up from `3.9.6`), which
+  resolves `ntex-server` to `3.10.4`. That release fixes lost wakeups in the
+  server accept loop — a partial fix for [ntex#911](https://github.com/ntex-rs/ntex/issues/911),
+  an io-uring startup race where the first connection after `ServerStatus::Ready`
+  could intermittently fail with `ECONNREFUSED` / `POLLHUP`.
 
 ## [0.7.1] - 2026-06-21
 

@@ -33,7 +33,7 @@ leptos_meta = { version = "0.8.6", features = ["ssr", "nonce"] }
 leptos_router = { version = "0.8.13", features = ["ssr"] }
 lru = "0.18"
 mime = "0.3"
-ntex = "3.9.6"
+ntex = "3.10.0"
 ntex-files = "3.2.0"
 percent-encoding = "2.3"
 or_poisoned = "0.1.0"
