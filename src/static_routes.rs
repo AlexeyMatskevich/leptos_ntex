@@ -1654,14 +1654,12 @@ async fn write_static_route_managed(
         dir.create_dir_all(METADATA_DIRECTORY)?;
         publish_file(&dir, metadata_temp, &metadata_path)?;
         #[cfg(unix)]
-        dir.open_dir(METADATA_DIRECTORY)?
-            .into_std_file()
-            .sync_all()?;
+        crate::fs_boundary::sync_dir(&dir.open_dir(METADATA_DIRECTORY)?)?;
         #[cfg(test)]
         test_hooks::after_metadata(&file_path)?;
         publish_file(&dir, html_temp, &name)?;
         #[cfg(unix)]
-        dir.try_clone()?.into_std_file().sync_all()?;
+        crate::fs_boundary::sync_dir(&dir)?;
         coordination.commit();
         Ok::<_, StaticStorageError>(())
     })

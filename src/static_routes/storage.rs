@@ -374,7 +374,7 @@ impl Storage {
                 None => {
                     control.file_mut().write_all(&encode(limits))?;
                     control.file_mut().sync_all()?;
-                    dir.try_clone()?.into_std_file().sync_all()?;
+                    crate::fs_boundary::sync_dir(&dir)?;
                     0
                 }
             };

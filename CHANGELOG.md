@@ -103,6 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlinks, refuses directories, FIFOs and hard-linked inodes, and ends the
   lease explicitly, for the per-directory publication and scratch locks as
   well as the policy control record.
+- Sync published directories through a readable handle: cap-std holds
+  directories as `O_PATH` descriptors on Linux, which `fsync` rejects with
+  `EBADF`, so every static publication failed there with 500.
 - Coordinate static publication through case and Unicode path aliases with a
   per-directory commit lock. Keep rendering and temporary-file preparation
   outside that lock, and validate pinned reader snapshots after releasing it.

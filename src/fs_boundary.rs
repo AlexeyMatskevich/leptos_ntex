@@ -146,6 +146,16 @@ pub(crate) fn canonicalize_existing_prefix(
     Ok((canonical, suffix))
 }
 
+/// Durably records directory entry changes (renames, creations) below `dir`.
+///
+/// cap-std keeps directories as `O_PATH` handles where the platform offers
+/// them (Linux, Android, FreeBSD), and `fsync` refuses such a handle with
+/// `EBADF`; the directory is therefore reopened for reading through the same
+/// capability before it is synced.
+pub(crate) fn sync_dir(dir: &Dir) -> io::Result<()> {
+    dir.open(".")?.sync_all()
+}
+
 pub(crate) fn open_regular(dir: &Dir, path: &Path) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true);
