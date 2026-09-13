@@ -66,6 +66,19 @@ async fn registered_page<A: IntoView + 'static, V: IntoView + 'static>(
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
+    // Out-of-order streaming must send the shell with its fallback before the
+    // resource resolves; blocking modes await the value inside the response,
+    // so their resource is released up front.
+    let release = has_resource.then(|| {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        crate::tests::RESOURCE_RELEASE.with(|release| *release.borrow_mut() = Some(receiver));
+        sender
+    });
+    let streams_out_of_order = uri == "/out";
+    let mut release = release;
+    if !streams_out_of_order && let Some(release) = release.take() {
+        let _ = release.send(());
+    }
     let response = test::call_service(
         &app,
         test::TestRequest::default()
@@ -74,6 +87,10 @@ async fn registered_page<A: IntoView + 'static, V: IntoView + 'static>(
             .to_request(),
     )
     .await;
+    // The shell is out; only the body stream can carry the resolved fragment.
+    if let Some(release) = release.take() {
+        let _ = release.send(());
+    }
     let status = response.status();
     let content_type = response
         .headers()

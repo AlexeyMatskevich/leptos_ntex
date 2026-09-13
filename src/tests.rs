@@ -294,15 +294,28 @@ fn unit_shell() -> impl IntoView {
 //     RESOLVED content in place and NO fallback marker.
 // Deleting the InOrder/Async match arm falls back to the OutOfOrder renderer,
 // which a fallback-marker assertion then catches.
+thread_local! {
+    // A fixture may hand the pending resource an explicit release, so that
+    // the moment it resolves is decided by the test rather than by timing.
+    pub(super) static RESOURCE_RELEASE: std::cell::RefCell<Option<futures::channel::oneshot::Receiver<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[component]
 fn SuspendedView() -> impl IntoView {
     let data = Resource::new(
         || (),
         |_| async move {
-            // A real delay so the resource is still pending when the shell
-            // renders. OutOfOrder then streams the shell + fallback first and
-            // the resolved fragment later; InOrder/Async block for the value.
-            ntex::time::sleep(ntex::time::Millis(50)).await;
+            match RESOURCE_RELEASE.with(|release| release.borrow_mut().take()) {
+                // The test releases the value once the shell is out, so
+                // OutOfOrder demonstrably streams the fallback first.
+                Some(release) => {
+                    let _ = release.await;
+                }
+                // Without a release, a real delay keeps the resource pending
+                // while the shell renders in ordinary fixtures.
+                None => ntex::time::sleep(ntex::time::Millis(50)).await,
+            }
             String::from("RESOLVED-CONTENT")
         },
     );

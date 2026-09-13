@@ -502,7 +502,7 @@ async fn concurrent_regeneration(delete_after_first: bool) -> RegenerationObserv
             }
         }
     };
-    let routes = crate::generate_route_list(app_fn.clone());
+    let routes = crate::tests::gen_route_list(app_fn.clone());
     let app = test::init_service(
         NtexApp::new()
             .state(static_options(&root))
@@ -692,7 +692,7 @@ async fn terminated_regeneration_inner(
             </Routes></Router> }
         }
     };
-    let routes = crate::generate_route_list(app_fn.clone());
+    let routes = crate::tests::gen_route_list(app_fn.clone());
     let runtime = routes[0].runtime.clone();
     let app = test::init_service(
         NtexApp::new()
