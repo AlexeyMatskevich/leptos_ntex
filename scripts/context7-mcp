@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Wrapper script for Context7 MCP server
-# Fetches API key from Bitwarden (rbw) to avoid storing secrets in repo
+# Launch an already installed server; provisioning never runs with this key.
+set -u
 
-export CONTEXT7_API_KEY="$(rbw get context7 2>/dev/null)"
-
-if [ -z "$CONTEXT7_API_KEY" ]; then
-  echo "Warning: Could not fetch context7 API key from rbw. Running without API key (rate limited)." >&2
+context7_bin=$(command -v "${CONTEXT7_MCP_BIN:-context7-mcp}") || {
+  echo "Error: Install a reviewed Context7 MCP version first; see CONTRIBUTING.md. Set CONTEXT7_MCP_BIN to its executable path." >&2
+  exit 1
+}
+# The wrapper and the installed command have the same default name. Avoid
+# recursively executing this wrapper when scripts/ comes first in PATH.
+if [ "$context7_bin" -ef "${BASH_SOURCE[0]}" ]; then
+  echo "Error: Set CONTEXT7_MCP_BIN to the installed server executable, not this wrapper." >&2
+  exit 1
 fi
-
-exec npx -y @upstash/context7-mcp@latest "$@"
+export CONTEXT7_API_KEY="$(rbw get context7 2>/dev/null || true)"
+if [ -z "$CONTEXT7_API_KEY" ]; then
+  echo "Warning: No Context7 key in rbw; using the server without a key." >&2
+fi
+exec "$context7_bin" "$@"

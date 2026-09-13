@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Wrapper script for GitHub MCP server
-# Fetches personal access token from Bitwarden (rbw) to avoid storing secrets in repo
+# Launch an already installed server; provisioning never runs with this token.
+set -u
 
-export GITHUB_PERSONAL_ACCESS_TOKEN="$(rbw get github_personal_access_token 2>/dev/null)"
-
+github_bin=$(command -v "${GITHUB_MCP_BIN:-mcp-server-github}") || {
+  echo "Error: Install a reviewed GitHub MCP server first; see CONTRIBUTING.md. Set GITHUB_MCP_BIN to its executable path." >&2
+  exit 1
+}
+if [ "$github_bin" -ef "${BASH_SOURCE[0]}" ]; then
+  echo "Error: GITHUB_MCP_BIN must point to the installed server, not this wrapper." >&2
+  exit 1
+fi
+export GITHUB_PERSONAL_ACCESS_TOKEN="$(rbw get github_personal_access_token 2>/dev/null || true)"
 if [ -z "$GITHUB_PERSONAL_ACCESS_TOKEN" ]; then
   echo "Error: Could not fetch github_personal_access_token from rbw" >&2
   exit 1
 fi
-
-exec npx -y @modelcontextprotocol/server-github "$@"
+exec "$github_bin" "$@"
