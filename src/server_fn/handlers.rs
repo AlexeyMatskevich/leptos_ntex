@@ -302,6 +302,31 @@ where
         })
 }
 
+/// Consumes a request body that no server function will read, bounded by the
+/// configured payload limit.
+///
+/// ntex closes the connection after a response whose request body was left
+/// unread. Bytes the client is still sending then sit unread in the socket,
+/// so that close becomes a reset which can overtake the response; a client
+/// posting to an unknown endpoint would never see its `400`. Draining first
+/// lets the connection close in order. A body beyond the limit is abandoned
+/// and ntex closes the connection as for any oversized request.
+async fn drain_payload(mut payload: Payload, limit: usize) {
+    use futures::StreamExt;
+    let mut seen = 0usize;
+    while let Some(chunk) = payload.next().await {
+        match chunk {
+            Ok(bytes) => {
+                seen = seen.saturating_add(bytes.len());
+                if seen > limit {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Builds a canonical `413 Payload Too Large` response with a human-
 /// readable body that states the configured limit.
 fn oversize_response(limit: usize) -> HttpResponse {
@@ -398,6 +423,7 @@ where
             if let Some(service) = get_server_fn_service(req.path(), req.method()) {
                 dispatch_server_fn(service, req, payload.into_inner(), additional_context).await
             } else {
+                drain_payload(payload.into_inner(), limit).await;
                 let allowed = server_fn_methods(req.path());
                 if allowed.is_empty() {
                     HttpResponse::BadRequest().body(format!(

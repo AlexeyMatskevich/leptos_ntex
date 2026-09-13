@@ -261,6 +261,57 @@ fn listed_paths() -> (bool, bool) {
     )
 }
 
+/// A request body the catch-all cannot hand to any function: the handler must
+/// still consume it (within the limit) so that its error response leaves on an
+/// orderly close rather than a reset racing the response.
+#[derive(Clone, Copy)]
+enum UnusedBody {
+    UnknownEndpoint,
+    WrongMethod,
+    BeyondLimit,
+}
+async fn unused_body(case: UnusedBody) -> (StatusCode, bool) {
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    register_explicit::<EchoName>();
+    let limit = 64;
+    let app = test::init_service(
+        NtexApp::new()
+            .state(crate::LeptosServerFnConfig::new().with_payload_limit(limit))
+            .route("/api/{tail}*", handle_server_fns()),
+    )
+    .await;
+    let (uri, method) = match case {
+        UnusedBody::UnknownEndpoint | UnusedBody::BeyondLimit => {
+            ("/api/does_not_exist", Method::POST)
+        }
+        UnusedBody::WrongMethod => (EchoName::PATH, Method::GET),
+    };
+    let chunks = if matches!(case, UnusedBody::BeyondLimit) {
+        8
+    } else {
+        2
+    };
+    let drained = std::sync::Arc::new(AtomicBool::new(false));
+    let observed = drained.clone();
+    let body = futures::stream::iter((0..chunks).map(|_| {
+        Ok::<_, ntex::http::error::PayloadError>(ntex::util::Bytes::from(vec![b'a'; 16]))
+    }))
+    .chain(futures::stream::poll_fn(move |_| {
+        observed.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None)
+    }));
+    let mut request = test::TestRequest::with_uri(uri)
+        .method(method)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .to_request();
+    request.replace_payload(ntex::http::Payload::Stream(Box::pin(body)));
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let _ = test::read_body(response).await;
+    (status, drained.load(Ordering::SeqCst))
+}
+
 const MISSING_DIAGNOSTIC: &str = "Could not find a server function at the route /api/does_not_exist. \n\nIt's likely that either\n1. The API prefix you specify in the `#[server]` macro doesn't match the prefix at which your server function handler is mounted, or\n2. You are on a platform that doesn't support automatic server function registration and you need to call register_explicit() on the server function type, somewhere in your `main` function.";
 
 lets_expect! {
@@ -278,6 +329,18 @@ lets_expect! {
         when function_is_missing {
             let spec = RequestSpec { uri: "/api/does_not_exist".into(), ..Default::default() };
             to explain_missing_registration { have_status(StatusCode::BAD_REQUEST), have_body(MISSING_DIAGNOSTIC) }
+        }
+    }
+    expect(run_ntex(unused_body(case))) as unused_request_body {
+        let case = UnusedBody::UnknownEndpoint;
+        to is_consumed_before_the_rejection { equal((StatusCode::BAD_REQUEST, true)) }
+        when the_method_is_wrong {
+            let case = UnusedBody::WrongMethod;
+            to is_consumed_before_the_rejection { equal((StatusCode::METHOD_NOT_ALLOWED, true)) }
+        }
+        when the_body_exceeds_the_limit {
+            let case = UnusedBody::BeyondLimit;
+            to is_abandoned_at_the_limit { equal((StatusCode::BAD_REQUEST, false)) }
         }
     }
     expect(run_ntex(response(RequestSpec { body: "name=Bob".into(), ..Default::default() }, true))) as service_config_registration {
