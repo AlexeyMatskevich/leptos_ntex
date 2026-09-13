@@ -150,6 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message limit to the codec, and validate handshake and frame fields before
   ntex discards them. Preserve valid fragmentation, UTF-8 and offered
   subprotocol negotiation. Successful upgrades have no transfer encoding.
+- Finish the WebSocket close handshake: after sending a Close frame the
+  server drains what the peer still sends, bounded by a one-second wait,
+  before shutting the transport down, so an oversized frame in flight no
+  longer turns the close into a reset that overtakes the Close frame.
 - Terminate HTTP/1 connections on a response-body error before ntex can insert a
   second HTTP response into the original body. This is a containment workaround
   for the dependency's error path. HTTP/2 retains native stream-error handling;

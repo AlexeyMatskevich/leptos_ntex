@@ -141,6 +141,28 @@ type UpgradedConnection = (
     NtexServerResponse,
 );
 
+/// How long a closing server waits for the peer to finish its side of the
+/// close handshake before shutting the transport down.
+const CLOSE_DRAIN_TIMEOUT: ntex::time::Millis = ntex::time::Millis(1_000);
+
+/// Consumes and discards every incoming byte, so that a closing connection
+/// drains what the peer still sends without decoding it.
+struct Drain;
+
+impl Decoder for Drain {
+    type Item = ();
+    type Error = std::io::Error;
+
+    fn decode(&self, src: &mut NBytesMut) -> Result<Option<()>, std::io::Error> {
+        if src.is_empty() {
+            Ok(None)
+        } else {
+            src.clear();
+            Ok(Some(()))
+        }
+    }
+}
+
 pub(crate) async fn upgrade<E, I>(request: HttpRequest) -> Result<UpgradedConnection, E>
 where
     E: FromServerFnError,
@@ -199,7 +221,15 @@ where
         drop(cancel);
         if let Some(reason) = reason {
             let _ = io.encode(Message::Close(reason), &ws::Codec::new());
-            // ntex's configured disconnect timeout bounds graceful flushing.
+            // RFC 6455 §7.1.1: after sending Close, keep reading until the peer
+            // closes. Bytes the peer is still sending (for example the rest of
+            // an oversized frame) would otherwise remain unread in the socket,
+            // and closing then answers with a reset that can overtake the Close
+            // frame. The wait is bounded like ntex's own disconnect timeout.
+            let _ = ntex::time::timeout(CLOSE_DRAIN_TIMEOUT, async {
+                while io.recv(&Drain).await.is_ok_and(|item| item.is_some()) {}
+            })
+            .await;
             io.close();
             io.on_disconnect().await;
         }
