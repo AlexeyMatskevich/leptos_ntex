@@ -1,613 +1,407 @@
 use super::*;
-use crate::register_leptos_routes;
-use ntex::http::{StatusCode, header};
+use crate::{LeptosRoutes, register_leptos_routes};
+use lets_expect::*;
+use ntex::http::{Method as HttpMethod, StatusCode, header};
 use ntex::web::{App as NtexApp, test};
 
-#[ntex::test]
-async fn renders_root_route() {
-    // No server-fn setup: these render tests only request rendered routes
-    // ('/', '/about'), never an `/api` server fn, so the registration + catchall
-    // were dead scaffolding.
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), unit_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Leptos over ntex"));
+#[derive(Clone, Copy)]
+enum Registration {
+    App,
+    ServiceConfig,
 }
 
-#[ntex::test]
-async fn renders_about_route() {
-    // No server-fn setup: these render tests only request rendered routes
-    // ('/', '/about'), never an `/api` server fn, so the registration + catchall
-    // were dead scaffolding.
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), unit_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/about").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("This route is generated from the Leptos router"));
+#[derive(Debug)]
+struct Page {
+    status: StatusCode,
+    content_type: Option<String>,
+    html: String,
 }
 
-/// Regression for the `*splat` route conversion (`to_ntex_path`): ntex
-/// must receive the tail match `{any}*`, not actix's single-segment regex
-/// `{any:.*}`. The two states of the URL-depth axis:
-///   * single segment under the splat — matched under BOTH syntaxes;
-///   * nested path under the splat — used to fall through to the router
-///     fallback ("Not Found") under `{any:.*}`.
-#[ntex::test]
-async fn splat_route_serves_nested_paths() {
-    use crate::LeptosRoutes;
-    let routes = gen_route_list(SplatApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, splat_shell)).await;
-
-    for uri in ["/files/report.txt", "/files/a/b/report.txt"] {
-        let req = test::TestRequest::with_uri(uri).to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK, "splat must match {uri}");
-
-        let body = test::read_body(resp).await;
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            html.contains("Splat Files"),
-            "{uri} must render the splat view, not the fallback: {html}"
-        );
+fn render_page(marker: &'static str) -> impl Fn(&Page) -> AssertionResult {
+    move |page| {
+        let mut errors = Vec::new();
+        if page.status != StatusCode::OK {
+            errors.push(format!("expected 200, got {}", page.status));
+        }
+        if page.content_type.as_deref() != Some("text/html; charset=utf-8") {
+            errors.push(format!(
+                "expected HTML content type, got {:?}",
+                page.content_type
+            ));
+        }
+        if !page.html.contains(marker) {
+            errors.push(format!("missing {marker:?} in body {:?}", page.html));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AssertionError::new(errors))
+        }
     }
 }
 
-/// The `:param` sibling of the splat conversion: a brace segment matches
-/// exactly one segment — and keeps matching it after the splat fix.
-#[ntex::test]
-async fn param_route_serves_single_segment() {
-    use crate::LeptosRoutes;
-    let routes = gen_route_list(SplatApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, splat_shell)).await;
-
-    let req = test::TestRequest::with_uri("/users/42").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("User Param"),
-        "param route must render: {html}"
-    );
-
-    // The boundary that makes "exactly one segment" meaningful: a TWO-segment
-    // URL must NOT match the single-segment `:param` route (it falls through to
-    // the fallback). Without this, the positive case alone would also pass a
-    // `{id}*`-style multi-segment match.
-    let req = test::TestRequest::with_uri("/users/42/extra").to_request();
-    let resp = test::call_service(&app, req).await;
-    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
-    assert!(
-        !html.contains("User Param"),
-        "a 2-segment URL must not match the single-segment :param route: {html}"
-    );
-}
-
-/// `ServiceConfig` counterpart of `splat_route_serves_nested_paths`: the
-/// `&mut ServiceConfig` impl of `LeptosRoutes` (`register_leptos_routes`)
-/// registers paths through its own, separately-written match arms
-/// (`leptos_routes.rs` lines 184-277), so the splat/nested-path regression
-/// must be pinned on THIS registration path too, not just the `App` impl.
-#[ntex::test]
-async fn splat_route_serves_nested_paths_via_service_config() {
-    let routes = gen_route_list(SplatApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), splat_shell);
-    }))
+// The upstream global suppression race is covered by a separate controlled
+// reproduction. Resource-bearing fixtures here serialize against generation;
+// this guard does not establish production isolation (see ROUTE_GEN_VS_RENDER).
+#[allow(clippy::await_holding_lock)]
+async fn registered_page<A: IntoView + 'static, V: IntoView + 'static>(
+    registration: Registration,
+    app_fn: fn() -> A,
+    shell: fn() -> V,
+    uri: &'static str,
+    method: HttpMethod,
+    has_resource: bool,
+) -> Page {
+    let routes = gen_route_list(app_fn);
+    let app = NtexApp::new();
+    let app = match registration {
+        Registration::App => app.leptos_routes(routes, shell),
+        Registration::ServiceConfig => app.configure(move |cfg| {
+            register_leptos_routes(cfg, routes, shell);
+        }),
+    };
+    let app = test::init_service(app).await;
+    let _resource_guard = has_resource.then(|| {
+        ROUTE_GEN_VS_RENDER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let response = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(method)
+            .uri(uri)
+            .to_request(),
+    )
     .await;
-
-    for uri in ["/files/report.txt", "/files/a/b/report.txt"] {
-        let req = test::TestRequest::with_uri(uri).to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK, "splat must match {uri}");
-
-        let body = test::read_body(resp).await;
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            html.contains("Splat Files"),
-            "{uri} must render the splat view, not the fallback: {html}"
-        );
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let html = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+    Page {
+        status,
+        content_type,
+        html,
     }
 }
 
-/// `ServiceConfig` counterpart of `param_route_serves_single_segment`: see
-/// `splat_route_serves_nested_paths_via_service_config` for why the
-/// ServiceConfig registration path needs its own pin.
-#[ntex::test]
-async fn param_route_serves_single_segment_via_service_config() {
-    let routes = gen_route_list(SplatApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), splat_shell);
-    }))
-    .await;
+lets_expect! {
+    expect(run_ntex(registered_page(registration, UnitApp, unit_shell, uri, HttpMethod::GET, false))) as registered_pages {
+        let registration = Registration::App;
+        let uri = "/";
+        to renders_the_root { render_page("Leptos over ntex") }
+        when requesting_about {
+            let uri = "/about";
+            to renders_the_about_page { render_page("This route is generated from the Leptos router") }
+        }
+        when requesting_an_unregistered_path {
+            let uri = "/missing";
+            to falls_through_to_the_app_default { have(status) equal(StatusCode::NOT_FOUND) }
+        }
+    }
+    expect(run_ntex(registered_page(registration, UnitApp, unit_shell, uri, HttpMethod::GET, false))) as registered_pages_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/";
 
-    let req = test::TestRequest::with_uri("/users/42").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+        to renders_the_root { render_page("Leptos over ntex") }
+        when requesting_about {
+            let uri = "/about";
+            to renders_the_about_page { render_page("This route is generated from the Leptos router") }
+        }
+        when requesting_an_unregistered_path {
+            let uri = "/missing";
+            to falls_through_to_the_app_default { have(status) equal(StatusCode::NOT_FOUND) }
+        }
 
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("User Param"),
-        "param route must render: {html}"
-    );
+    }
+    expect(run_ntex(registered_page(registration, SplatApp, splat_shell, uri, HttpMethod::GET, false))) as parameter_route_matching {
+        let registration = Registration::App;
+        let uri = "/users/42";
+        to matches_one_segment { render_page("User Param") }
+        when the_parameter_is_absent {
+            let uri = "/users/";
+            to rejects_the_missing_parameter { have(status) equal(StatusCode::NOT_FOUND) }
+        }
+        when the_parameter_has_an_extra_segment {
+            let uri = "/users/42/extra";
+            to rejects_more_than_one_segment { have(status) equal(StatusCode::NOT_FOUND) }
+        }
+    }
+    expect(run_ntex(registered_page(registration, SplatApp, splat_shell, uri, HttpMethod::GET, false))) as parameter_route_matching_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/users/42";
 
-    let req = test::TestRequest::with_uri("/users/42/extra").to_request();
-    let resp = test::call_service(&app, req).await;
-    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
-    assert!(
-        !html.contains("User Param"),
-        "a 2-segment URL must not match the single-segment :param route: {html}"
-    );
+        to matches_one_segment { render_page("User Param") }
+        when the_parameter_is_absent {
+            let uri = "/users/";
+            to rejects_the_missing_parameter { have(status) equal(StatusCode::NOT_FOUND) }
+        }
+        when the_parameter_has_an_extra_segment {
+            let uri = "/users/42/extra";
+            to rejects_more_than_one_segment { have(status) equal(StatusCode::NOT_FOUND) }
+        }
+
+    }
+    expect(run_ntex(registered_page(registration, SplatApp, splat_shell, uri, HttpMethod::GET, false))) as splat_route_matching {
+        let registration = Registration::App;
+        let uri = "/files/report.txt";
+        to matches_one_segment { render_page("Splat Files") }
+        when the_tail_has_nested_segments {
+            let uri = "/files/a/b/report.txt";
+            to matches_the_complete_tail { render_page("Splat Files") }
+        }
+    }
+    expect(run_ntex(registered_page(registration, SplatApp, splat_shell, uri, HttpMethod::GET, false))) as splat_route_matching_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/files/report.txt";
+
+        to matches_one_segment { render_page("Splat Files") }
+        when the_tail_has_nested_segments {
+            let uri = "/files/a/b/report.txt";
+            to matches_the_complete_tail { render_page("Splat Files") }
+        }
+
+    }
 }
 
-#[ntex::test]
-async fn renders_in_order_ssr_route() {
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), mixed_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/in").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("InOrder"));
-}
-
-#[ntex::test]
-async fn renders_async_ssr_route() {
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), mixed_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/async").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Async"));
-}
-
-// MixedApp's `/out` route (the default/no-suspense `SsrMode::OutOfOrder`
-// case) was previously only exercised by the HEAD-parity tests, which check
-// status/Content-Type equality but never read the body. Pin the body content
-// too, mirroring `renders_in_order_ssr_route` / `renders_async_ssr_route`
-// above — a regression specific to the OutOfOrder match arm's own body
-// wouldn't otherwise be caught for this fixture.
-#[ntex::test]
-async fn renders_out_of_order_ssr_route() {
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), mixed_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/out").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("OutOfOrder"));
-}
-
-// `SsrMode::PartiallyBlocked` has its own dispatch arm in `leptos_routes.rs`
-// (both the `App` impl and the `&mut ServiceConfig` impl), calling
-// `render_app_to_stream_with_context_and_replace_blocks`. Per that function's
-// doc, `replace_blocks` is currently a no-op upstream, so PartiallyBlocked
-// renders identically to OutOfOrder — but the dispatch arm itself must still
-// be reached, not silently fall through to `unsupported_ssr_mode_route`
-// (which would 500 instead of rendering the view).
 #[component]
 fn PartiallyBlockedApp() -> impl IntoView {
     provide_meta_context();
     view! {
-        <Router>
-            <main>
-                <Routes fallback=|| view! { <h1>"Not Found"</h1> }>
-                    <Route
-                        path=path!("/partial")
-                        ssr=SsrMode::PartiallyBlocked
-                        view=|| view! { <h1>"PartiallyBlocked"</h1> }
-                    />
-                </Routes>
-            </main>
-        </Router>
+        <Router><main><Routes fallback=|| ()>
+            <Route path=path!("/partial") ssr=SsrMode::PartiallyBlocked view=|| view! { <h1>"PartiallyBlocked"</h1> }/>
+        </Routes></main></Router>
     }
 }
-
 fn partially_blocked_shell() -> impl IntoView {
-    view! {
-        <!DOCTYPE html>
-        <html lang="en">
-            <head>
-                <meta charset="utf-8"/>
-                <MetaTags/>
-            </head>
-            <body>
-                <PartiallyBlockedApp/>
-            </body>
-        </html>
+    view! { <!DOCTYPE html><html><head><MetaTags/></head><body><PartiallyBlockedApp/></body></html> }
+}
+
+// A separate subject covers ready mode dispatch; the pending-resource subject
+// below observes each mode's distinct Suspense result. PartiallyBlocked's
+// replace_blocks argument is currently a documented no-op upstream.
+lets_expect! {
+    expect(run_ntex(registered_page(registration, MixedApp, mixed_shell, uri, HttpMethod::GET, false))) as ready_ssr_modes {
+        let registration = Registration::App;
+        let uri = "/out";
+        to renders_out_of_order { render_page("OutOfOrder") }
+        when configured_in_order {
+            let uri = "/in";
+            to renders_in_order { render_page("InOrder") }
+        }
+        when configured_async {
+            let uri = "/async";
+            to renders_async { render_page("Async") }
+        }
+    }
+    expect(run_ntex(registered_page(registration, MixedApp, mixed_shell, uri, HttpMethod::GET, false))) as ready_ssr_modes_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/out";
+
+        to renders_out_of_order { render_page("OutOfOrder") }
+        when configured_in_order {
+            let uri = "/in";
+            to renders_in_order { render_page("InOrder") }
+        }
+        when configured_async {
+            let uri = "/async";
+            to renders_async { render_page("Async") }
+        }
+
+    }
+    expect(run_ntex(registered_page(registration, PartiallyBlockedApp, partially_blocked_shell, "/partial", HttpMethod::GET, false))) as partially_blocked_dispatch {
+        let registration = Registration::App;
+        to reaches_the_renderer { render_page("PartiallyBlocked") }
+    }
+    expect(run_ntex(registered_page(registration, PartiallyBlockedApp, partially_blocked_shell, "/partial", HttpMethod::GET, false))) as partially_blocked_dispatch_via_service_config {
+        let registration = Registration::ServiceConfig;
+
+        to reaches_the_renderer { render_page("PartiallyBlocked") }
+
     }
 }
 
-#[ntex::test]
-async fn renders_partially_blocked_ssr_route() {
-    let routes = gen_route_list(PartiallyBlockedApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), partially_blocked_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/partial").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("PartiallyBlocked"),
-        "PartiallyBlocked route must render its view, not fall through to the 500 catch-all: {html}"
-    );
+fn render_suspense(fallback: bool) -> impl Fn(&Page) -> AssertionResult {
+    move |page| {
+        render_page("RESOLVED-CONTENT")(page)?;
+        if page.html.contains("FALLBACK-MARKER") == fallback {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected fallback presence {fallback}, body {:?}",
+                page.html
+            )]))
+        }
+    }
 }
 
-// ----- SSR streaming mode is observable in the body ------------------
-// A `<Suspense>` over a still-pending resource renders differently per
-// mode: OutOfOrder streams the shell + fallback first (the body carries
-// BOTH the fallback marker and an out-of-order replacement template);
-// InOrder/Async block for the resolved value (the body has it in place
-// and NO fallback marker). Deleting the InOrder/Async match arm falls
-// back to the OutOfOrder renderer, which these assertions catch — across
-// both the `App` and the `&mut ServiceConfig` implementations.
-// The read guard is deliberately held across the render `.await`s: that is
-// the whole point of the workaround (serialize this resource-bearing render
-// against any route-generation window). It cannot deadlock — the render path
-// never takes the write side — and the `#[ntex::test]` future is single-
-// threaded, so the `!Send` guard is fine.
-#[allow(clippy::await_holding_lock)]
-async fn suspense_body_via_app_impl(path: &str) -> String {
-    use crate::LeptosRoutes;
-    let routes = gen_route_list(SuspenseApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, suspense_shell)).await;
-    let req = test::TestRequest::with_uri(path).to_request();
-    // Hold the READ side across the render: `SuspendedView` first-polls its
-    // `Resource` here, and it must not land inside another test's
-    // route-generation window (see `ROUTE_GEN_VS_RENDER`).
-    let _render_guard = ROUTE_GEN_VS_RENDER
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let resp = test::call_service(&app, req).await;
-    let body = test::read_body(resp).await;
-    String::from_utf8(body.to_vec()).unwrap()
+lets_expect! {
+    expect(run_ntex(registered_page(registration, SuspenseApp, suspense_shell, uri, HttpMethod::GET, true))) as pending_resource_ssr {
+        let registration = Registration::App;
+        let uri = "/out";
+        to retains_fallback_and_resolved_content { render_suspense(true) }
+        when configured_in_order {
+            let uri = "/in";
+            to resolves_the_value_without_the_fallback { render_suspense(false) }
+        }
+        when configured_async {
+            let uri = "/async";
+            to resolves_the_value_without_the_fallback { render_suspense(false) }
+        }
+    }
+    expect(run_ntex(registered_page(registration, SuspenseApp, suspense_shell, uri, HttpMethod::GET, true))) as pending_resource_ssr_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/out";
+
+        to retains_fallback_and_resolved_content { render_suspense(true) }
+        when configured_in_order {
+            let uri = "/in";
+            to resolves_the_value_without_the_fallback { render_suspense(false) }
+        }
+        when configured_async {
+            let uri = "/async";
+            to resolves_the_value_without_the_fallback { render_suspense(false) }
+        }
+
+    }
 }
 
-#[allow(clippy::await_holding_lock)]
-async fn suspense_body_via_service_config(path: &str) -> String {
-    let routes = gen_route_list(SuspenseApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), suspense_shell);
-    }))
-    .await;
-    let req = test::TestRequest::with_uri(path).to_request();
-    let _render_guard = ROUTE_GEN_VS_RENDER
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let resp = test::call_service(&app, req).await;
-    let body = test::read_body(resp).await;
-    String::from_utf8(body.to_vec()).unwrap()
+// The in-memory service bypasses the wire encoder. Body suppression for HEAD
+// is checked over a real connection in integration.rs.
+fn head_parity(registration: Registration, uri: &'static str) -> (StatusCode, StatusCode, bool) {
+    run_ntex(async move {
+        let get = registered_page(
+            registration,
+            MixedApp,
+            mixed_shell,
+            uri,
+            HttpMethod::GET,
+            false,
+        )
+        .await;
+        let head = registered_page(
+            registration,
+            MixedApp,
+            mixed_shell,
+            uri,
+            HttpMethod::HEAD,
+            false,
+        )
+        .await;
+        (
+            get.status,
+            head.status,
+            get.content_type == head.content_type,
+        )
+    })
+}
+lets_expect! {
+    expect(head_parity(registration, uri)) as head_response_parity {
+        let registration = Registration::App;
+        let uri = "/out";
+        to mirrors_get_status_and_content_type { equal((StatusCode::OK, StatusCode::OK, true)) }
+        when the_route_is_missing {
+            let uri = "/totally-bogus-path";
+            to preserves_the_not_found_result { equal((StatusCode::NOT_FOUND, StatusCode::NOT_FOUND, true)) }
+        }
+    }
+    expect(head_parity(registration, uri)) as head_response_parity_via_service_config {
+        let registration = Registration::ServiceConfig;
+        let uri = "/out";
+
+        to mirrors_get_status_and_content_type { equal((StatusCode::OK, StatusCode::OK, true)) }
+        when the_route_is_missing {
+            let uri = "/totally-bogus-path";
+            to preserves_the_not_found_result { equal((StatusCode::NOT_FOUND, StatusCode::NOT_FOUND, true)) }
+        }
+
+    }
 }
 
-#[ntex::test]
-async fn in_order_mode_blocks_for_the_resource_via_app_impl() {
-    let html = suspense_body_via_app_impl("/in").await;
-    assert!(
-        html.contains("RESOLVED-CONTENT"),
-        "resolved value must be present"
-    );
-    assert!(
-        !html.contains("FALLBACK-MARKER"),
-        "InOrder must block for the resource, not stream the OOO fallback"
-    );
+#[derive(Clone, Copy)]
+enum Helper {
+    Stream,
+    InOrder,
+    Async,
+    Inner,
+}
+async fn helper_page(helper: Helper) -> Page {
+    let route = match helper {
+        Helper::Stream => crate::render_app_to_stream(unit_shell, leptos_router::Method::Get),
+        Helper::InOrder => {
+            crate::render_app_to_stream_in_order(unit_shell, leptos_router::Method::Get)
+        }
+        Helper::Async => crate::render_app_async(unit_shell, leptos_router::Method::Get),
+        Helper::Inner => ntex::web::get().to(|req: ntex::web::HttpRequest| {
+            crate::handle_response_inner(
+                || {},
+                unit_shell,
+                req,
+                crate::render::async_stream_builder,
+            )
+        }),
+    };
+    let app = test::init_service(NtexApp::new().route("/", route)).await;
+    let response = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let html = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+    Page {
+        status,
+        content_type,
+        html,
+    }
+}
+lets_expect! {
+    expect(run_ntex(helper_page(helper))) as public_render_helpers {
+        let helper = Helper::Stream;
+        to renders_the_app { render_page("Leptos over ntex") }
+        when using_the_in_order_helper {
+            let helper = Helper::InOrder;
+            to renders_the_app { render_page("Leptos over ntex") }
+        }
+        when using_the_async_helper {
+            let helper = Helper::Async;
+            to renders_the_app { render_page("Leptos over ntex") }
+        }
+        when composing_the_low_level_handler {
+            let helper = Helper::Inner;
+            to renders_the_app { render_page("Leptos over ntex") }
+        }
+    }
 }
 
-#[ntex::test]
-async fn in_order_mode_blocks_for_the_resource_via_service_config() {
-    let html = suspense_body_via_service_config("/in").await;
-    assert!(html.contains("RESOLVED-CONTENT"));
-    assert!(
-        !html.contains("FALLBACK-MARKER"),
-        "InOrder (ServiceConfig) must block for the resource"
-    );
-}
-
-#[ntex::test]
-async fn async_mode_blocks_for_the_resource_via_app_impl() {
-    let html = suspense_body_via_app_impl("/async").await;
-    assert!(html.contains("RESOLVED-CONTENT"));
-    assert!(
-        !html.contains("FALLBACK-MARKER"),
-        "Async must resolve everything before sending, not stream the fallback"
-    );
-}
-
-#[ntex::test]
-async fn async_mode_blocks_for_the_resource_via_service_config() {
-    let html = suspense_body_via_service_config("/async").await;
-    assert!(html.contains("RESOLVED-CONTENT"));
-    assert!(
-        !html.contains("FALLBACK-MARKER"),
-        "Async (ServiceConfig) must resolve everything before sending"
-    );
-}
-
-/// OutOfOrder is observable in the FINAL buffered body by the presence of BOTH
-/// the fallback marker AND the resolved content (InOrder/Async drop the
-/// fallback marker entirely). `read_body` buffers the whole response, so this
-/// pins the OOO body SHAPE — not the temporal streaming ORDER, which the
-/// TCP-based integration tests cover. The name reflects that.
-#[ntex::test]
-async fn out_of_order_body_contains_the_fallback_marker() {
-    let html = suspense_body_via_app_impl("/out").await;
-    assert!(
-        html.contains("FALLBACK-MARKER"),
-        "OutOfOrder's body must carry the streamed fallback marker"
-    );
-    assert!(html.contains("RESOLVED-CONTENT"));
-}
-
-/// RFC 9110 §9.3.2: HEAD must mirror GET's status and headers.
-///
-/// Note: `test::call_service` bypasses the h1 wire encoder, so the
-/// empty-body requirement is asserted in the TCP-based integration
-/// tests; here we verify that the handler runs and produces the
-/// same status and Content-Type as GET.
-#[ntex::test]
-async fn head_request_mirrors_get_status_and_content_type() {
-    use crate::LeptosRoutes;
-
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, mixed_shell)).await;
-
-    let get_resp = test::call_service(&app, test::TestRequest::with_uri("/out").to_request()).await;
-    assert_eq!(get_resp.status(), StatusCode::OK);
-    let get_headers = get_resp.headers().clone();
-
-    let head_resp = test::call_service(
-        &app,
-        test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/out")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(head_resp.status(), StatusCode::OK);
-    assert_eq!(
-        head_resp.headers().get(header::CONTENT_TYPE),
-        get_headers.get(header::CONTENT_TYPE),
-        "HEAD must advertise the same Content-Type as GET"
-    );
-}
-
-/// Same parity assertions via `register_leptos_routes` on a
-/// `ServiceConfig`.
-#[ntex::test]
-async fn head_request_via_service_config_mirrors_get() {
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), mixed_shell);
-    }))
-    .await;
-
-    // Actually compare against GET (the name claims parity): same status AND
-    // Content-Type, mirroring the App-impl variant — not just "HEAD is 200".
-    let get = test::call_service(&app, test::TestRequest::with_uri("/out").to_request()).await;
-    assert_eq!(get.status(), StatusCode::OK);
-    let get_ct = get.headers().get(header::CONTENT_TYPE).cloned();
-
-    let head = test::call_service(
-        &app,
-        test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/out")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(head.status(), StatusCode::OK);
-    assert_eq!(
-        head.headers().get(header::CONTENT_TYPE),
-        get_ct.as_ref(),
-        "HEAD Content-Type must mirror GET through the ServiceConfig path"
-    );
-}
-
-/// HEAD on an unregistered path must not return 200 — the old
-/// synthetic HEAD handler did exactly that, hiding real 404s from
-/// monitoring. Now HEAD on a missing route falls through to the
-/// default 404 (or the app's configured fallback).
-#[ntex::test]
-async fn head_request_on_missing_route_not_200() {
-    use crate::LeptosRoutes;
-
-    let routes = gen_route_list(MixedApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, mixed_shell)).await;
-
-    let resp = test::call_service(
-        &app,
-        test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/totally-bogus-path")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "HEAD on a missing route must exactly 404, not falsely report 200 (or some other non-OK status)"
-    );
-}
-
-#[ntex::test]
-async fn app_leptos_routes_impl_renders_route() {
-    use crate::LeptosRoutes;
-
-    // No `/api` catchall: this test only renders '/', never a server fn.
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(NtexApp::new().leptos_routes(routes, unit_shell)).await;
-
-    let req = test::TestRequest::with_uri("/").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Leptos over ntex"));
-}
-
-#[ntex::test]
-async fn generate_request_and_parts_returns_cloned_head() {
-    use crate::generate_request_and_parts;
-
+fn cloned_request_heads() -> [(String, Option<String>, Option<String>); 2] {
     let req = test::TestRequest::default()
         .uri("/some/path?q=1")
         .header("x-custom", "yes")
         .to_http_request();
-    let payload = ntex::http::Payload::None;
-
-    let (server_fn_req, head) = generate_request_and_parts(req.clone(), payload);
-    assert_eq!(head.uri().path(), "/some/path");
-    assert_eq!(head.uri().query(), Some("q=1"));
-    assert_eq!(
-        head.headers().get("x-custom").and_then(|v| v.to_str().ok()),
-        Some("yes")
-    );
-
-    // Also inspect the `NtexRequest` half of the tuple, not just `head`: a
-    // mutation that built it from a fresh/default `HttpRequest` instead of
-    // `req.clone()` (while still returning the correct `head`) would
-    // otherwise slip through untested.
-    let (server_fn_http_req, _payload) = server_fn_req.take();
-    assert_eq!(server_fn_http_req.uri().path(), "/some/path");
-    assert_eq!(server_fn_http_req.uri().query(), Some("q=1"));
-    assert_eq!(
-        server_fn_http_req
-            .headers()
-            .get("x-custom")
-            .and_then(|v| v.to_str().ok()),
-        Some("yes")
-    );
+    let (server_fn_request, head) =
+        crate::generate_request_and_parts(req, ntex::http::Payload::None);
+    let (request, _) = server_fn_request.take();
+    [head, request].map(|request| {
+        (
+            request.uri().path().to_string(),
+            request.uri().query().map(str::to_string),
+            request
+                .headers()
+                .get("x-custom")
+                .map(|v| v.to_str().unwrap().to_string()),
+        )
+    })
 }
-
-#[ntex::test]
-async fn handle_response_inner_renders_shell() {
-    use crate::handle_response_inner;
-    use futures::StreamExt;
-    use futures::stream::once as stream_once;
-    use leptos_integration_utils::{BoxedFnOnce, PinnedStream};
-
-    let app = test::init_service(NtexApp::new().route(
-        "/hrinner",
-        ntex::web::get().to(|req: ntex::web::HttpRequest| async move {
-            handle_response_inner(
-                || {},
-                || view! { <!DOCTYPE html><html><body><h1>"HriHello"</h1></body></html> },
-                req,
-                |app, chunks: BoxedFnOnce<PinnedStream<String>>, _supports_ooo| {
-                    Box::pin(async move {
-                        let app = app.to_html_stream_in_order().collect::<String>().await;
-                        Box::pin(stream_once(async move { app }).chain(chunks()))
-                            as PinnedStream<String>
-                    })
-                },
-            )
-            .await
-        }),
-    ))
-    .await;
-
-    let req = test::TestRequest::with_uri("/hrinner").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("HriHello"));
-}
-
-// ----- public no-context render helpers ------------------------------
-// render_app_to_stream / _in_order / _async are thin wrappers over their
-// _with_context forms, exported for callers who mount a route by hand. The
-// crate's own routing always goes through the _with_context variants, so these
-// wrappers were untested — a mutation returning an empty Route survived.
-// Mounting each directly and asserting the rendered body pins the wrapper.
-
-#[ntex::test]
-async fn render_app_to_stream_helper_renders_the_app() {
-    let app = test::init_service(NtexApp::new().route(
-        "/",
-        crate::render_app_to_stream(unit_shell, leptos_router::Method::Get),
-    ))
-    .await;
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
-    assert!(
-        html.contains("Leptos over ntex"),
-        "render_app_to_stream produced no app body: {html}"
-    );
-}
-
-#[ntex::test]
-async fn render_app_to_stream_in_order_helper_renders_the_app() {
-    let app = test::init_service(NtexApp::new().route(
-        "/",
-        crate::render_app_to_stream_in_order(unit_shell, leptos_router::Method::Get),
-    ))
-    .await;
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
-    assert!(
-        html.contains("Leptos over ntex"),
-        "render_app_to_stream_in_order produced no app body: {html}"
-    );
-}
-
-#[ntex::test]
-async fn render_app_async_helper_renders_the_app() {
-    let app = test::init_service(NtexApp::new().route(
-        "/",
-        crate::render_app_async(unit_shell, leptos_router::Method::Get),
-    ))
-    .await;
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let html = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
-    assert!(
-        html.contains("Leptos over ntex"),
-        "render_app_async produced no app body: {html}"
-    );
+lets_expect! {
+    expect(cloned_request_heads()) as server_function_request_head_copies {
+        to preserves_path_query_and_headers_in_both_outputs {
+            equal([
+                ("/some/path".to_string(), Some("q=1".to_string()), Some("yes".to_string())),
+                ("/some/path".to_string(), Some("q=1".to_string()), Some("yes".to_string())),
+            ])
+        }
+    }
 }

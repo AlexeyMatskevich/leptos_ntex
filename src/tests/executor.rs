@@ -7,9 +7,8 @@ use lets_expect::lets_expect;
 // independence* and a *stable result pair* (which arm is observed
 // depends on test order and cannot be set by a `when`), not a fixed
 // value. `any_spawner::ExecutorError` derives no `PartialEq`, so the
-// pair is matched with `match_pattern!`, not `equal`. Manual-Red is weak
-// for both (the code structurally avoids the failure modes) — these lock
-// in the current invariants rather than acting as rich behavioural specs.
+// pair is matched with `match_pattern!`, not `equal`. Fresh installation
+// results are checked by separate integration test binaries.
 
 // A trivial app whose route walk must not require a ntex arbiter.
 #[component]
@@ -36,8 +35,8 @@ fn generate_routes_without_a_ntex_runtime() {
 // NOR does this leaf (or any other test in this file) observe the
 // arbiter-PRESENT case: that is exercised elsewhere in the suite instead —
 // `src/tests/rendering.rs` and `src/tests/server_fn_http.rs` call
-// `gen_route_list` from `#[ntex::test]`s, and `tests/integration.rs` calls
-// `generate_route_list` directly inside `#[ntex::test]` — so
+// `gen_route_list` from native ntex runtime subjects, and `tests/integration.rs` calls
+// `generate_route_list` inside a native ntex runtime subject — so
 // `ensure_executor_initialized`/`init_ntex_executor` are also exercised from
 // inside a running ntex arbiter, just not documented or pinned in this file.
 lets_expect! {

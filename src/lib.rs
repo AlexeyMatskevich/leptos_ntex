@@ -6,13 +6,16 @@
 pub mod config;
 pub mod extract;
 pub mod files;
+mod fs_boundary;
 pub mod leptos_routes;
+mod owner;
 pub mod render;
 pub mod request;
 pub mod response;
 pub mod routes;
 pub mod server_fn;
 pub mod static_routes;
+mod stream;
 
 pub use config::{DEFAULT_PAYLOAD_LIMIT, DEFAULT_WS_CHANNEL_BUFFER, LeptosServerFnConfig};
 pub use extract::{extract, extract_with_err};
@@ -25,7 +28,7 @@ pub use render::{
     render_app_to_stream_in_order, render_app_to_stream_in_order_with_context,
     render_app_to_stream_with_context, render_app_to_stream_with_context_and_replace_blocks,
 };
-pub use request::Request;
+pub use request::{Request, RequestAccessError, RequestRuntime, RequestScope};
 pub use response::{PinnedHtmlStream, ResponseOptions, ResponseParts, redirect};
 pub use routes::{
     NtexRouteListing, generate_route_list, generate_route_list_with_exclusions,
@@ -38,7 +41,10 @@ pub use server_fn::{
     get_server_fn_service, handle_server_fns, handle_server_fns_with_context, register_explicit,
     server_fn_paths,
 };
-pub use static_routes::StaticRouteGenerator;
+pub use static_routes::{
+    StaticGenerationError, StaticGenerationReport, StaticPolicyError, StaticRouteGenerator,
+    StaticRoutePolicy, StaticStorageError, StaticStorageLimits, StaticWorkLimits,
+};
 
 #[cfg(test)]
 mod tests;

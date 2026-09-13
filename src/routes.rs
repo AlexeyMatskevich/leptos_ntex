@@ -55,13 +55,14 @@ fn init_ntex_executor() -> Result<(), any_spawner::ExecutorError> {
 /// Produced by [`generate_route_list`] and consumed by
 /// [`LeptosRoutes::leptos_routes`](crate::LeptosRoutes::leptos_routes) or
 /// [`register_leptos_routes`](crate::register_leptos_routes).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NtexRouteListing {
     pub(crate) path: String,
     pub(crate) mode: SsrMode,
     pub(crate) methods: Vec<Method>,
     pub(crate) regenerate: Vec<RegenerationFn>,
     pub(crate) exclude: bool,
+    pub(crate) runtime: Arc<crate::static_routes::StaticRuntime>,
 }
 
 trait NtexPath {
@@ -158,9 +159,16 @@ impl IntoRouteListing for RouteListing {
                     methods: self.methods().collect(),
                     regenerate: self.regenerate().into(),
                     exclude: false,
+                    runtime: crate::static_routes::StaticRuntime::shared(),
                 }
             })
             .collect()
+    }
+}
+
+impl Default for NtexRouteListing {
+    fn default() -> Self {
+        Self::new(String::new(), SsrMode::default(), [], Vec::new())
     }
 }
 
@@ -178,6 +186,7 @@ impl NtexRouteListing {
             methods: methods.into_iter().collect(),
             regenerate: regenerate.into(),
             exclude: false,
+            runtime: crate::static_routes::StaticRuntime::shared(),
         }
     }
 
@@ -270,9 +279,9 @@ where
 // deterministically from a shared test binary.
 pub(crate) fn emit_foreign_executor_diagnostic(err: &any_spawner::ExecutorError) {
     let msg = format!(
-        "leptos_ntex_unofficial: another async executor is already installed \
-         via `any_spawner` (error: {err}). Leptos async tasks will run on \
-         that executor instead of ntex::rt. Call \
+        "leptos_ntex_unofficial: an async executor was installed outside this \
+         adapter's initialization path via `any_spawner` (error: {err}). \
+         Leptos async tasks will use that installed executor. Call \
          `leptos_ntex_unofficial::try_init_executor()` at startup to surface \
          this error deterministically. See the `Request` wrapper docs for \
          cross-thread-drop caveats."
@@ -315,10 +324,12 @@ pub(crate) fn ensure_executor_initialized() {
 /// # Errors
 ///
 /// Returns [`ExecutorError`](any_spawner::ExecutorError)'s `AlreadySet` variant
-/// if *another* executor won the global one-shot install race. When that
-/// happens, Leptos async tasks run on the foreign executor instead of
-/// `ntex::rt`; cross-thread drops of [`Request`](crate::Request) may leak or
-/// panic — see the [`Request`](crate::Request) documentation.
+/// if an executor was installed outside this crate's initialization path.
+/// `any_spawner` cannot identify that executor: this includes an explicitly
+/// installed [`NtexExecutor`]. Async work uses whichever
+/// executor won the process-global installation. If it moves request work to
+/// another thread, access to [`Request`](crate::Request) panics and its final
+/// drop retains request state; see its thread-affinity contract.
 pub fn try_init_executor() -> Result<(), any_spawner::ExecutorError> {
     init_ntex_executor()
 }
@@ -347,12 +358,24 @@ where
         })
         .unwrap_or_default();
 
-    let generator = StaticRouteGenerator::new(&routes, app_fn.clone(), additional_context.clone());
+    // One generated list and its generator share a runtime of their own, so
+    // that listings composed by hand elsewhere in the process stay independent.
+    let runtime = Arc::new(crate::static_routes::StaticRuntime::default());
+    let generator = StaticRouteGenerator::with_runtime(
+        &routes,
+        app_fn.clone(),
+        additional_context.clone(),
+        runtime.clone(),
+    );
 
     let routes = routes
         .into_inner()
         .into_iter()
         .flat_map(IntoRouteListing::into_route_listing)
+        .map(|mut listing| {
+            listing.runtime = runtime.clone();
+            listing
+        })
         .collect::<Vec<_>>();
 
     // Synthesize the fallback `/` listing when the app declared no routes, so
@@ -386,6 +409,7 @@ where
             methods: Vec::new(),
             regenerate: Vec::new(),
             exclude: true,
+            runtime: Arc::default(),
         });
 
     (routes.into_iter().chain(excluded).collect(), generator)

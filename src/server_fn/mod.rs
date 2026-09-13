@@ -9,6 +9,7 @@ pub(crate) mod handlers;
 pub(crate) mod registry;
 pub(crate) mod request;
 pub(crate) mod response;
+pub(crate) mod websocket;
 
 use ntex::http::Payload;
 use ntex::web::HttpRequest;
@@ -29,17 +30,17 @@ pub use response::NtexServerResponse;
 /// triggered them instead of bouncing onto a separate thread pool.
 ///
 /// Installed automatically from [`generate_route_list`](crate::generate_route_list)
-/// and friends; must be called from inside an ntex arbiter (i.e. from
-/// within `#[ntex::main]` or `#[ntex::test]`).
+/// and friends. Installation itself does not require a running arbiter;
+/// spawning work does require an active ntex runtime.
 pub struct NtexExecutor;
 
 impl any_spawner::CustomExecutor for NtexExecutor {
     fn spawn(&self, fut: any_spawner::PinnedFuture<()>) {
-        ntex::rt::spawn(fut);
+        ntex::rt::spawn(crate::owner::OwnerContextFuture::from_pin(fut));
     }
 
     fn spawn_local(&self, fut: any_spawner::PinnedLocalFuture<()>) {
-        ntex::rt::spawn(fut);
+        ntex::rt::spawn(crate::owner::OwnerContextFuture::from_pin(fut));
     }
 
     fn poll_local(&self) {}
@@ -51,6 +52,11 @@ impl any_spawner::CustomExecutor for NtexExecutor {
 /// Pass this as the `server = leptos_ntex_unofficial::NtexServerFnBackend`
 /// argument on the `#[server]` attribute so that the server function is
 /// dispatched through the ntex runtime.
+///
+/// Explicit calls to the backend's `Server::spawn` retain the current request
+/// context until the task finishes, even after an HTTP response returns. Tasks
+/// spawned in a WebSocket dispatch are also cancelled when its connection pump
+/// ends. Detecting a transport disconnect can be delayed while input is paused.
 pub struct NtexServerFnBackend;
 
 impl<Error, InputStreamError, OutputStreamError> Server<Error, InputStreamError, OutputStreamError>
@@ -64,8 +70,52 @@ where
     type Response = NtexServerResponse;
 
     fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Result<(), Error> {
-        ntex::rt::spawn(future);
+        use futures::FutureExt;
+        let scope = leptos::context::use_context::<websocket::ConnectionScope>();
+        let owner = leptos::context::use_context::<std::sync::Weak<crate::owner::OwnerCleanup>>()
+            .and_then(|owner| owner.upgrade());
+        let future = async move {
+            if let Some(scope) = scope {
+                futures::pin_mut!(future);
+                futures::select_biased! {
+                    _ = scope.cancelled.fuse() => {},
+                    _ = future.fuse() => {},
+                }
+            } else {
+                future.await;
+            }
+        };
+        let has_request_owner = owner.is_some();
+        let task = OwnedTask {
+            future: Box::pin(future),
+            _owner: owner,
+        };
+        if has_request_owner {
+            // The WebSocket output forwarder keeps the server function's scope
+            // after dispatch returns, including through cancellation Drop.
+            ntex::rt::spawn(crate::owner::ScopedWork::new(task));
+        } else {
+            // Standalone backend use has no request scope to retain.
+            ntex::rt::spawn(crate::owner::OwnerContextFuture::new(task));
+        }
         Ok(())
+    }
+}
+
+// Explicit field order keeps context available to user future destructors,
+// including cancellation before the first poll.
+struct OwnedTask<F> {
+    future: std::pin::Pin<Box<F>>,
+    _owner: Option<std::sync::Arc<crate::owner::OwnerCleanup>>,
+}
+
+impl<F: Future<Output = ()>> Future for OwnedTask<F> {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        self.get_mut().future.as_mut().poll(cx)
     }
 }
 

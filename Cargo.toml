@@ -19,32 +19,44 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 any_spawner = "0.3.0"
+base64 = "0.22.1"
 bytes = "1.11.1"
+cap-std = "4.0.3"
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 futures = "0.3.31"
 hydration_context = "0.3.0"
 leptos = { version = "0.8.19", features = ["ssr", "nonce"] }
-# NOTE: `NtexResponse::from_app` (src/response.rs) is a frozen near-verbatim
-# copy of this version's `ExtendResponse::from_app`, diverging only to clean up
-# the reactive Owner on `Drop` (owner-leak stopgap, leptos-rs/leptos#4739).
-# When bumping this dependency, re-diff that override against the new source and
-# delete it once upstream ships the `Drop`-based cleanup.
+# NtexResponse::from_app follows ExtendResponse::from_app in 0.8.8, with an
+# earlier cleanup guard and explicit stream/Owner lifetime and context handling.
+# Re-diff this integration when updating utils. Remove the local override only
+# when upstream preserves cleanup on cancellation, retained Owner handles,
+# destructor ordering and caller-context restoration (see lifecycle specs).
 leptos_integration_utils = "0.8.8"
 leptos_meta = { version = "0.8.6", features = ["ssr", "nonce"] }
 leptos_router = { version = "0.8.13", features = ["ssr"] }
-lru = "0.18"
 mime = "0.3"
 ntex = "3.9.6"
+# System::try_current lets StaticRoutePolicy::open run outside an ntex System.
+ntex-rt = { version = "3.15.4", default-features = false }
 ntex-files = "3.2.0"
 percent-encoding = "2.3"
 or_poisoned = "0.1.0"
 send_wrapper = { version = "0.6.0", features = ["futures"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
 server_fn = { version = "0.8.12", features = ["ssr"] }
 tracing = { version = "0.1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[build-dependencies]
+# Compile-time Runner signature detection across ntex-rt 3.14 / 3.17.
+ntex-rt = { version = "3.15.4", default-features = false }
 
 [dev-dependencies]
 ciborium = "0.2.2"
 lets_expect = "0.5.2"
-serde_json = "1.0.145"
 server_fn = { version = "0.8.12", features = ["cbor"] }
 
 [[example]]

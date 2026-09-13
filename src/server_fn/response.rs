@@ -30,13 +30,8 @@ use std::io;
 /// appears if the response is deliberately moved across threads — the same
 /// cross-thread invariant documented on [`Request`](crate::request::Request).
 ///
-/// The inner field is crate-private, mirroring `server_fn`'s `ActixResponse`:
-/// build one with [`NtexServerResponse::from`] and consume it with
-/// [`NtexServerResponse::take`]. Narrowing the field only removes direct `.0`
-/// access; the cross-thread panic above still applies to the value itself, as
-/// [`take`](NtexServerResponse::take) and dropping it off the origin thread
-/// both trip the [`SendWrapper`] thread check.
-pub struct NtexServerResponse(pub(crate) SendWrapper<HttpResponse>);
+/// Construct with [`NtexServerResponse::from`] and consume with [`NtexServerResponse::take`].
+pub struct NtexServerResponse(pub SendWrapper<HttpResponse>);
 
 impl NtexServerResponse {
     /// Consumes the wrapper and returns the inner ntex response.

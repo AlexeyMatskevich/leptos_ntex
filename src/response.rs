@@ -17,21 +17,18 @@ use server_fn::redirect::REDIRECT_HEADER;
 use std::{
     future::Future,
     io,
-    pin::Pin,
     sync::{Arc, RwLock},
-    task::{Context, Poll},
-    thread::ThreadId,
 };
 
 use leptos::context::{provide_context, use_context};
 use leptos::prelude::ReadValue;
-use leptos::reactive::owner::{Owner, Sandboxed};
 use leptos::{IntoView, PrefetchLazyFn, WasmSplitManifest};
 use leptos_integration_utils::{
     BoxedFnOnce, ExtendResponse, PinnedFuture, PinnedStream, build_response,
 };
 use leptos_meta::{Link, ServerMetaContextOutput};
 
+use crate::owner::{OwnerCleanup, OwnerLease, RestoreOwner, ScopedWork};
 use crate::request::Request;
 
 /// A boxed stream of HTML chunks, as used for progressive streaming of SSR
@@ -44,7 +41,8 @@ pub type PinnedHtmlStream = std::pin::Pin<Box<dyn Stream<Item = io::Result<NByte
 /// customising the status code from a server function or a component.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseParts {
-    /// When set, overrides any other status code for this response.
+    /// When set, overrides the response status, except for adapter-generated
+    /// WebSocket handshake and payload-limit errors.
     pub status: Option<StatusCode>,
     /// Extra headers to add to the response.
     pub headers: header::HeaderMap,
@@ -66,6 +64,11 @@ impl ResponseParts {
 ///
 /// Injected as a context value during SSR and inside server functions so that
 /// user code can change the status and headers of the response.
+///
+/// Adapter-generated WebSocket handshake and payload-limit errors retain their
+/// own status, representation metadata and supported-version advertisement.
+/// Other supplied headers (including repeated cookies) survive when context
+/// setup preceded the rejection. Preflight rejection does not set up context.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseOptions(pub Arc<RwLock<ResponseParts>>);
 
@@ -76,7 +79,8 @@ impl ResponseOptions {
         *writable = parts;
     }
 
-    /// Sets the HTTP status that will be returned for this response.
+    /// Sets the response status, subject to the adapter-generated error
+    /// exceptions described on [`ResponseOptions`].
     pub fn set_status(&self, status: StatusCode) {
         let mut writable = self.0.write().or_poisoned();
         writable.status = Some(status);
@@ -104,11 +108,27 @@ impl NtexResponse {
 
     pub(crate) fn extend_response_parts(&mut self, parts: ResponseParts) {
         let headers = self.0.headers_mut();
-        for (key, value) in parts.headers.iter() {
-            if should_replace_header(key) {
-                headers.insert(key.clone(), value.clone());
-            } else {
-                headers.append(key.clone(), value.clone());
+        for key in parts.headers.keys() {
+            let values = parts.headers.get_all(key);
+            match header_merge(key) {
+                HeaderMerge::ReplaceOne => {
+                    // Preserve last-wins compatibility for duplicate singleton fields.
+                    if let Some(value) = values.last() {
+                        headers.insert(key.clone(), value.clone());
+                    }
+                }
+                HeaderMerge::ReplaceList => {
+                    // Replace the old set once; every incoming list member survives.
+                    headers.remove(key);
+                    for value in values {
+                        headers.append(key.clone(), value.clone());
+                    }
+                }
+                HeaderMerge::Append => {
+                    for value in values {
+                        headers.append(key.clone(), value.clone());
+                    }
+                }
             }
         }
         if let Some(status) = parts.status {
@@ -117,22 +137,76 @@ impl NtexResponse {
     }
 }
 
-fn should_replace_header(key: &HeaderName) -> bool {
-    matches!(
-        key,
-        &header::CONTENT_LENGTH
-            | &header::CONTENT_TYPE
-            | &header::CONTENT_ENCODING
+/// Fields that describe the entity bytes a response carries. When the adapter
+/// produces those bytes itself (a served file, an error it generated), captured
+/// application values for these fields are dropped: they describe a
+/// representation the response does not carry.
+pub(crate) static REPRESENTATION_HEADERS: std::sync::LazyLock<[HeaderName; 10]> =
+    std::sync::LazyLock::new(|| {
+        [
+            header::CONTENT_LENGTH,
+            header::CONTENT_TYPE,
+            header::CONTENT_ENCODING,
+            header::CONTENT_RANGE,
+            header::TRANSFER_ENCODING,
+            header::ACCEPT_RANGES,
+            header::ETAG,
+            header::LAST_MODIFIED,
+            HeaderName::from_static("content-digest"),
+            HeaderName::from_static("digest"),
+        ]
+    });
+
+/// Fields that identify the selected representation as a whole, dropped in
+/// addition to [`REPRESENTATION_HEADERS`] when an adapter error replaces the
+/// intended response: neither its language, location, digest nor handshake
+/// version fields can describe a response that failed to complete.
+pub(crate) static FAILED_REPRESENTATION_HEADERS: std::sync::LazyLock<[HeaderName; 4]> =
+    std::sync::LazyLock::new(|| {
+        [
+            header::CONTENT_LANGUAGE,
+            header::CONTENT_LOCATION,
+            HeaderName::from_static("repr-digest"),
+            header::SEC_WEBSOCKET_VERSION,
+        ]
+    });
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderMerge {
+    ReplaceOne,
+    ReplaceList,
+    Append,
+}
+
+/// How a captured application header joins the framework's own: single-valued
+/// fields (RFC 9110 §5.3 non-list fields) and list fields that describe the
+/// representation replace the framework value; every other field, including
+/// unknown ones, appends so that repeated application members survive.
+pub(crate) fn header_merge(key: &HeaderName) -> HeaderMerge {
+    if REPRESENTATION_HEADERS.contains(key) || FAILED_REPRESENTATION_HEADERS.contains(key) {
+        return match key {
+            &header::CONTENT_ENCODING
             | &header::TRANSFER_ENCODING
-            | &header::LOCATION
-            | &header::ETAG
-            | &header::LAST_MODIFIED
-            | &header::CACHE_CONTROL
-            | &header::EXPIRES
-            | &header::CONTENT_DISPOSITION
-            | &header::CONTENT_RANGE
             | &header::ACCEPT_RANGES
-    )
+            | &header::CONTENT_LANGUAGE => HeaderMerge::ReplaceList,
+            _ => HeaderMerge::ReplaceOne,
+        };
+    }
+    match key {
+        &header::LOCATION
+        | &header::EXPIRES
+        | &header::CONTENT_DISPOSITION
+        | &header::RETRY_AFTER
+        | &header::AGE
+        | &header::DATE
+        | &header::SERVER
+        | &header::STRICT_TRANSPORT_SECURITY
+        | &header::X_FRAME_OPTIONS
+        | &header::X_CONTENT_TYPE_OPTIONS
+        | &header::REFERRER_POLICY => HeaderMerge::ReplaceOne,
+        &header::CACHE_CONTROL => HeaderMerge::ReplaceList,
+        _ => HeaderMerge::Append,
+    }
 }
 
 impl ExtendResponse for NtexResponse {
@@ -181,18 +255,14 @@ impl ExtendResponse for NtexResponse {
         }
     }
 
-    // ntex stopgap override of the default `from_app`.
+    // Local override of `ExtendResponse::from_app` from
+    // `leptos_integration_utils` 0.8.8. Its trailing cleanup item misses
+    // cancellation. An integration guard is armed before the first await,
+    // survives response construction, and outlives the body's destructor.
     //
-    // This is a near-verbatim copy of `ExtendResponse::from_app` from
-    // `leptos_integration_utils` 0.8.8, with exactly one behavioural change:
-    // the reactive `Owner` is cleaned up through `OwnerCleanupStream`'s `Drop`
-    // instead of a trailing stream item, so cleanup also runs when a client
-    // disconnects mid-response (the trailing-item approach only runs on a full
-    // drain, leaking the owner on early disconnect — leptos-rs/leptos#4739).
-    //
-    // TODO: delete this override and `OwnerCleanupStream`, and bump
-    // `leptos_integration_utils`, once the upstream crate ships the
-    // `Drop`-based cleanup.
+    // Remove this copy only when a released upstream implementation provides
+    // these guarantees for cancellation before headers and during the body,
+    // including retained Owner handles and thread-affine destruction.
     //
     // The explicit `-> impl Future + Send` form (rather than `async fn`)
     // mirrors the upstream trait method's signature verbatim and keeps the
@@ -216,156 +286,92 @@ impl ExtendResponse for NtexResponse {
         async move {
             let prefetches = PrefetchLazyFn::default();
 
-            let (owner, stream) =
-                build_response(app_fn, additional_context, stream_builder, supports_ooo);
+            let (owner, stream) = {
+                let _restore = RestoreOwner::capture();
+                build_response(app_fn, additional_context, stream_builder, supports_ooo)
+            };
+            // Arm cleanup before constructing the scoped future. Its scope
+            // restores the request Owner for setup, deferred work and metadata,
+            // and keeps its arena active through cancellation destructors.
+            let owner = OwnerCleanup::new(owner);
+            ScopedWork::with_owner(owner.owner().clone(), async move {
+                let (owner, stream) = (owner, stream);
 
-            owner.with(|| provide_context(prefetches.clone()));
+                provide_context(prefetches.clone());
 
-            let sc = owner.shared_context().unwrap();
+                let sc = owner.owner().shared_context().unwrap();
 
-            let stream = stream.await.ready_chunks(32).map(|n| n.join(""));
+                let stream = stream.await.ready_chunks(32).map(|n| n.join(""));
 
-            while let Some(pending) = sc.await_deferred() {
-                pending.await;
-            }
+                while let Some(pending) = sc.await_deferred() {
+                    pending.await;
+                }
 
-            if !prefetches.0.read_value().is_empty() {
-                use leptos::prelude::*;
+                if !prefetches.0.read_value().is_empty() {
+                    use leptos::prelude::*;
 
-                let nonce = use_nonce().map(|n| n.to_string()).unwrap_or_default();
-                if let Some(manifest) = use_context::<WasmSplitManifest>() {
-                    let (pkg_path, manifest, wasm_split_file) = &*manifest.0.read_value();
-                    let prefetches = prefetches.0.read_value();
+                    let nonce = use_nonce().map(|n| n.to_string()).unwrap_or_default();
+                    if let Some(manifest) = use_context::<WasmSplitManifest>() {
+                        let (pkg_path, manifest, wasm_split_file) = &*manifest.0.read_value();
+                        let prefetches = prefetches.0.read_value();
 
-                    let all_prefetches = prefetches
-                        .iter()
-                        .flat_map(|key| manifest.get(*key).into_iter().flatten());
+                        let all_prefetches = prefetches
+                            .iter()
+                            .flat_map(|key| manifest.get(*key).into_iter().flatten());
 
-                    for module in all_prefetches {
-                        // to_html() on leptos_meta components registers them with the meta
-                        // context, rather than returning HTML directly
+                        for module in all_prefetches {
+                            // to_html() on leptos_meta components registers them with the meta
+                            // context, rather than returning HTML directly
+                            _ = view! {
+                                <Link
+                                    rel="preload"
+                                    href=format!("{pkg_path}/{module}.wasm")
+                                    as_="fetch"
+                                    type_="application/wasm"
+                                    crossorigin=nonce.clone()
+                                />
+                            }
+                            .to_html();
+                        }
                         _ = view! {
-                            <Link
-                                rel="preload"
-                                href=format!("{pkg_path}/{module}.wasm")
-                                as_="fetch"
-                                type_="application/wasm"
-                                crossorigin=nonce.clone()
-                            />
+                            <Link rel="modulepreload" href=format!("{pkg_path}/{wasm_split_file}") crossorigin=nonce/>
                         }
                         .to_html();
                     }
-                    _ = view! {
-                        <Link rel="modulepreload" href=format!("{pkg_path}/{wasm_split_file}") crossorigin=nonce/>
-                    }
-                    .to_html();
                 }
-            }
 
-            let mut stream = Box::pin(meta_context.inject_meta_context(stream).await.then({
-                let sc = Arc::clone(&sc);
-                move |chunk| {
+                let mut stream = Box::pin(meta_context.inject_meta_context(stream).await.then({
                     let sc = Arc::clone(&sc);
-                    async move {
-                        while let Some(pending) = sc.await_deferred() {
-                            pending.await;
+                    move |chunk| {
+                        let sc = Arc::clone(&sc);
+                        async move {
+                            while let Some(pending) = sc.await_deferred() {
+                                pending.await;
+                            }
+                            chunk
                         }
-                        chunk
                     }
-                }
-            }));
+                }));
 
-            // wait for the first chunk of the stream, then set the status and headers
-            let first_chunk = stream.next().await.unwrap_or_default();
+                // wait for the first chunk of the stream, then set the status and headers
+                let first_chunk = stream.next().await.unwrap_or_default();
 
-            // ntex divergence from upstream: tie owner cleanup to the body's
-            // `Drop` (via `OwnerCleanupStream`) instead of a trailing stream
-            // item, so it also runs on early client disconnect.
-            let mut res = Self::from_stream(Sandboxed::new(OwnerCleanupStream::new(
-                once(async move { first_chunk }).chain(stream),
-                owner,
-            )));
+                // ntex divergence from upstream: tie owner cleanup to the body's
+                // `Drop` (via `OwnerLease`) instead of a trailing stream
+                // item, so it also runs on early client disconnect.
+                let mut res = Self::from_stream(OwnerLease::new(
+                    once(async move { first_chunk }).chain(stream),
+                    Arc::new(owner),
+                ));
 
-            res.extend_response(&res_options);
+                res.extend_response(&res_options);
 
-            // Set the Content Type headers on all responses. This makes Firefox show the page
-            // source without complaining
-            res.set_default_content_type("text/html; charset=utf-8");
+                // Set the Content Type headers on all responses. This makes Firefox show the page
+                // source without complaining
+                res.set_default_content_type("text/html; charset=utf-8");
 
-            res
-        }
-    }
-}
-
-/// Wraps a response body stream and ties cleanup of the reactive [`Owner`] to
-/// the stream's `Drop`, rather than to a chained trailing future.
-///
-/// Upstream `leptos_integration_utils` (0.8.8) appends
-/// `owner.unset_with_forced_cleanup()` as the last item of the stream, so it
-/// only runs when the stream is polled to completion. A client disconnecting
-/// mid-response (slow client, browser cancel, proxy timeout) drops the body
-/// before that terminal item runs, leaking the `Owner` and everything it
-/// transitively keeps alive. Cleaning up on `Drop` runs whether the stream
-/// finishes or is cancelled.
-///
-/// **ntex divergence from the upstream/axum fix.** The reactive cleanup is not
-/// safe to run from an arbitrary thread (the same cross-thread-drop hazard the
-/// [`Request`](crate::request::Request) wrapper documents). The axum
-/// integration never hits this — every body is `Send` on a uniform tokio
-/// runtime — but ntex workers are single-threaded, so in the normal path the
-/// body is created, polled, and dropped on the same worker thread. As a
-/// belt-and-suspenders guard we record the origin thread and only force
-/// cleanup when dropped there; an unexpected off-thread drop falls back to the
-/// pre-stopgap behaviour (skip the forced cleanup — no worse than today's
-/// leak) rather than risking a panic during response teardown.
-struct OwnerCleanupStream {
-    inner: Pin<Box<dyn Stream<Item = String> + Send>>,
-    owner: Option<Owner>,
-    origin_thread: ThreadId,
-}
-
-impl OwnerCleanupStream {
-    fn new(inner: impl Stream<Item = String> + Send + 'static, owner: Owner) -> Self {
-        Self {
-            inner: Box::pin(inner),
-            owner: Some(owner),
-            origin_thread: std::thread::current().id(),
-        }
-    }
-}
-
-impl Stream for OwnerCleanupStream {
-    type Item = String;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
-    }
-}
-
-impl Drop for OwnerCleanupStream {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.take() {
-            if std::thread::current().id() == self.origin_thread {
-                owner.unset_with_forced_cleanup();
-            } else {
-                // Off-origin-thread drop: do not run the reactive teardown
-                // here. Letting `owner` drop normally would not help — dropping
-                // the last `Owner` handle itself runs thread-affine cleanup
-                // (child disposal, cleanup callbacks, arena removal), the very
-                // cross-thread work we must avoid. `mem::forget` the handle so
-                // none of it runs off-thread; the reactive graph leaks, which
-                // is strictly no worse than the pre-stopgap behaviour. Mirrors
-                // the `SendWrapper` invalid-thread guard in `Request`'s `Drop`
-                // (see `crate::request`).
-                let msg = "OwnerCleanupStream dropped off its origin thread; \
-                           leaking the reactive Owner to avoid a cross-thread \
-                           cleanup panic";
-                #[cfg(feature = "tracing")]
-                tracing::warn!("{msg}");
-                #[cfg(not(feature = "tracing"))]
-                eprintln!("{msg}");
-                std::mem::forget(owner);
-            }
+                res
+            }).await
         }
     }
 }
@@ -438,14 +444,21 @@ pub fn redirect(path: &str) {
             eprintln!("{msg}");
             return;
         };
+        let accepts_html = req.with(|http| {
+            http.headers()
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map(accept_header_includes_html)
+                .unwrap_or(false)
+        });
+        let Ok(accepts_html) = accepts_html else {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("redirect() could not access the current request scope");
+            #[cfg(not(feature = "tracing"))]
+            eprintln!("redirect() could not access the current request scope");
+            return;
+        };
         res.insert_header(header::LOCATION, location);
-
-        let accepts_html = req
-            .headers()
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .map(accept_header_includes_html)
-            .unwrap_or(false);
 
         if accepts_html {
             res.set_status(StatusCode::FOUND);
@@ -468,63 +481,17 @@ pub fn redirect(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leptos::prelude::Owner;
     use lets_expect::lets_expect;
 
-    // ----- should_replace_header: the full singleton set ----------------
-    // `extend_response_parts` REPLACES these headers and APPENDS every other.
-    // The set is a hand-maintained 12-entry `matches!`, so pin EVERY arm
-    // directly. (Going through a real response can't cover CONTENT_LENGTH /
-    // CONTENT_TYPE / TRANSFER_ENCODING, which ntex auto-manages on `finish()`,
-    // so the predicate is tested in isolation.) The sweep returns the list of
-    // MISCLASSIFIED headers, so deleting any arm — or wrongly adding one —
-    // names the offender instead of just flipping a bool. Two negatives pin
-    // the append side.
-    fn header_classification_failures() -> Vec<String> {
-        let must_replace = [
-            header::CONTENT_LENGTH,
-            header::CONTENT_TYPE,
-            header::CONTENT_ENCODING,
-            header::TRANSFER_ENCODING,
-            header::LOCATION,
-            header::ETAG,
-            header::LAST_MODIFIED,
-            header::CACHE_CONTROL,
-            header::EXPIRES,
-            header::CONTENT_DISPOSITION,
-            header::CONTENT_RANGE,
-            header::ACCEPT_RANGES,
-        ];
-        let must_append = [header::SET_COOKIE, HeaderName::from_static("x-custom")];
-        let mut failures = Vec::new();
-        for key in must_replace {
-            if !should_replace_header(&key) {
-                failures.push(format!("{key:?} must REPLACE"));
-            }
-        }
-        for key in must_append {
-            if should_replace_header(&key) {
-                failures.push(format!("{key:?} must APPEND"));
-            }
-        }
-        failures
-    }
-
-    lets_expect! {
-        expect(header_classification_failures()) as the_should_replace_header_set {
-            to classifies_all_twelve_singletons_and_no_others {
-                equal(Vec::<String>::new())
-            }
-        }
-    }
-
-    // ----- accept_header_includes_html: exhaustive spec -----------------
+    // ----- HTML-navigation heuristic: selected characteristic states ----
     // Domain-walk of a type-poor `&str -> bool`: the media range parses or
     // not, its type/subtype is text/html or not, the `q` quality is
     // absent / positive / zero / unparseable, and HTML may appear among
     // several comma-separated ranges. Every leaf below is the behaviour
-    // decided from the HTTP `Accept` semantics, not read off the code.
+    // derived from this helper's navigation contract, not full content negotiation.
     lets_expect! {
-        expect(accept_header_includes_html(accept)) {
+        expect(accept_header_includes_html(accept)) as html_acceptance {
             let accept = "text/html";
 
             to accepts_a_plain_html_range { be_true }
@@ -645,72 +612,43 @@ mod tests {
         }
     }
 
-    // ----- OwnerCleanupStream::drop thread-affinity: exhaustive spec ----
-    // The body stream is dropped early (before it is drained), modelling a
-    // client disconnect. The single characteristic is *which thread* runs
-    // the drop: on its origin thread the reactive teardown is forced; off
-    // its origin thread it is skipped (the owner is `mem::forget`-leaked) to
-    // avoid a cross-thread cleanup panic. We observe the outcome through a
-    // `DropProbe` context value whose own `Drop` flips a flag iff the
-    // reactive teardown disposed it.
-
-    /// Which thread drops the body, relative to the one that built it.
     enum DropSite {
         OriginThread,
         OffOriginThread,
     }
 
-    /// Builds an `OwnerCleanupStream` over an `Owner` holding a drop-probe,
-    /// drops the (undrained) stream at `site`, and reports whether the
-    /// reactive teardown ran (i.e. whether the probe's `Drop` fired).
-    fn reactive_cleanup_runs_when_dropped_at(site: DropSite) -> bool {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // A context value whose own `Drop` records that it ran. Forcing the
-        // owner's cleanup disposes its stored context, so this flag flips iff
-        // `OwnerCleanupStream::drop` ran the reactive teardown.
-        struct DropProbe(Arc<AtomicBool>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let cleaned = Arc::new(AtomicBool::new(false));
+    fn reactive_cleanup_runs_when_dropped_at(site: DropSite) -> usize {
+        use leptos::prelude::{Owner, on_cleanup};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cleaned = Arc::new(AtomicUsize::new(0));
         let owner = Owner::new();
-        owner.with(|| provide_context(DropProbe(cleaned.clone())));
-
-        // NOTE: this leaf pins the THREAD-AFFINITY contract (origin-thread drop
-        // runs the reactive teardown; off-thread drop leaks instead of
-        // panicking), which is the actual `OwnerCleanupStream` bug class. It
-        // does NOT separately isolate "forced cleanup" from an ordinary
-        // last-handle disposal — `unset_with_forced_cleanup()` does not dispose
-        // a graph that another live `Owner` handle is keeping alive, so the
-        // "hold a second clone" trick cannot distinguish them (verified: it
-        // suppresses disposal on BOTH paths).
-
-        // Build the body but drop it WITHOUT draining the stream.
-        let stream =
-            OwnerCleanupStream::new(futures::stream::iter(vec!["partial".to_string()]), owner);
+        let retained = owner.clone();
+        let counter = cleaned.clone();
+        owner.with(|| {
+            on_cleanup(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let stream = OwnerLease::new(
+            futures::stream::iter(vec!["partial".to_string()]),
+            Arc::new(OwnerCleanup::new(owner)),
+        );
         match site {
             DropSite::OriginThread => drop(stream),
-            DropSite::OffOriginThread => std::thread::spawn(move || drop(stream))
-                .join()
-                .expect("off-thread drop must not panic"),
+            DropSite::OffOriginThread => std::thread::spawn(move || drop(stream)).join().unwrap(),
         }
-
-        cleaned.load(Ordering::SeqCst)
+        let observed = cleaned.load(Ordering::SeqCst);
+        retained.unset_with_forced_cleanup();
+        observed
     }
 
     lets_expect! {
-        expect(reactive_cleanup_runs_when_dropped_at(drop_site)) {
+        expect(reactive_cleanup_runs_when_dropped_at(drop_site)) as body_cleanup_thread_affinity {
             let drop_site = DropSite::OriginThread;
-
-            to forces_reactive_cleanup_on_early_drop { be_true }
-
+            to forces_cleanup_despite_a_retained_owner { equal(1_usize) }
             when the_body_is_dropped_off_its_origin_thread {
                 let drop_site = DropSite::OffOriginThread;
-                to skips_reactive_cleanup_and_leaks_instead_of_panicking { be_false }
+                to preserves_the_documented_off_thread_fallback { equal(0_usize) }
             }
         }
     }
@@ -744,7 +682,7 @@ mod tests {
     }
 
     lets_expect! {
-        expect(content_type_after_default(preset, valid)) {
+        expect(content_type_after_default(preset, valid)) as default_content_type {
             // default: nothing set yet, a valid value -> it is applied
             let preset: Option<&str> = None;
             let valid = true;
@@ -783,7 +721,7 @@ mod tests {
 
     // ----- redirect(): reactive-context presence and Accept-header specs ---
     // `redirect()` has three characteristics of its own, independent of
-    // `accept_header_includes_html`'s own exhaustive spec above (which covers
+    // `accept_header_includes_html`'s parser spec above (which covers
     // the STRING PARSING of an Accept value once one is in hand):
     //   1. reactive-context presence: both Request and ResponseOptions
     //      present (the only state that can do anything) vs. either/both
@@ -803,9 +741,7 @@ mod tests {
     /// are provided to the `Owner` running `redirect()`.
     enum ContextSetup {
         Both,
-        OnlyRequest,
         OnlyResponseOptions,
-        Neither,
     }
 
     /// The observable outcome of one `redirect()` call: the `Location` header
@@ -819,15 +755,10 @@ mod tests {
         redirect_header_present: bool,
     }
 
-    /// Builds a mock ntex request with the given `Accept` header state, runs
-    /// `redirect(path)` inside an `Owner` seeded per `ctx`, and reports the
-    /// resulting `ResponseOptions` state. When `ctx` withholds the
-    /// `ResponseOptions` context, the outcome is read from a SEPARATE
-    /// `ResponseOptions` that was never given to `redirect()` — any change
-    /// on it would mean `redirect()` reached through to the wrong instance,
-    /// which cannot happen, so its all-`None`/`false` value simply confirms
-    /// "no-op" the same way the with-Request case does.
+    /// Executes redirect against the actual ResponseOptions supplied to context.
+    /// Missing-ResponseOptions behavior is a separate completion contract below.
     fn redirect_outcome(ctx: ContextSetup, accept: Option<&HeaderValue>) -> RedirectOutcome {
+        let _scope = crate::RequestScope::new();
         let mut req_builder = ntex::web::test::TestRequest::with_uri("/");
         if let Some(accept) = accept {
             req_builder = req_builder.header(header::ACCEPT, accept.clone());
@@ -842,13 +773,9 @@ mod tests {
                     provide_context(crate::request::Request::new(&http_req));
                     provide_context(res_options.clone());
                 }
-                ContextSetup::OnlyRequest => {
-                    provide_context(crate::request::Request::new(&http_req));
-                }
                 ContextSetup::OnlyResponseOptions => {
                     provide_context(res_options.clone());
                 }
-                ContextSetup::Neither => {}
             }
 
             redirect("/target");
@@ -869,7 +796,7 @@ mod tests {
     }
 
     lets_expect! {
-        expect(redirect_outcome(ctx, accept.as_ref())) {
+        expect(redirect_outcome(ctx, accept.as_ref())) as contextual_redirect {
             // Default: both contexts present, Accept accepts html -> 302 + Location.
             let ctx = ContextSetup::Both;
             let accept: Option<HeaderValue> = Some(HeaderValue::from_static("text/html"));
@@ -932,18 +859,8 @@ mod tests {
             // Reactive-context-presence axis: `redirect()` requires BOTH a
             // `Request` and a `ResponseOptions` in context; any state short of
             // "both" takes the `else` (warn-and-no-op) branch. Each state
-            // below observes the SAME never-touched `res_options` the harness
-            // builds, confirming no Location/status/redirect-header was set.
-            when the_reactive_context_is_missing_response_options {
-                let ctx = ContextSetup::OnlyRequest;
-                to performs_no_side_effect {
-                    equal(RedirectOutcome {
-                        location: None,
-                        status: None,
-                        redirect_header_present: false,
-                    })
-                }
-            }
+            // below observes the actual supplied ResponseOptions.
+
 
             when the_reactive_context_is_missing_the_request {
                 let ctx = ContextSetup::OnlyResponseOptions;
@@ -956,16 +873,52 @@ mod tests {
                 }
             }
 
-            when the_reactive_context_is_missing_both {
-                let ctx = ContextSetup::Neither;
-                to performs_no_side_effect {
-                    equal(RedirectOutcome {
-                        location: None,
-                        status: None,
-                        redirect_header_present: false,
-                    })
-                }
+
+        }
+    }
+    fn redirect_without_response_context(request_present: bool) {
+        let _scope = crate::RequestScope::new();
+        let owner = Owner::new();
+        owner.with(|| {
+            if request_present {
+                let request = ntex::web::test::TestRequest::get().to_http_request();
+                provide_context(crate::request::Request::new(&request));
             }
+            redirect("/target");
+        });
+    }
+    lets_expect! {
+        expect(redirect_without_response_context(request_present)) as redirect_without_response_options {
+            let request_present = true;
+            to completes_without_a_response_context { equal(()) }
+            when the_request_is_also_absent {
+                let request_present = false;
+                to completes_without_any_request_context { equal(()) }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod header_ownership_specs {
+    use super::*;
+    use lets_expect::*;
+
+    /// Every field the adapter strips from its own representations is also a
+    /// field whose captured value replaces the framework's; a header added to
+    /// one list without the other would surface here.
+    fn appended_owned_headers() -> Vec<String> {
+        REPRESENTATION_HEADERS
+            .iter()
+            .chain(FAILED_REPRESENTATION_HEADERS.iter())
+            .filter(|name| header_merge(name) == HeaderMerge::Append)
+            .map(|name| name.as_str().to_owned())
+            .collect()
+    }
+
+    lets_expect! {
+        expect(appended_owned_headers()) as adapter_owned_headers {
+            to never_append_to_the_frameworks_value { equal(Vec::<String>::new()) }
         }
     }
 }

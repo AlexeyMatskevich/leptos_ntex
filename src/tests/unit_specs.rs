@@ -3,136 +3,360 @@ use lets_expect::lets_expect;
 use ntex::http::{StatusCode, header};
 use ntex::web::test;
 
-// ----- LeptosServerFnConfig builder: exhaustive spec ----------------
-// Object-interface spec for the const builder. The behavioural content
-// the old single-case test missed: each setter overrides ONLY its own
-// field (leaving the siblings at the crate defaults), and `Default`
-// agrees with `new()`. `LeptosServerFnConfig` derives no `PartialEq`,
-// so each field is asserted individually via `have(...)`.
-lets_expect! {
-    expect(config) as the_server_fn_config {
-        let config = crate::LeptosServerFnConfig::new();
+// Builder fields are independent axes; each context overrides one field.
+fn configured_limits(
+    payload: Option<usize>,
+    buffer: Option<usize>,
+    protocol: Option<&'static str>,
+) -> crate::LeptosServerFnConfig {
+    let mut config = crate::LeptosServerFnConfig::new();
+    if let Some(limit) = payload {
+        config = config.with_payload_limit(limit);
+    }
+    if let Some(limit) = buffer {
+        config = config.with_ws_channel_buffer(limit);
+    }
+    if let Some(protocol) = protocol {
+        config = config.with_ws_subprotocol(protocol);
+    }
+    config
+}
 
-        to starts_from_the_crate_defaults {
+lets_expect! {
+    expect(configured_limits(payload, buffer, protocol)) as independent_config_fields {
+        let payload = None;
+        let buffer = None;
+        let protocol = None;
+        to preserves_every_independent_field {
             have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
             have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
-            have(ws_subprotocol) be_none,
+            have(ws_subprotocol) equal(None),
         }
-
-        when built_through_the_default_trait {
-            let config = crate::LeptosServerFnConfig::default();
-            to matches_new {
-                have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
-                have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
-                have(ws_subprotocol) be_none,
-            }
-        }
-
-        when only_the_payload_limit_is_overridden {
-            let config = crate::LeptosServerFnConfig::new().with_payload_limit(4096);
-            to changes_the_payload_limit_alone {
-                have(payload_limit) equal(4096),
-                have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
-                have(ws_subprotocol) be_none,
-            }
-        }
-
-        when only_the_ws_channel_buffer_is_overridden {
-            let config = crate::LeptosServerFnConfig::new().with_ws_channel_buffer(32);
-            to changes_the_channel_buffer_alone {
-                have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
-                have(ws_channel_buffer) equal(32),
-                have(ws_subprotocol) be_none,
-            }
-        }
-
-        when only_the_ws_subprotocol_is_overridden {
-            let config = crate::LeptosServerFnConfig::new().with_ws_subprotocol("graphql-ws");
-            to changes_the_subprotocol_alone {
+        when the_subprotocol_is_overridden {
+            let protocol = Some("graphql-ws");
+            to preserves_every_independent_field {
                 have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
                 have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
                 have(ws_subprotocol) equal(Some("graphql-ws")),
             }
         }
-
-        when every_field_is_overridden {
-            let config = crate::LeptosServerFnConfig::new()
-                .with_payload_limit(4096)
-                .with_ws_channel_buffer(32)
-                .with_ws_subprotocol("graphql-ws");
-            to applies_all_three_overrides {
-                have(payload_limit) equal(4096),
+        when the_channel_buffer_is_overridden {
+            let buffer = Some(32);
+            to preserves_every_independent_field {
+                have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
                 have(ws_channel_buffer) equal(32),
-                have(ws_subprotocol) equal(Some("graphql-ws")),
+                have(ws_subprotocol) equal(None),
             }
+            when the_subprotocol_is_overridden {
+                let protocol = Some("graphql-ws");
+                to preserves_every_independent_field {
+                    have(payload_limit) equal(crate::DEFAULT_PAYLOAD_LIMIT),
+                    have(ws_channel_buffer) equal(32),
+                    have(ws_subprotocol) equal(Some("graphql-ws")),
+                }
+            }
+        }
+        when the_payload_limit_is_overridden {
+            let payload = Some(4096);
+            to preserves_every_independent_field {
+                have(payload_limit) equal(4096),
+                have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                have(ws_subprotocol) equal(None),
+            }
+            when the_subprotocol_is_overridden {
+                let protocol = Some("graphql-ws");
+                to preserves_every_independent_field {
+                    have(payload_limit) equal(4096),
+                    have(ws_channel_buffer) equal(crate::DEFAULT_WS_CHANNEL_BUFFER),
+                    have(ws_subprotocol) equal(Some("graphql-ws")),
+                }
+            }
+            when the_channel_buffer_is_overridden {
+                let buffer = Some(32);
+                to preserves_every_independent_field {
+                    have(payload_limit) equal(4096),
+                    have(ws_channel_buffer) equal(32),
+                    have(ws_subprotocol) equal(None),
+                }
+                when the_subprotocol_is_overridden {
+                    let protocol = Some("graphql-ws");
+                    to preserves_every_independent_field {
+                        have(payload_limit) equal(4096),
+                        have(ws_channel_buffer) equal(32),
+                        have(ws_subprotocol) equal(Some("graphql-ws")),
+                    }
+                }
+            }
+        }
+    }
+    expect(crate::LeptosServerFnConfig::default()) as default_config {
+        to agrees_with_new {
+            have(payload_limit) equal(crate::LeptosServerFnConfig::new().payload_limit),
+            have(ws_channel_buffer) equal(crate::LeptosServerFnConfig::new().ws_channel_buffer),
+            have(ws_subprotocol) equal(crate::LeptosServerFnConfig::new().ws_subprotocol),
         }
     }
 }
 
-// ----- NtexResponse::extend_response_parts header merge: exhaustive -
-// When merging captured `ResponseParts` into the response, a *singleton*
-// header (the `should_replace_header` set — Cache-Control, Location,
-// ETag, …, here represented by Cache-Control) must REPLACE any existing
-// value, while a multi-value header (e.g. Set-Cookie) must APPEND,
-// keeping both. The old test covered only the replace direction; the
-// append direction was the missing negative. The assertion pins the
-// exact resulting value vector, not mere presence.
-fn reconcile_header(key: header::HeaderName, existing: &str, incoming: &str) -> Vec<String> {
-    let mut response = crate::response::NtexResponse(
-        ntex::web::HttpResponse::Ok()
-            .header(key.clone(), existing)
-            .finish(),
-    );
+// Header field replacement is separate from the cardinality of either set.
+// Every spec invokes the merge anew and compares the complete ordered field set.
+fn reconcile_header(key: header::HeaderName, existing: &[&str], incoming: &[&str]) -> Vec<String> {
+    let mut response = crate::response::NtexResponse(ntex::web::HttpResponse::Ok().finish());
+    for value in existing {
+        response
+            .0
+            .headers_mut()
+            .append(key.clone(), header::HeaderValue::from_str(value).unwrap());
+    }
     let mut parts = crate::ResponseParts::default();
-    parts.append_header(
-        key.clone(),
-        header::HeaderValue::from_str(incoming).unwrap(),
-    );
+    for value in incoming {
+        parts.append_header(key.clone(), header::HeaderValue::from_str(value).unwrap());
+    }
     response.extend_response_parts(parts);
     response
         .take()
         .headers()
         .get_all(key)
-        .filter_map(|value| value.to_str().ok())
-        .map(str::to_string)
+        .map(|value| value.to_str().unwrap().to_string())
         .collect()
 }
 
 lets_expect! {
-    expect(reconcile_header(key, existing, incoming)) as the_reconciled_header {
+    expect(reconcile_header(key, existing, incoming)) as list_header_cardinality {
         let key = header::CACHE_CONTROL;
-        let existing = "public, max-age=60";
-        let incoming = "no-store";
+        let existing = &["private"];
+        let incoming = &["no-store", "max-age=60"];
+        to preserves_the_required_field_set { equal(vec!["no-store".to_string(), "max-age=60".to_string()]) }
+        when one_incoming_value {
+            let incoming = &["no-store"];
+            to preserves_the_required_field_set { equal(vec!["no-store".to_string()]) }
+        }
+        when no_incoming_value {
+            let incoming = &[];
+            to preserves_the_required_field_set { equal(vec!["private".to_string()]) }
+        }
+        when no_existing_value {
+            let existing = &[];
+            to preserves_the_required_field_set { equal(vec!["no-store".to_string(), "max-age=60".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["no-store"];
+                to preserves_the_required_field_set { equal(vec!["no-store".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(Vec::<String>::new()) }
+            }
+        }
+        when multiple_existing_values {
+            let existing = &["private", "max-age=5"];
+            to preserves_the_required_field_set { equal(vec!["no-store".to_string(), "max-age=60".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["no-store"];
+                to preserves_the_required_field_set { equal(vec!["no-store".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(vec!["private".to_string(), "max-age=5".to_string()]) }
+            }
+        }
+    }
+}
 
-        to replaces_the_previous_singleton_value { equal(vec!["no-store".to_string()]) }
+lets_expect! {
+    expect(reconcile_header(key, existing, incoming)) as singleton_header_cardinality {
+        let key = header::CONTENT_TYPE;
+        let existing = &["text/plain"];
+        let incoming = &["application/json", "application/xml"];
+        to preserves_the_required_field_set { equal(vec!["application/xml".to_string()]) }
+        when one_incoming_value {
+            let incoming = &["application/json"];
+            to preserves_the_required_field_set { equal(vec!["application/json".to_string()]) }
+        }
+        when no_incoming_value {
+            let incoming = &[];
+            to preserves_the_required_field_set { equal(vec!["text/plain".to_string()]) }
+        }
+        when no_existing_value {
+            let existing = &[];
+            to preserves_the_required_field_set { equal(vec!["application/xml".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["application/json"];
+                to preserves_the_required_field_set { equal(vec!["application/json".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(Vec::<String>::new()) }
+            }
+        }
+        when multiple_existing_values {
+            let existing = &["text/plain", "text/html"];
+            to preserves_the_required_field_set { equal(vec!["application/xml".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["application/json"];
+                to preserves_the_required_field_set { equal(vec!["application/json".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(vec!["text/plain".to_string(), "text/html".to_string()]) }
+            }
+        }
+    }
+}
 
-        // Pin the other singleton match arms the original test covered, so
-        // a regression deleting only `EXPIRES` or `CONTENT_DISPOSITION`
-        // from `should_replace_header` is still caught (each is a distinct
-        // arm — not subsumed by the Cache-Control representative).
-        when the_singleton_header_is_expires {
+lets_expect! {
+    expect(reconcile_header(key, existing, incoming)) as appended_header_cardinality {
+        let key = header::SET_COOKIE;
+        let existing = &["a=1"];
+        let incoming = &["c=3", "d=4"];
+        to preserves_the_required_field_set { equal(vec!["a=1".to_string(), "c=3".to_string(), "d=4".to_string()]) }
+        when one_incoming_value {
+            let incoming = &["c=3"];
+            to preserves_the_required_field_set { equal(vec!["a=1".to_string(), "c=3".to_string()]) }
+        }
+        when no_incoming_value {
+            let incoming = &[];
+            to preserves_the_required_field_set { equal(vec!["a=1".to_string()]) }
+        }
+        when no_existing_value {
+            let existing = &[];
+            to preserves_the_required_field_set { equal(vec!["c=3".to_string(), "d=4".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["c=3"];
+                to preserves_the_required_field_set { equal(vec!["c=3".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(Vec::<String>::new()) }
+            }
+        }
+        when multiple_existing_values {
+            let existing = &["a=1", "b=2"];
+            to preserves_the_required_field_set { equal(vec!["a=1".to_string(), "b=2".to_string(), "c=3".to_string(), "d=4".to_string()]) }
+            when one_incoming_value {
+                let incoming = &["c=3"];
+                to preserves_the_required_field_set { equal(vec!["a=1".to_string(), "b=2".to_string(), "c=3".to_string()]) }
+            }
+            when no_incoming_value {
+                let incoming = &[];
+                to preserves_the_required_field_set { equal(vec!["a=1".to_string(), "b=2".to_string()]) }
+            }
+        }
+    }
+}
+
+lets_expect! {
+    expect(reconcile_header(key, existing, incoming)) as header_field_contract {
+        let key = header::CACHE_CONTROL;
+        let existing = &["private"];
+        let incoming = &["no-store", "max-age=60"];
+        to applies_the_complete_override { equal(vec!["no-store".to_string(), "max-age=60".to_string()]) }
+        when the_field_is_content_encoding {
+            let key = header::CONTENT_ENCODING;
+            let existing = &["br"];
+            let incoming = &["gzip", "identity"];
+            to applies_the_complete_override { equal(vec!["gzip".to_string(), "identity".to_string()]) }
+        }
+        when the_field_is_transfer_encoding {
+            let key = header::TRANSFER_ENCODING;
+            let existing = &["identity"];
+            let incoming = &["gzip", "chunked"];
+            to applies_the_complete_override { equal(vec!["gzip".to_string(), "chunked".to_string()]) }
+        }
+        when the_field_is_accept_ranges {
+            let key = header::ACCEPT_RANGES;
+            let existing = &["none"];
+            let incoming = &["bytes", "custom"];
+            to applies_the_complete_override { equal(vec!["bytes".to_string(), "custom".to_string()]) }
+        }
+        when the_field_is_content_length {
+            let key = header::CONTENT_LENGTH;
+            let existing = &["1"];
+            let incoming = &["2", "3"];
+            to applies_the_complete_override { equal(vec!["3".to_string()]) }
+        }
+        when the_field_is_content_type {
+            let key = header::CONTENT_TYPE;
+            let existing = &["text/plain"];
+            let incoming = &["text/html", "application/json"];
+            to applies_the_complete_override { equal(vec!["application/json".to_string()]) }
+        }
+        when the_field_is_location {
+            let key = header::LOCATION;
+            let existing = &["/old"];
+            let incoming = &["/one", "/two"];
+            to applies_the_complete_override { equal(vec!["/two".to_string()]) }
+        }
+        when the_field_is_etag {
+            let key = header::ETAG;
+            let existing = &["old"];
+            let incoming = &["one", "two"];
+            to applies_the_complete_override { equal(vec!["two".to_string()]) }
+        }
+        when the_field_is_last_modified {
+            let key = header::LAST_MODIFIED;
+            let existing = &["Mon, 01 Jan 2024 00:00:00 GMT"];
+            let incoming = &["Tue, 02 Jan 2024 00:00:00 GMT", "Wed, 03 Jan 2024 00:00:00 GMT"];
+            to applies_the_complete_override { equal(vec!["Wed, 03 Jan 2024 00:00:00 GMT".to_string()]) }
+        }
+        when the_field_is_expires {
             let key = header::EXPIRES;
-            let existing = "Wed, 21 Oct 2015 07:28:00 GMT";
-            let incoming = "Thu, 01 Jan 1970 00:00:00 GMT";
-            to replaces_the_previous_value {
-                equal(vec!["Thu, 01 Jan 1970 00:00:00 GMT".to_string()])
-            }
+            let existing = &["Mon, 01 Jan 2024 00:00:00 GMT"];
+            let incoming = &["Tue, 02 Jan 2024 00:00:00 GMT", "Wed, 03 Jan 2024 00:00:00 GMT"];
+            to applies_the_complete_override { equal(vec!["Wed, 03 Jan 2024 00:00:00 GMT".to_string()]) }
         }
-
-        when the_singleton_header_is_content_disposition {
+        when the_field_is_content_disposition {
             let key = header::CONTENT_DISPOSITION;
-            let existing = "inline";
-            let incoming = "attachment";
-            to replaces_the_previous_value { equal(vec!["attachment".to_string()]) }
+            let existing = &["inline"];
+            let incoming = &["attachment; filename=one", "attachment; filename=two"];
+            to applies_the_complete_override { equal(vec!["attachment; filename=two".to_string()]) }
         }
-
-        when the_header_permits_multiple_values {
+        when the_field_is_content_range {
+            let key = header::CONTENT_RANGE;
+            let existing = &["bytes 0-1/5"];
+            let incoming = &["bytes 1-2/5", "bytes 2-3/5"];
+            to applies_the_complete_override { equal(vec!["bytes 2-3/5".to_string()]) }
+        }
+        when the_field_is_content_location {
+            let key = header::CONTENT_LOCATION;
+            let existing = &["/framework"];
+            let incoming = &["/one", "/two"];
+            to applies_the_complete_override { equal(vec!["/two".to_string()]) }
+        }
+        when the_field_is_retry_after {
+            let key = header::RETRY_AFTER;
+            let existing = &["1"];
+            let incoming = &["2", "3"];
+            to applies_the_complete_override { equal(vec!["3".to_string()]) }
+        }
+        when the_field_is_strict_transport_security {
+            let key = header::STRICT_TRANSPORT_SECURITY;
+            let existing = &["max-age=1"];
+            let incoming = &["max-age=2", "max-age=3"];
+            to applies_the_complete_override { equal(vec!["max-age=3".to_string()]) }
+        }
+        when the_field_is_content_digest {
+            let key = header::HeaderName::from_static("content-digest");
+            let existing = &["sha-256=:old:"];
+            let incoming = &["sha-256=:one:", "sha-256=:two:"];
+            to applies_the_complete_override { equal(vec!["sha-256=:two:".to_string()]) }
+        }
+        when the_field_is_set_cookie {
             let key = header::SET_COOKIE;
-            let existing = "session=abc";
-            let incoming = "theme=dark";
-            to appends_and_keeps_both_values {
-                equal(vec!["session=abc".to_string(), "theme=dark".to_string()])
-            }
+            let existing = &["a=1"];
+            let incoming = &["b=2", "c=3"];
+            to applies_the_complete_override { equal(vec!["a=1".to_string(), "b=2".to_string(), "c=3".to_string()]) }
+        }
+        when the_field_is_vary {
+            let key = header::VARY;
+            let existing = &["Accept"];
+            let incoming = &["Origin", "Accept-Encoding"];
+            to applies_the_complete_override { equal(vec!["Accept".to_string(), "Origin".to_string(), "Accept-Encoding".to_string()]) }
+        }
+        when the_field_is_custom {
+            let key = header::HeaderName::from_static("x-custom");
+            let existing = &["old"];
+            let incoming = &["one", "two"];
+            to applies_the_complete_override { equal(vec!["old".to_string(), "one".to_string(), "two".to_string()]) }
         }
     }
 }
@@ -461,15 +685,6 @@ lets_expect! {
 // would silently re-mode and re-method every route).
 // Two distinct methods, so `methods()` must report BOTH in order — a single
 // method could not catch a `.take(1)` / drop-after-first / reorder regression.
-fn sample_listing() -> crate::NtexRouteListing {
-    crate::NtexRouteListing::new(
-        "/sample".to_string(),
-        leptos_router::SsrMode::Async,
-        [leptos_router::Method::Get, leptos_router::Method::Post],
-        Vec::new(),
-    )
-}
-
 fn listing_with_mode(mode: leptos_router::SsrMode) -> crate::NtexRouteListing {
     crate::NtexRouteListing::new(
         "/sample".to_string(),
@@ -512,18 +727,32 @@ lets_expect! {
         // `matches!(mode, SsrMode::Static(_))` checks elsewhere in the crate,
         // but only an exact-value check like this one catches it.
         when the_listing_was_built_static {
-            let mode = leptos_router::SsrMode::Static(leptos_router::static_routes::StaticRoute::new());
-            to echoes_that_mode {
-                equal(leptos_router::SsrMode::Static(leptos_router::static_routes::StaticRoute::new()))
+            let static_route = leptos_router::static_routes::StaticRoute::new()
+                .prerender_params(|| async { Default::default() })
+                .regenerate(|_| futures::stream::pending());
+            let mode = leptos_router::SsrMode::Static(static_route.clone());
+            to preserves_the_configured_callbacks {
+                equal(leptos_router::SsrMode::Static(static_route))
             }
         }
     }
 }
 
 lets_expect! {
-    expect(sample_listing().methods().collect::<Vec<_>>()) as the_listing_methods {
-        to reports_every_configured_method_in_order {
+    expect(crate::NtexRouteListing::new(
+        "/methods".to_string(), leptos_router::SsrMode::Async, methods, Vec::new(),
+    ).methods().collect::<Vec<_>>()) as listing_method_cardinality {
+        let methods = vec![leptos_router::Method::Get, leptos_router::Method::Post];
+        to preserves_every_method_in_order {
             equal(vec![leptos_router::Method::Get, leptos_router::Method::Post])
+        }
+        when one_method_is_configured {
+            let methods = vec![leptos_router::Method::Post];
+            to preserves_the_single_method { equal(vec![leptos_router::Method::Post]) }
+        }
+        when no_methods_are_configured {
+            let methods = Vec::<leptos_router::Method>::new();
+            to does_not_invent_a_get_method { equal(Vec::<leptos_router::Method>::new()) }
         }
     }
 }
@@ -656,17 +885,14 @@ lets_expect! {
     }
 }
 
-/// A multi-segment route path keeps a `/` separator BETWEEN segments.
-/// Multi-segment paths arrive as separate `Static` segments WITHOUT
-/// leading slashes (a lone `/about` is stored whole, but `/outer/inner`
-/// splits), so the separator-insertion in `to_ntex_path` is load-bearing:
-/// dropping the `!raw.is_empty()` or `!raw.starts_with('/')` guard
-/// collapses `/outer/inner` into `outerinner`.
-#[test]
-fn nested_route_path_keeps_segment_separators() {
-    let paths = gen_route_list(NestedApp)
-        .into_iter()
-        .map(|r| r.path().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(paths, vec!["/outer/inner".to_string()]);
+// A multi-segment route path keeps a `/` separator BETWEEN segments.
+// Multi-segment paths arrive as separate `Static` segments WITHOUT
+// leading slashes (a lone `/about` is stored whole, but `/outer/inner`
+// splits), so the separator-insertion in `to_ntex_path` is load-bearing:
+// dropping the `!raw.is_empty()` or `!raw.starts_with('/')` guard
+// collapses `/outer/inner` into `outerinner`.
+lets_expect! {
+    expect(gen_route_list(NestedApp).into_iter().map(|route| route.path().to_string()).collect::<Vec<_>>()) as nested_route_paths {
+        to separates_parent_and_child_segments { equal(vec!["/outer/inner".to_string()]) }
+    }
 }

@@ -2,16 +2,14 @@
 //! catch-all [`handle_server_fns`] / [`handle_server_fns_with_context`]
 //! entry points.
 
-use leptos::{
-    context::provide_context,
-    reactive::{computed::ScopedFuture, owner::Owner},
-};
+use leptos::{context::provide_context, reactive::owner::Owner};
 use leptos_integration_utils::ExtendResponse;
 use ntex::http::{
     Payload, StatusCode, Uri,
     header::{self, HeaderValue},
 };
 use ntex::web::{self, ErrorRenderer, HttpRequest, HttpResponse, Route};
+use or_poisoned::OrPoisoned;
 use server_fn::{
     ServerFnTraitObj,
     error::SERVER_FN_ERROR_HEADER,
@@ -20,7 +18,6 @@ use server_fn::{
 use std::sync::Arc;
 
 use crate::config::{PayloadTooLarge, content_length_exceeds, server_fn_config};
-use crate::request::Request;
 use crate::response::{NtexResponse, ResponseOptions, accept_header_includes_html};
 use crate::routes::ensure_executor_initialized;
 use crate::server_fn::registry::{get_server_fn_service, server_fn_methods};
@@ -38,11 +35,21 @@ pub(crate) async fn dispatch_server_fn(
     payload: Payload,
     additional_context: impl FnOnce() + 'static + Send,
 ) -> HttpResponse {
-    let owner = Owner::new();
-    owner
+    crate::owner::OwnerContextFuture::new(async move {
+        let request = match crate::request::scoped_request(&req) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        let cleanup = Arc::new(crate::owner::OwnerCleanup::new(Owner::new()));
+        let weak_cleanup = Arc::downgrade(&cleanup);
+        let response_request = req.clone();
+        let response = cleanup.owner()
         .with(|| {
-            ScopedFuture::new(async move {
-                provide_context(Request::new(&req));
+            crate::owner::ScopedWork::new(async move {
+                provide_context(request);
+                provide_context(weak_cleanup);
+                let connection_scope = super::websocket::ConnectionScope::new();
+                provide_context(connection_scope.clone());
                 let res_options = ResponseOptions::default();
                 provide_context(res_options.clone());
                 additional_context();
@@ -68,7 +75,28 @@ pub(crate) async fn dispatch_server_fn(
                     .as_ref()
                     .and_then(|value| same_origin_location(&conn_scheme, &conn_host, value));
 
-                let mut res = service.run(NtexRequest::from((req, payload))).await;
+                let handshake_request = req.clone();
+                let mut res = {
+                    use futures::FutureExt;
+                    let run = service.run(NtexRequest::from((req, payload))).fuse();
+                    futures::pin_mut!(run);
+                    futures::select_biased! {
+                        _ = connection_scope.cancelled.fuse() => return HttpResponse::Ok().finish(),
+                        response = run => response,
+                    }
+                };
+                // Choose the canonical error before consuming ResponseOptions.
+                // Both registration paths share this finalization, including an
+                // overflow detected while the server function consumed input.
+                let failure = if handshake_request.extensions().get::<PayloadTooLarge>().is_some() {
+                    Some(oversize_response(server_fn_config(&handshake_request).payload_limit))
+                } else {
+                    handshake_request.extensions().get::<super::websocket::HandshakeFailure>()
+                        .map(|error| super::websocket::failure_response(error.0))
+                };
+                if let Some(response) = failure {
+                    return finalize_error_response(response, &res_options);
+                }
 
                 // Whether the post-run `Location` is an echo of the request's
                 // Referer — the signature of server_fn's form-redirect fallback
@@ -134,7 +162,30 @@ pub(crate) async fn dispatch_server_fn(
                 wrapped.take()
             })
         })
-        .await
+        .await;
+        crate::owner::with_owner_cleanup(
+            crate::stream::terminate_on_body_error(&response_request, response),
+            cleanup,
+        )
+    })
+    .await
+}
+
+/// Preserve application headers while a new adapter-owned error replaces the
+/// intended response. Its status, body metadata and handshake version fields
+/// cannot describe the response that failed to complete.
+fn finalize_error_response(response: HttpResponse, options: &ResponseOptions) -> HttpResponse {
+    let mut parts = std::mem::take(&mut *options.0.write().or_poisoned());
+    parts.status = None;
+    for name in crate::response::REPRESENTATION_HEADERS
+        .iter()
+        .chain(crate::response::FAILED_REPRESENTATION_HEADERS.iter())
+    {
+        parts.headers.remove(name);
+    }
+    let mut response = NtexResponse(response);
+    response.extend_response_parts(parts);
+    response.take()
 }
 
 /// Resets the status of a response whose `Location` was just stripped — either
@@ -246,20 +297,7 @@ where
                 for m in middleware.iter() {
                     service = m.layer(service);
                 }
-                let resp = dispatch_server_fn(
-                    service,
-                    req.clone(),
-                    payload.into_inner(),
-                    additional_context,
-                )
-                .await;
-                // Promote streaming/chunked overflow (detected by
-                // `collect_payload` or the `try_into_stream` adapter
-                // through the request-scoped marker) into a real 413.
-                if req.extensions().get::<PayloadTooLarge>().is_some() {
-                    return oversize_response(limit);
-                }
-                resp
+                dispatch_server_fn(service, req, payload.into_inner(), additional_context).await
             }
         })
 }
@@ -317,6 +355,12 @@ where
 /// Variant of [`handle_server_fns`] that injects additional values into the
 /// reactive context before dispatching the server function.
 ///
+/// Headers supplied through [`ResponseOptions`] also survive a rejected
+/// WebSocket handshake or a payload overflow detected after context setup.
+/// Those adapter-generated errors retain their status, representation metadata
+/// and handshake version advertisement. Rejections before dispatch (including
+/// a declared oversized `Content-Length`) do not run `additional_context`.
+///
 /// If your server functions expect some piece of context, make sure to
 /// provide it both here and in
 /// [`LeptosRoutes::leptos_routes_with_context`](crate::LeptosRoutes::leptos_routes_with_context)
@@ -352,17 +396,7 @@ where
                 return oversize_response(limit);
             }
             if let Some(service) = get_server_fn_service(req.path(), req.method()) {
-                let resp = dispatch_server_fn(
-                    service,
-                    req.clone(),
-                    payload.into_inner(),
-                    additional_context,
-                )
-                .await;
-                if req.extensions().get::<PayloadTooLarge>().is_some() {
-                    return oversize_response(limit);
-                }
-                resp
+                dispatch_server_fn(service, req, payload.into_inner(), additional_context).await
             } else {
                 let allowed = server_fn_methods(req.path());
                 if allowed.is_empty() {

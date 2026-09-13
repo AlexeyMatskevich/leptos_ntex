@@ -1,22 +1,16 @@
 //! The [`NtexRequest`] newtype and its `server_fn::request::Req` impl —
 //! covering body collection, streaming, and the WebSocket upgrade bridge.
 
-use bytes::{Bytes as SfBytes, BytesMut as SfBytesMut};
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, channel::mpsc};
+use bytes::Bytes as SfBytes;
+use futures::{Sink, Stream};
 use ntex::http::Payload;
-use ntex::util::Bytes as NBytes;
-use ntex::web::{self, HttpRequest};
-use or_poisoned::OrPoisoned;
+use ntex::web::HttpRequest;
 use send_wrapper::SendWrapper;
 use server_fn::{
     error::{FromServerFnError, IntoAppError},
     request::Req,
 };
-use std::{
-    borrow::Cow,
-    future::Future,
-    sync::{Arc, Mutex},
-};
+use std::{borrow::Cow, future::Future};
 
 use crate::config::{PayloadTooLarge, collect_payload, server_fn_config};
 use crate::server_fn::response::NtexServerResponse;
@@ -37,13 +31,8 @@ use crate::server_fn::response::NtexServerResponse;
 /// thread (e.g. `spawn_blocking`) and touched there — the same cross-thread
 /// invariant documented on [`Request`](crate::request::Request).
 ///
-/// The inner field is crate-private, mirroring `server_fn`'s `ActixRequest`:
-/// build one with [`NtexRequest::from`] and consume it with
-/// [`NtexRequest::take`]. Narrowing the field only removes direct `.0`
-/// access; the cross-thread panic above still applies to the value itself, as
-/// [`take`](NtexRequest::take) and dropping it off the origin thread both trip
-/// the [`SendWrapper`] thread check.
-pub struct NtexRequest(pub(crate) SendWrapper<(HttpRequest, Payload)>);
+/// Construct with [`NtexRequest::from`] and consume with [`NtexRequest::take`].
+pub struct NtexRequest(pub SendWrapper<(HttpRequest, Payload)>);
 
 impl NtexRequest {
     /// Consumes the wrapper and returns the original ntex request/payload.
@@ -126,8 +115,10 @@ where
         // poll, so a single error frame (limit exceeded or payload error)
         // is emitted and then the stream closes. On overflow we also
         // stash the `PayloadTooLarge` marker on `req.extensions_mut()`
-        // so the outer ntex handler can translate the stream's error
-        // frame into a 413 response body.
+        // so the outer ntex handler can return 413 if it observes the marker
+        // before returning the response. If a lazy response body consumes the
+        // input later, this remains a stream error; there is no second marker
+        // check, even if the original response has not reached the wire yet.
         let stream =
             futures::stream::unfold(Some((req, payload, 0usize, limit)), |state| async move {
                 let (req, mut payload, so_far, limit) = state?;
@@ -168,46 +159,21 @@ where
         Ok(SendWrapper::new(stream))
     }
 
-    /// Upgrades the request to a WebSocket connection and returns
-    /// `(incoming_stream, outgoing_sink, response)` for the server-fn
-    /// runtime.
+    /// Upgrades the request and returns the incoming stream, outgoing sink and response.
     ///
-    /// The incoming and outgoing mpsc channel capacities default to
-    /// [`DEFAULT_WS_CHANNEL_BUFFER`](crate::DEFAULT_WS_CHANNEL_BUFFER)
-    /// (2048 messages). Override per-app by registering a
-    /// [`LeptosServerFnConfig`](crate::LeptosServerFnConfig) with
-    /// [`App::state`](ntex::web::App::state).
+    /// One worker-local task owns the connection. Its single inbound sender and
+    /// outbound receiver apply backpressure before reading another message or
+    /// encoding more output. Each futures mpsc channel has the configured buffer
+    /// plus one sender reservation. ntex IO adds its configured watermarks and at
+    /// most one encoded outgoing message; applications control outgoing sizes.
     ///
-    /// ## Backpressure
+    /// Text and fragmented messages are validated and bounded by
+    /// [`LeptosServerFnConfig::payload_limit`](crate::LeptosServerFnConfig::payload_limit).
+    /// Invalid protocol, UTF-8 and size failures close with 1002, 1007 and 1009.
+    /// Delivery of the terminal input error is best effort if the receiver is full.
     ///
-    /// Both channels are bounded (`futures::channel::mpsc`). Producers
-    /// (this bridge writing incoming WS frames into the server-fn
-    /// receiver; the server-fn writing outgoing frames into the ntex
-    /// sink) call `Sink::send().await`, which suspends the task until
-    /// the channel has capacity again. A slow consumer therefore stalls
-    /// the frame-reader task, which is exactly the backpressure behavior
-    /// expected. Smaller buffers apply backpressure sooner; larger
-    /// buffers absorb bursts at the cost of memory
-    /// (`O(N_connections * buffer * msg_size)` worst case).
-    ///
-    /// ## Fragmented messages (RFC 6455 §5.4)
-    ///
-    /// Fragmented WebSocket messages — delivered by ntex as
-    /// `Frame::Continuation(Item::{FirstText, FirstBinary, Continue,
-    /// Last})` — are reassembled per-connection into a single payload
-    /// before being handed to the server-fn. Browser ws-clients and
-    /// many library clients fragment large messages automatically, so
-    /// dropping continuation frames (as an earlier revision did) would
-    /// silently lose data.
-    ///
-    /// ## Policy-violation close
-    ///
-    /// When a reassembled fragmented message exceeds
-    /// `LeptosServerFnConfig::payload_limit`, this bridge closes the
-    /// connection with [`CloseCode::Size`](ntex::ws::CloseCode::Size)
-    /// (1009, "Message Too Big" per RFC 6455 §7.4.1) and delivers an
-    /// `InputStreamError` to the server-fn receiver. The client gets
-    /// a structured reason rather than an abrupt disconnect.
+    /// Authentication and Origin checks must run in middleware before this call:
+    /// successful upgrade commits 101 before the server-function body executes.
     fn try_into_websocket(
         self,
     ) -> impl Future<
@@ -220,445 +186,18 @@ where
             Error,
         >,
     > + Send {
-        use ntex::ws::{CloseCode, CloseReason};
-        use std::{cell::RefCell, rc::Rc};
-
-        #[derive(Copy, Clone)]
-        enum FragmentKind {
-            Text,
-            Binary,
-        }
-
         SendWrapper::new(async move {
             let (request, _payload) = self.0.take();
-
-            let config = server_fn_config(&request);
-            let payload_limit = config.payload_limit;
-            let ws_subprotocol = config.ws_subprotocol.filter(|protocol| {
-                web::ws::subprotocols(&request).any(|offered| offered == *protocol)
-            });
-            let (response_stream_tx, response_stream_rx) =
-                mpsc::channel::<Result<SfBytes, SfBytes>>(config.ws_channel_buffer);
-            let (response_sink_tx, response_sink_rx) =
-                mpsc::channel::<SfBytes>(config.ws_channel_buffer);
-            let response_sink_rx = Arc::new(Mutex::new(Some(response_sink_rx)));
-
-            let response = web::ws::start::<_, _, &str, web::Error>(
-                request,
-                ws_subprotocol,
-                ntex::service::fn_factory_with_config(move |sink: web::ws::WsSink| {
-                    let response_stream_tx = response_stream_tx.clone();
-                    let response_sink_rx = response_sink_rx.clone();
-
-                    async move {
-                        let mut response_sink_rx = response_sink_rx
-                            .lock()
-                            .or_poisoned()
-                            .take()
-                            .expect("websocket response sink should only be initialized once");
-
-                        let outbound_sink = sink.clone();
-                        let mut outbound_errors = response_stream_tx.clone();
-                        ntex::rt::spawn(async move {
-                            // The bridge parks on the OUTPUT receiver while
-                            // holding a clone of the INPUT sender, so it must
-                            // also watch the connection itself: when the peer
-                            // disconnects, ntex drops only the frame-service's
-                            // sender clone, and without this signal the bridge
-                            // and the server-fn forwarder would keep waiting
-                            // on each other forever — leaking both channels,
-                            // the task, and the WsSink of every closed
-                            // connection.
-                            let mut disconnect = outbound_sink.on_disconnect().fuse();
-                            loop {
-                                let incoming = futures::select! {
-                                    item = response_sink_rx.next() => match item {
-                                        Some(incoming) => incoming,
-                                        // Server fn finished its output:
-                                        // close the websocket politely.
-                                        None => break,
-                                    },
-                                    // Peer gone: release the INPUT sender so
-                                    // the server fn sees EOF and unwinds.
-                                    _ = disconnect => return,
-                                };
-                                if let Err(err) = outbound_sink
-                                    .send(web::ws::Message::Binary(NBytes::copy_from_slice(&incoming)))
-                                    .await
-                                {
-                                    // Best-effort notify the server-fn
-                                    // receiver, then tear down. NOT an
-                                    // awaiting `send`: this is the teardown
-                                    // path, and backpressure here can
-                                    // deadlock — if the inbound channel is
-                                    // full because the server fn never drains
-                                    // its input, `send().await` would block
-                                    // forever and the bridge would never drop
-                                    // its sender clone (the very leak the
-                                    // disconnect watch above prevents).
-                                    let _ = outbound_errors.try_send(Err(
-                                        InputStreamError::from_server_fn_error(
-                                            server_fn::error::ServerFnErrorErr::Request(
-                                                err.to_string(),
-                                            ),
-                                        )
-                                        .ser(),
-                                    ));
-                                    let _ = outbound_sink
-                                        .send(close_send_failure(&err.to_string()))
-                                        .await;
-                                    return;
-                                }
-                            }
-                            let _ = outbound_sink.send(web::ws::Message::Close(None)).await;
-                        });
-
-                        // Per-connection reassembly buffer for
-                        // `Frame::Continuation`. `Rc<RefCell<_>>`
-                        // because `fn_factory_with_config` returns a
-                        // `!Send` future — one per connection.
-                        let fragment: Rc<RefCell<Option<(FragmentKind, SfBytesMut)>>> =
-                            Rc::new(RefCell::new(None));
-
-                        Ok::<_, web::Error>(ntex::service::fn_service({
-                            let response_stream_tx = response_stream_tx.clone();
-                            let fragment = fragment.clone();
-                            move |frame: web::ws::Frame| {
-                                let mut tx = response_stream_tx.clone();
-                                let fragment = fragment.clone();
-                                async move {
-                                    use web::ws::{Frame, Message};
-                                    use ntex::ws::Item;
-                                    match frame {
-                                        Frame::Ping(bytes) => {
-                                            Ok::<Option<Message>, web::Error>(Some(
-                                                Message::Pong(bytes),
-                                            ))
-                                        }
-                                        Frame::Pong(_) => Ok(None),
-                                        Frame::Close(reason) => {
-                                            fragment.borrow_mut().take();
-                                            Ok(Some(Message::Close(reason)))
-                                        }
-                                        Frame::Binary(bytes) => {
-                                            // Unfragmented binary; bypass
-                                            // the reassembly buffer and
-                                            // enforce the limit directly.
-                                            if bytes.len() > payload_limit {
-                                                let _ = tx
-                                                    .send(Err(InputStreamError::from_server_fn_error(
-                                                        server_fn::error::ServerFnErrorErr::Args(format!(
-                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
-                                                            bytes.len()
-                                                        )),
-                                                    )
-                                                    .ser()))
-                                                    .await;
-                                                return Ok(Some(close_too_big(payload_limit)));
-                                            }
-                                            // `send().await` applies
-                                            // backpressure when the
-                                            // consumer is slow. If the
-                                            // receiver is gone, the WS
-                                            // is about to close anyway.
-                                            let _ = tx
-                                                .send(Ok(SfBytes::from_owner(bytes)))
-                                                .await;
-                                            Ok(None)
-                                        }
-                                        Frame::Text(text) => {
-                                            if text.len() > payload_limit {
-                                                let _ = tx
-                                                    .send(Err(InputStreamError::from_server_fn_error(
-                                                        server_fn::error::ServerFnErrorErr::Args(format!(
-                                                            "websocket payload exceeded limit of {payload_limit} bytes (observed {})",
-                                                            text.len()
-                                                        )),
-                                                    )
-                                                    .ser()))
-                                                    .await;
-                                                return Ok(Some(close_too_big(payload_limit)));
-                                            }
-                                            // RFC 6455 §8.1: a text message MUST
-                                            // be valid UTF-8. ntex's `Frame::Text`
-                                            // hands over raw bytes without
-                                            // checking, so validate here and fail
-                                            // the connection (1007) rather than
-                                            // forward invalid bytes to the
-                                            // server fn.
-                                            if std::str::from_utf8(&text).is_err() {
-                                                let _ = tx
-                                                    .send(Err(InputStreamError::from_server_fn_error(
-                                                        server_fn::error::ServerFnErrorErr::Args(
-                                                            "websocket text frame is not valid UTF-8 (RFC 6455 §8.1)".to_string(),
-                                                        ),
-                                                    )
-                                                    .ser()))
-                                                    .await;
-                                                return Ok(Some(close_invalid_utf8()));
-                                            }
-                                            let _ = tx
-                                                .send(Ok(SfBytes::from_owner(text)))
-                                                .await;
-                                            Ok(None)
-                                        }
-                                        Frame::Continuation(item) => {
-                                            // What to do with a First*
-                                            // fragment after state + size
-                                            // checks. Computed inside one
-                                            // borrow window so no `RefMut`
-                                            // is held across `.await`.
-                                            enum FirstAction {
-                                                Installed,
-                                                ProtocolViolation,
-                                                Overflow(usize),
-                                            }
-                                            // For Continue: whether to
-                                            // extend the buffer, reject as
-                                            // protocol error, or reject
-                                            // on overflow.
-                                            enum ContinueAction {
-                                                Extended,
-                                                NoOpener,
-                                                Overflow(usize),
-                                            }
-                                            // For Last: take the buffer
-                                            // (if any) along with its message
-                                            // kind (so a Text message can be
-                                            // UTF-8 validated), or reject.
-                                            enum LastAction {
-                                                Complete(FragmentKind, SfBytesMut),
-                                                NoOpener,
-                                                Overflow(usize),
-                                            }
-                                            // Inline overflow-emit block:
-                                            // builds the `InputStreamError`
-                                            // (generic captured by the
-                                            // enclosing impl), sends it
-                                            // through the receiver with
-                                            // backpressure, then returns
-                                            // the policy-close message.
-                                            macro_rules! overflow_close {
-                                                ($total:expr) => {{
-                                                    let total = $total;
-                                                    let _ = tx
-                                                        .send(Err(InputStreamError::from_server_fn_error(
-                                                            server_fn::error::ServerFnErrorErr::Args(format!(
-                                                                "websocket payload exceeded limit of {payload_limit} bytes (observed {total})"
-                                                            )),
-                                                        )
-                                                        .ser()))
-                                                        .await;
-                                                    Ok(Some(close_too_big(payload_limit)))
-                                                }};
-                                            }
-                                            let protocol_close = |msg: &'static str| {
-                                                Ok::<Option<Message>, web::Error>(Some(
-                                                    Message::Close(Some(CloseReason {
-                                                        code: CloseCode::Protocol,
-                                                        description: Some(msg.into()),
-                                                    })),
-                                                ))
-                                            };
-
-                                            match item {
-                                                Item::FirstText(b) => {
-                                                    let action = {
-                                                        let mut guard = fragment.borrow_mut();
-                                                        if guard.is_some() {
-                                                            *guard = None;
-                                                            FirstAction::ProtocolViolation
-                                                        } else if b.len() > payload_limit {
-                                                            FirstAction::Overflow(b.len())
-                                                        } else {
-                                                            let mut buf = SfBytesMut::new();
-                                                            buf.extend_from_slice(&b);
-                                                            *guard = Some((FragmentKind::Text, buf));
-                                                            FirstAction::Installed
-                                                        }
-                                                    };
-                                                    match action {
-                                                        FirstAction::Installed => Ok(None),
-                                                        FirstAction::ProtocolViolation => protocol_close(
-                                                            "new fragmented message started before previous one terminated",
-                                                        ),
-                                                        FirstAction::Overflow(t) => overflow_close!(t),
-                                                    }
-                                                }
-                                                Item::FirstBinary(b) => {
-                                                    let action = {
-                                                        let mut guard = fragment.borrow_mut();
-                                                        if guard.is_some() {
-                                                            *guard = None;
-                                                            FirstAction::ProtocolViolation
-                                                        } else if b.len() > payload_limit {
-                                                            FirstAction::Overflow(b.len())
-                                                        } else {
-                                                            let mut buf = SfBytesMut::new();
-                                                            buf.extend_from_slice(&b);
-                                                            *guard = Some((FragmentKind::Binary, buf));
-                                                            FirstAction::Installed
-                                                        }
-                                                    };
-                                                    match action {
-                                                        FirstAction::Installed => Ok(None),
-                                                        FirstAction::ProtocolViolation => protocol_close(
-                                                            "new fragmented message started before previous one terminated",
-                                                        ),
-                                                        FirstAction::Overflow(t) => overflow_close!(t),
-                                                    }
-                                                }
-                                                Item::Continue(b) => {
-                                                    let action = {
-                                                        let mut guard = fragment.borrow_mut();
-                                                        match guard.as_mut() {
-                                                            None => ContinueAction::NoOpener,
-                                                            Some((_, buf)) => {
-                                                                if buf
-                                                                    .len()
-                                                                    .saturating_add(b.len())
-                                                                    > payload_limit
-                                                                {
-                                                                    let total =
-                                                                        buf.len() + b.len();
-                                                                    *guard = None;
-                                                                    ContinueAction::Overflow(total)
-                                                                } else {
-                                                                    buf.extend_from_slice(&b);
-                                                                    ContinueAction::Extended
-                                                                }
-                                                            }
-                                                        }
-                                                    };
-                                                    match action {
-                                                        ContinueAction::Extended => Ok(None),
-                                                        ContinueAction::NoOpener => protocol_close(
-                                                            "unexpected continuation frame",
-                                                        ),
-                                                        ContinueAction::Overflow(t) => overflow_close!(t),
-                                                    }
-                                                }
-                                                Item::Last(b) => {
-                                                    let action = {
-                                                        let taken = fragment.borrow_mut().take();
-                                                        match taken {
-                                                            None => LastAction::NoOpener,
-                                                            Some((kind, mut buf)) => {
-                                                                if buf
-                                                                    .len()
-                                                                    .saturating_add(b.len())
-                                                                    > payload_limit
-                                                                {
-                                                                    LastAction::Overflow(
-                                                                        buf.len() + b.len(),
-                                                                    )
-                                                                } else {
-                                                                    buf.extend_from_slice(&b);
-                                                                    LastAction::Complete(kind, buf)
-                                                                }
-                                                            }
-                                                        }
-                                                    };
-                                                    match action {
-                                                        LastAction::Complete(kind, buf) => {
-                                                            // RFC 6455 §8.1: a
-                                                            // reassembled TEXT
-                                                            // message must be
-                                                            // valid UTF-8. The
-                                                            // kind was recorded
-                                                            // on the opening
-                                                            // fragment; validate
-                                                            // the whole buffer
-                                                            // before forwarding.
-                                                            if matches!(kind, FragmentKind::Text)
-                                                                && std::str::from_utf8(&buf).is_err()
-                                                            {
-                                                                let _ = tx
-                                                                    .send(Err(InputStreamError::from_server_fn_error(
-                                                                        server_fn::error::ServerFnErrorErr::Args(
-                                                                            "reassembled websocket text message is not valid UTF-8 (RFC 6455 §8.1)".to_string(),
-                                                                        ),
-                                                                    )
-                                                                    .ser()))
-                                                                    .await;
-                                                                return Ok(Some(close_invalid_utf8()));
-                                                            }
-                                                            let _ = tx.send(Ok(buf.freeze())).await;
-                                                            Ok(None)
-                                                        }
-                                                        LastAction::NoOpener => protocol_close(
-                                                            "unexpected terminal continuation frame",
-                                                        ),
-                                                        LastAction::Overflow(t) => overflow_close!(t),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }))
-                    }
-                }),
-            )
-            .await
-            .map_err(|e| {
-                Error::from_server_fn_error(server_fn::error::ServerFnErrorErr::Request(
-                    e.to_string(),
-                ))
-            })?;
-
-            Ok((
-                response_stream_rx,
-                response_sink_tx,
-                NtexServerResponse::from(response),
-            ))
+            super::websocket::upgrade::<Error, InputStreamError>(request).await
         })
     }
-}
-
-/// Builds a policy-violation `Close` message carrying `CloseCode::Size`
-/// (1009, "Message Too Big" per RFC 6455 §7.4.1) with a human-readable
-/// description. The corresponding `InputStreamError` is emitted at the
-/// call site because its generic type is only in scope inside
-/// `impl Req for NtexRequest`.
-fn close_too_big(limit: usize) -> web::ws::Message {
-    web::ws::Message::Close(Some(ntex::ws::CloseReason {
-        code: ntex::ws::CloseCode::Size,
-        description: Some(format!("message exceeds limit of {limit} bytes")),
-    }))
-}
-
-/// Builds the policy-violation `Close` for a text frame whose payload is not
-/// valid UTF-8, carrying [`CloseCode::Invalid`](ntex::ws::CloseCode::Invalid)
-/// (1007, "Invalid frame payload data" per RFC 6455 §7.4.1; §8.1 requires text
-/// messages to be valid UTF-8). ntex's `Frame::Text` exposes raw `Bytes`
-/// WITHOUT validating UTF-8, so the bridge must validate before forwarding.
-/// The matching `InputStreamError` is emitted at the call site because its
-/// generic type is only in scope inside `impl Req for NtexRequest`.
-fn close_invalid_utf8() -> web::ws::Message {
-    web::ws::Message::Close(Some(ntex::ws::CloseReason {
-        code: ntex::ws::CloseCode::Invalid,
-        description: Some("text frame payload is not valid UTF-8".to_string()),
-    }))
-}
-
-/// Builds the `Close` sent when an OUTBOUND server-fn message fails to reach
-/// the peer, carrying [`CloseCode::Error`](ntex::ws::CloseCode::Error) (1011,
-/// "Internal Error"). RFC 6455 §7.4.1 RESERVES 1006 ("Abnormal Closure") for
-/// local reporting only — an endpoint must never place it in a Close control
-/// frame, and ntex serializes whatever code it is given onto the wire verbatim.
-fn close_send_failure(reason: &str) -> web::ws::Message {
-    web::ws::Message::Close(Some(ntex::ws::CloseReason {
-        code: ntex::ws::CloseCode::Error,
-        description: Some(reason.to_string()),
-    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lets_expect::lets_expect;
+    use ntex::util::Bytes as NBytes;
     use ntex::web::test;
     use server_fn::error::ServerFnError;
 
@@ -847,261 +386,110 @@ mod tests {
         }
     }
 
-    // ----- WebSocket policy-close codes ---------------------------------
-    // The bridge builds policy `Close` frames whose CODE is the contract
-    // (RFC 6455 §7.4.1). These lock all THREE codes: an oversize message
-    // closes with 1009 (Size) — the most-fired policy close, reached from
-    // every Binary/Text/Continuation overflow branch — invalid-UTF-8 text
-    // closes with 1007, and an outbound send failure closes with 1011 — NOT
-    // the reserved 1006, which an endpoint must never serialize onto the
-    // wire. (`close_send_failure`'s path is otherwise unreachable in a wire
-    // test, so this is its primary regression.)
-    fn close_code(msg: &web::ws::Message) -> Option<ntex::ws::CloseCode> {
-        match msg {
-            web::ws::Message::Close(Some(reason)) => Some(reason.code),
-            _ => None,
+    #[derive(Debug, PartialEq, Eq)]
+    enum BodyError {
+        Args(String),
+        Other(String),
+    }
+
+    fn body_error(error: E) -> BodyError {
+        match error {
+            ServerFnError::Args(message) => BodyError::Args(message),
+            other => BodyError::Other(format!("{other:?}")),
         }
+    }
+
+    fn string_body(bytes: &'static [u8]) -> Result<String, BodyError> {
+        crate::tests::run_ntex(async move {
+            let http_req = test::TestRequest::default().to_http_request();
+            let chunks = futures::stream::iter([Ok::<_, ntex::http::error::PayloadError>(
+                NBytes::from_static(bytes),
+            )]);
+            let req = NtexRequest::from((http_req, Payload::from_stream(chunks)));
+            let result = <NtexRequest as Req<E, E, E>>::try_into_string(req).await;
+            result.map_err(body_error)
+        })
+    }
+
+    #[derive(Debug)]
+    struct StreamObservation {
+        items: Vec<Result<Vec<u8>, BodyError>>,
+        overflow_marked: bool,
+    }
+
+    // A real trailing chunk distinguishes a terminal error from a stream that
+    // merely happens to end immediately after its error-producing input.
+    fn stream_body(second: Result<NBytes, ntex::http::error::PayloadError>) -> StreamObservation {
+        use futures::StreamExt;
+        crate::tests::run_ntex(async move {
+            let http_req = test::TestRequest::default()
+                .state(crate::LeptosServerFnConfig::new().with_payload_limit(16))
+                .to_http_request();
+            let chunks = futures::stream::iter([
+                Ok(NBytes::from_static(b"AAAAAA")),
+                second,
+                Ok(NBytes::from_static(b"CCC")),
+            ]);
+            let req = NtexRequest::from((http_req.clone(), Payload::from_stream(chunks)));
+            let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
+                .expect("request stream construction must succeed");
+            let items: Vec<Result<Vec<u8>, BodyError>> = stream
+                .map(|item| {
+                    item.map(|bytes| bytes.to_vec())
+                        .map_err(|bytes| body_error(E::de(bytes)))
+                })
+                .collect()
+                .await;
+            let overflow_marked = http_req.extensions().get::<PayloadTooLarge>().is_some();
+            StreamObservation {
+                items,
+                overflow_marked,
+            }
+        })
     }
 
     lets_expect! {
-        expect(close_code(&close_too_big(8))) as the_too_big_close {
-            to carries_close_code_1009_size {
-                equal(Some(ntex::ws::CloseCode::Size))
-            }
-        }
-    }
-
-    lets_expect! {
-        expect(close_code(&close_invalid_utf8())) as the_invalid_utf8_close {
-            to carries_close_code_1007_invalid {
-                equal(Some(ntex::ws::CloseCode::Invalid))
-            }
-        }
-    }
-
-    lets_expect! {
-        expect(close_code(&close_send_failure("send failed"))) as the_send_failure_close {
-            to carries_1011_internal_error_not_reserved_1006 {
-                equal(Some(ntex::ws::CloseCode::Error))
-            }
-        }
-    }
-
-    // `close_send_failure`'s `reason` parameter is interpolated directly into
-    // the close description — pin that pass-through so a regression that
-    // hardcodes a static description (ignoring `reason`) is caught.
-    fn close_description(msg: &web::ws::Message) -> Option<String> {
-        match msg {
-            web::ws::Message::Close(Some(reason)) => {
-                reason.description.as_ref().map(|d| d.to_string())
-            }
-            _ => None,
-        }
-    }
-
-    lets_expect! {
-        expect(close_description(&close_send_failure(reason))) as the_send_failure_close_description {
-            let reason = "send failed";
-
-            to carries_the_given_reason_as_the_description {
-                equal(Some("send failed".to_string()))
-            }
-
-            when a_different_reason_is_given {
-                let reason = "connection reset by peer";
-                to carries_that_reason_as_the_description {
-                    equal(Some("connection reset by peer".to_string()))
+        expect(string_body(bytes)) as request_body_as_string {
+            let bytes: &'static [u8] = "Привет".as_bytes();
+            to preserves_the_utf8_text { equal(Ok("Привет".to_string())) }
+            when the_bytes_are_invalid_utf8 {
+                let bytes: &'static [u8] = b"ok\xff";
+                to reports_the_structured_utf8_error {
+                    equal(Err(BodyError::Args("invalid utf-8 sequence of 1 bytes from index 2".to_string())))
                 }
             }
         }
     }
 
-    // ----- try_into_string: invalid-UTF-8 body ---------------------------
-    // `try_into_string` has two fallible steps: `collect_payload`'s Err
-    // (payload-overflow) and `String::from_utf8`'s Err (malformed bytes).
-    // Only the overflow path was ever exercised; a body that collects fine
-    // but is not valid UTF-8 must surface as a structured `Args` error, not
-    // panic and not silently lose/replace the bad bytes.
-    #[ntex::test]
-    async fn try_into_string_reports_invalid_utf8_as_a_structured_args_error() {
-        let http_req = test::TestRequest::default().to_http_request();
-        // 0xFF is never a valid UTF-8 byte anywhere in a sequence.
-        let chunks = futures::stream::iter(vec![Ok::<_, ntex::http::error::PayloadError>(
-            ntex::util::Bytes::from_static(&[b'o', b'k', 0xff]),
-        )]);
-        let req = NtexRequest::from((http_req, Payload::from_stream(chunks)));
-
-        let result = <NtexRequest as Req<E, E, E>>::try_into_string(req).await;
-
-        match result {
-            Err(ServerFnError::Args(message)) => {
-                // Exact message from `FromUtf8Error`'s `Display` impl for this
-                // byte sequence (`ok\xff`, the single invalid byte at index 2).
-                assert_eq!(message, "invalid utf-8 sequence of 1 bytes from index 2");
+    lets_expect! {
+        expect(stream_body(Ok(NBytes::from_static(second)))) as cumulative_request_payload {
+            let second: &'static [u8] = b"BBBBBB";
+            to forwards_every_chunk_without_marking_overflow {
+                have(items) equal(vec![Ok(b"AAAAAA".to_vec()), Ok(b"BBBBBB".to_vec()), Ok(b"CCC".to_vec())]),
+                have(overflow_marked) equal(false),
             }
-            other => {
-                panic!("expected Err(ServerFnError::Args(_)) for invalid-UTF-8 body, got {other:?}")
+            when the_cumulative_size_equals_the_limit {
+                let second: &'static [u8] = b"BBBBBBB";
+                to forwards_every_chunk_at_the_limit {
+                    have(items) equal(vec![Ok(b"AAAAAA".to_vec()), Ok(b"BBBBBBB".to_vec()), Ok(b"CCC".to_vec())]),
+                    have(overflow_marked) equal(false),
+                }
+            }
+            when the_second_chunk_crosses_the_limit {
+                let second: &'static [u8] = b"BBBBBBBBBBB";
+                to reports_overflow_and_stops_before_the_trailing_chunk {
+                    have(items) equal(vec![Ok(b"AAAAAA".to_vec()), Err(BodyError::Args("payload exceeds limit of 16 bytes".to_string()))]),
+                    have(overflow_marked) equal(true),
+                }
             }
         }
     }
 
-    // ----- try_into_stream cumulative overflow ACROSS chunks ------------
-    // The per-chunk guard carries the running total between chunks
-    // (`next = so_far + b.len()`). A single HTTP test payload is delivered as
-    // ONE chunk (`TestRequest::set_payload`), so the HTTP-level streaming tests
-    // only ever trip on the FIRST chunk and cannot pin the cross-chunk
-    // accumulation — a regression resetting the carried total to 0 would
-    // survive. Drive it directly with a hand-built multi-chunk `Payload`
-    // (the analog of the websocket Continue/Last accumulation tests): two
-    // 10-byte chunks, each under the limit of 16, whose cumulative 20 exceeds
-    // it on the SECOND chunk.
-    #[ntex::test]
-    async fn try_into_stream_overflows_on_the_cumulative_total_across_chunks() {
-        use futures::StreamExt;
-        use ntex::http::Payload;
-        use ntex::util::Bytes as NBytes;
-
-        let http_req = test::TestRequest::default()
-            .state(crate::LeptosServerFnConfig {
-                payload_limit: 16,
-                ..Default::default()
-            })
-            .to_http_request();
-
-        let chunks = futures::stream::iter(vec![
-            Ok::<_, ntex::http::error::PayloadError>(NBytes::from(vec![b'A'; 10])),
-            Ok(NBytes::from(vec![b'B'; 10])),
-        ]);
-        let req = NtexRequest::from((http_req.clone(), Payload::from_stream(chunks)));
-
-        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
-            .expect("try_into_stream must build the stream");
-        let items: Vec<_> = stream.collect().await;
-
-        // Exactly two items: the passthrough Ok chunk, then the error frame —
-        // and the stream terminates there (a regression that kept polling
-        // after the error would produce a THIRD item).
-        assert_eq!(
-            items.len(),
-            2,
-            "expected exactly [Ok(first chunk), Err(overflow)], got {items:?}"
-        );
-        // The first item's CONTENT is the actual first chunk, not just "some
-        // Ok" — a regression returning `Ok(SfBytes::new())` would still pass
-        // a bare `is_ok()` check.
-        assert_eq!(
-            items[0].as_ref().ok(),
-            Some(&SfBytes::from(vec![b'A'; 10])),
-            "the first under-limit chunk must stream through with its actual bytes, got {items:?}"
-        );
-        assert!(
-            items[1].is_err(),
-            "the cumulative total crossing the limit on the SECOND chunk must yield an error frame"
-        );
-        // ...and the request-scoped marker is set so the dispatcher promotes it
-        // to 413 (extensions are shared across `HttpRequest` clones).
-        assert!(
-            http_req
-                .extensions()
-                .get::<crate::config::PayloadTooLarge>()
-                .is_some(),
-            "the PayloadTooLarge marker must be set on cumulative overflow"
-        );
-    }
-
-    // Positive sibling of the overflow test above: 2+ chunks whose cumulative
-    // total stays strictly UNDER the limit must ALL stream through as Ok —
-    // pinning the running-total arithmetic from the passing side (a subtle
-    // regression there could false-reject a legitimate multi-chunk stream,
-    // undetected if only the overflow direction were tested).
-    #[ntex::test]
-    async fn try_into_stream_streams_multiple_under_limit_chunks_through_as_ok() {
-        use futures::StreamExt;
-        use ntex::http::Payload;
-        use ntex::util::Bytes as NBytes;
-
-        let http_req = test::TestRequest::default()
-            .state(crate::LeptosServerFnConfig {
-                payload_limit: 16,
-                ..Default::default()
-            })
-            .to_http_request();
-
-        // Two 6-byte chunks: cumulative 12 stays strictly under the 16 limit.
-        let chunks = futures::stream::iter(vec![
-            Ok::<_, ntex::http::error::PayloadError>(NBytes::from(vec![b'A'; 6])),
-            Ok(NBytes::from(vec![b'B'; 6])),
-        ]);
-        let req = NtexRequest::from((http_req.clone(), Payload::from_stream(chunks)));
-
-        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
-            .expect("try_into_stream must build the stream");
-        let items: Vec<_> = stream.collect().await;
-
-        assert_eq!(
-            items.len(),
-            2,
-            "both under-limit chunks must stream through, got {items:?}"
-        );
-        assert_eq!(items[0].as_ref().ok(), Some(&SfBytes::from(vec![b'A'; 6])));
-        assert_eq!(items[1].as_ref().ok(), Some(&SfBytes::from(vec![b'B'; 6])));
-        assert!(
-            http_req
-                .extensions()
-                .get::<crate::config::PayloadTooLarge>()
-                .is_none(),
-            "an under-limit multi-chunk stream must not set the PayloadTooLarge marker"
-        );
-    }
-
-    // ----- try_into_stream: underlying payload error (not overflow) ------
-    // `try_into_stream`'s `stream::unfold` has TWO distinct error-producing
-    // branches: cumulative overflow (above) and the underlying `Payload`
-    // itself yielding an `Err` chunk (e.g. a connection reset mid-body).
-    // Only the overflow branch had a direct test; this drives the `Err(e)`
-    // match arm with a `Payload::from_stream` that yields an error chunk.
-    #[ntex::test]
-    async fn try_into_stream_surfaces_the_underlying_payload_error() {
-        use futures::StreamExt;
-        use ntex::http::Payload;
-        use ntex::http::error::PayloadError;
-        use server_fn::error::FromServerFnError;
-
-        let http_req = test::TestRequest::default().to_http_request();
-
-        let chunks = futures::stream::iter(vec![Err::<ntex::util::Bytes, _>(
-            PayloadError::Incomplete(None),
-        )]);
-        let req = NtexRequest::from((http_req, Payload::from_stream(chunks)));
-
-        let stream = <NtexRequest as Req<E, E, E>>::try_into_stream(req)
-            .expect("try_into_stream must build the stream");
-        let items: Vec<_> = stream.collect().await;
-
-        assert_eq!(
-            items.len(),
-            1,
-            "a single underlying payload error must yield exactly one error frame, got {items:?}"
-        );
-        let bytes = items[0]
-            .as_ref()
-            .err()
-            .cloned()
-            .expect("the underlying payload error must surface as an Err frame");
-        // Decode the serialized error frame back into the concrete error type
-        // and assert its EXACT content, not just that it is an `Err` — the
-        // production code wraps `PayloadError::Incomplete(None).to_string()`
-        // in a `ServerFnErrorErr::Args`, so the decoded message must match
-        // that `Display` output verbatim.
-        match E::de(bytes) {
-            ServerFnError::Args(message) => {
-                assert_eq!(
-                    message, "A payload reached EOF, but is not complete. With error: None",
-                    "the Args error must carry the underlying PayloadError's exact message"
-                );
-            }
-            other => {
-                panic!("expected Err(ServerFnError::Args(_)) for the payload error, got {other:?}")
+    lets_expect! {
+        expect(stream_body(Err(ntex::http::error::PayloadError::Incomplete(None)))) as payload_transport_failure {
+            to preserves_the_cause_and_stops_before_the_trailing_chunk {
+                have(items) equal(vec![Ok(b"AAAAAA".to_vec()), Err(BodyError::Args("A payload reached EOF, but is not complete. With error: None".to_string()))]),
+                have(overflow_marked) equal(false),
             }
         }
     }

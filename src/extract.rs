@@ -26,8 +26,8 @@ use crate::request::Request;
 ///
 /// Returns [`ServerFnErrorErr`](server_fn::error::ServerFnErrorErr) (its
 /// `ServerError` variant) if the [`Request`] is missing from
-/// context — the helper was called outside a server function — or if the
-/// extractor itself fails.
+/// context, its request scope has closed, access occurs on another thread,
+/// or the extractor itself fails.
 ///
 /// # Panics
 ///
@@ -67,8 +67,8 @@ where
 ///
 /// Returns [`ServerFnErrorErr`](server_fn::error::ServerFnErrorErr) (its
 /// `ServerError` variant) if the [`Request`] is missing from
-/// context — the helper was called outside a server function — or if the
-/// extractor itself fails.
+/// context, its request scope has closed, access occurs on another thread,
+/// or the extractor itself fails.
 ///
 /// # Panics
 ///
@@ -89,6 +89,12 @@ where
         server_fn::error::ServerFnErrorErr::ServerError(
             "HttpRequest should have been provided via context".to_string(),
         )
+    })?;
+
+    let req = req.try_into_inner().map_err(|error| {
+        server_fn::error::ServerFnErrorErr::ServerError(format!(
+            "Cannot access the request for extraction: {error}"
+        ))
     })?;
 
     SendWrapper::new(async move {

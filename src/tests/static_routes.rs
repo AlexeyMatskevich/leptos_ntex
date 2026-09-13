@@ -11,15 +11,9 @@ use leptos_router::{
 use ntex::http::{StatusCode, header};
 use ntex::web::{App as NtexApp, test};
 
-/// A `SsrMode::Static` route whose render sets ALL EIGHT keys in
-/// `handle_static_route`'s body-framing strip list (`Content-Length`,
-/// `Content-Type`, `Content-Encoding`, `Transfer-Encoding`, `Content-Range`,
-/// `Accept-Ranges`, `ETag`, `Last-Modified`) to deliberately WRONG sentinel
-/// values, plus one non-framing header (`x-custom-marker`) that must survive
-/// the strip untouched. Drives `static_route_strips_every_framing_header_
-/// from_the_cached_snapshot`, which the existing `StaticHeaderApp`-based test
-/// cannot: that fixture only ever sets a stale `Content-Length`, so the other
-/// 7 removals in the strip list were previously unexercised by any assertion.
+/// A static render with incorrect framing/validator overrides, a valid
+/// application-selected UTF-8 HTML MIME, and an unrelated marker. NamedFile
+/// must derive byte framing/validators while preserving the explicit MIME.
 #[component]
 fn StaticFramingHeaderApp() -> impl IntoView {
     provide_meta_context();
@@ -35,7 +29,7 @@ fn StaticFramingHeaderApp() -> impl IntoView {
                             if let Some(res) = use_context::<crate::ResponseOptions>() {
                                 for (name, value) in [
                                     (ntex::http::header::CONTENT_LENGTH, "5"),
-                                    (ntex::http::header::CONTENT_TYPE, "text/x-bogus"),
+                                    (ntex::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
                                     (ntex::http::header::CONTENT_ENCODING, "bogus-encoding"),
                                     (ntex::http::header::TRANSFER_ENCODING, "chunked"),
                                     (ntex::http::header::CONTENT_RANGE, "bytes 0-0/0"),
@@ -64,7 +58,7 @@ fn StaticFramingHeaderApp() -> impl IntoView {
 
 /// A `SsrMode::Static` route registered with a terminal `*splat` segment —
 /// matched by every distinct URL under `/files/` (the "wildcard static
-/// route" scenario documented on `STATIC_HEADERS`), unlike every other fixture
+/// route" scenario), unlike every other fixture
 /// in this file, which registers a literal path. Needed to drive a
 /// traversal/dotfile URL past ntex's own router (which only ever matches a
 /// literal-path route with that exact string) and into `static_path`'s own
@@ -88,961 +82,1017 @@ fn StaticSplatApp() -> impl IntoView {
     }
 }
 
-#[ntex::test]
-async fn static_route_generator_writes_html() {
-    let site_root = temp_site_root("static");
-    let (_routes, generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_test")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let index_path = site_root.join("index.html");
-    let about_path = site_root.join("about.html");
-
-    let index_html = std::fs::read_to_string(&index_path).unwrap();
-    let about_html = std::fs::read_to_string(&about_path).unwrap();
-
-    assert!(index_html.contains("Static Home"));
-    assert!(about_html.contains("Static About"));
-
-    let _ = std::fs::remove_dir_all(&site_root);
+#[derive(Clone, Copy)]
+enum StaticAppKind {
+    Home,
+    Headers,
+    Framing,
+    Status,
+    Redirect,
+    Splat,
 }
 
-/// `StaticRouteGenerator::generate` must skip writing any route whose render
-/// resolves to an ERROR status — EVERY 4xx/5xx, not only 404: leptos's
-/// static-file builder calls `was_error_status` after each render and, when it
-/// returns `true`, sends the HTML back instead of invoking the writer, so the
-/// dynamic handler can re-render the real error on demand. Caching an error
-/// render as a bare `200 OK` on disk would otherwise serve it indefinitely.
-/// A normal route (status left at the default) IS written.
-///
-/// Pins `was_error_status` end-to-end through the public `generate()` path:
-/// `/ok` → file present; `/gone` (404) → absent; `/server-error` (500) →
-/// absent. The 500 case is what makes this broader than `leptos_axum` /
-/// `leptos_actix` (whose `was_404` checks only `== NOT_FOUND`): narrowing
-/// `was_error_status` back to `== NOT_FOUND` would write `server-error.html`,
-/// and replacing its body with `true`/`false` breaks the `ok`/error halves.
-#[ntex::test]
-async fn static_generator_skips_writing_error_routes() {
-    let site_root = temp_site_root("static_404");
-    let (_routes, generator) = gen_route_list_with_ssg(StaticStatusApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_404")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let ok_path = site_root.join("ok.html");
-    let gone_path = site_root.join("gone.html");
-    let server_error_path = site_root.join("server-error.html");
-
-    assert!(
-        ok_path.exists(),
-        "a 200 static route must be pre-rendered to disk"
-    );
-    assert!(
-        !gone_path.exists(),
-        "a 404 static route must be skipped by `was_error_status`, not cached to disk as a bare 200"
-    );
-    assert!(
-        !server_error_path.exists(),
-        "a 500 static route must ALSO be skipped (was_error_status covers every error, not just 404)"
-    );
-
-    let ok_html = std::fs::read_to_string(&ok_path).unwrap();
-    assert!(ok_html.contains("Static OK"));
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// The 404/error-render branch of `handle_static_route` on a COLD cache (the
-/// `.html` was never written to disk, matching `static_generator_skips_
-/// writing_error_routes` above) must serve the route's OWN captured status —
-/// `404` for `/gone`, `500` for `/server-error` — not a hardcoded `404`
-/// literal. `ResolvedStaticPath::build` returns `Some(html)` on an error
-/// render and the handler seeds the response with a literal `HttpResponse::
-/// NotFound()`, but the captured `ResponseParts` snapshot is applied
-/// afterwards via `extend_response_parts`, which overwrites the status
-/// whenever one was captured — so the real status served must track what the
-/// app actually set, not the literal. Deliberately skips `generate()` so the
-/// cold-cache regeneration branch (not a pre-warmed cache hit) is what's
-/// exercised.
-#[ntex::test]
-async fn static_route_error_render_on_cold_cache_reports_its_own_captured_status() {
-    let site_root = temp_site_root("static_404_cold");
-    let (routes, _generator) = gen_route_list_with_ssg(StaticStatusApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_404_cold")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    // Deliberately no `generate()`: both `.html` files are absent, so each
-    // request below takes the on-demand regeneration branch, and `/gone` and
-    // `/server-error` render an error `build` never caches to disk.
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticStatusApp);
-    }))
-    .await;
-
-    let gone_resp =
-        test::call_service(&app, test::TestRequest::with_uri("/gone").to_request()).await;
-    assert_eq!(
-        gone_resp.status(),
-        StatusCode::NOT_FOUND,
-        "a cold-cache request to a route that captured 404 must report 404"
-    );
-
-    let server_error_resp = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/server-error").to_request(),
-    )
-    .await;
-    assert_eq!(
-        server_error_resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a cold-cache request to a route that captured 500 must report 500, not the hardcoded 404 literal"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// HEAD on a statically pre-rendered route must mirror GET's status
-/// and Content-Type. (Wire-level body elision is covered by the
-/// TCP-based integration tests.)
-#[ntex::test]
-async fn head_request_on_static_route_mirrors_get() {
-    let site_root = temp_site_root("head_static");
-    let (routes, generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_head_static")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticApp);
-    }))
-    .await;
-
-    let get_resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(get_resp.status(), StatusCode::OK);
-    let get_headers = get_resp.headers().clone();
-
-    let head_resp = test::call_service(
-        &app,
-        test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(head_resp.status(), StatusCode::OK);
-    assert_eq!(
-        head_resp.headers().get(header::CONTENT_TYPE),
-        get_headers.get(header::CONTENT_TYPE)
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-#[ntex::test]
-async fn static_route_served_over_http() {
-    let site_root = temp_site_root("http_static");
-    let (routes, generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_test_http")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticApp);
-    }))
-    .await;
-
-    let req = test::TestRequest::with_uri("/").to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Static Home"));
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// On-demand regeneration of a `SsrMode::Static` route that was NOT
-/// pre-generated by `StaticRouteGenerator::generate` must serve the freshly
-/// rendered HTML, not a 500. `ResolvedStaticPath::build` writes the page to
-/// disk and returns `None` on success (the body lives on disk, not in
-/// memory), so the handler must re-read the just-written file — mirroring
-/// leptos_axum (`ServeDir`) and leptos_actix (`NamedFile::open`). Regression
-/// probe for the regeneration branch that the existing static-route tests
-/// never exercise (they all call `generate()` first).
-#[ntex::test]
-async fn static_route_on_demand_regeneration_serves_html() {
-    let site_root = temp_site_root("static_regen");
-    std::fs::create_dir_all(&site_root).unwrap();
-    let (routes, _generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_test_regen")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    // Deliberately DO NOT call `_generator.generate(&options).await`: the
-    // file is absent on disk, so the first request takes the on-demand
-    // regeneration branch of `handle_static_route`.
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticApp);
-    }))
-    .await;
-
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "first (regenerating) request to an un-pregenerated static route must serve 200, not 500"
-    );
-    let body = test::read_body(resp).await;
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(
-        html.contains("Static Home"),
-        "must serve the rendered static HTML, got: {html}"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// Concurrent on-demand regenerations of the SAME static path must never
-/// serve a body from one render under headers captured by another. Every
-/// render of `StaticEpochApp` stamps a fresh epoch into both the body and
-/// the `x-render-epoch` header; with the file initially absent, N parallel
-/// first requests all race down the regeneration branch (the documented
-/// stampede), each writing the file+header snapshot under the write stripe
-/// and then re-opening the file. A re-open that pairs the on-disk body with
-/// the REQUEST-LOCAL header snapshot (instead of reading both under the
-/// stripe) lets a neighbour's freshly written body ship under this
-/// request's older headers — the regression this pins down. The pairing
-/// invariant must hold for every interleaving, so the test is
-/// deterministic-green under the fix and only the broken pairing can flake
-/// it red.
-///
-/// One-sided by nature: a red PROVES the pairing bug, while a green is
-/// meaningful only while the stampede design lets renders overlap (no
-/// barrier forces all 16 requests past the missing-file check before the
-/// first write lands). Manual-Red evidence at introduction: against the
-/// pre-fix unpaired re-open this failed 17/20 runs; with the fix, 10/10
-/// green. If in-flight render dedup (single-flight) ever lands, only one
-/// epoch will exist and this test stays trivially green — correctly so,
-/// because the bug class is then designed away.
-#[ntex::test]
-async fn static_route_concurrent_regeneration_pairs_body_with_headers() {
-    let site_root = temp_site_root("static_epoch_race");
-    std::fs::create_dir_all(&site_root).unwrap();
-    let (routes, _generator) = gen_route_list_with_ssg(StaticEpochApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_epoch")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    // Deliberately no `generate()`: the file must be missing so the initial
-    // requests take the regeneration branch concurrently.
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticEpochApp);
-    }))
-    .await;
-
-    let responses = futures::future::join_all(
-        (0..16)
-            .map(|_| test::call_service(&app, test::TestRequest::with_uri("/epoch").to_request())),
-    )
-    .await;
-
-    for resp in responses {
-        assert_eq!(resp.status(), StatusCode::OK);
-        let header_epoch = resp
-            .headers()
-            .get("x-render-epoch")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .expect("every served static response must carry the captured header snapshot");
-        let body = test::read_body(resp).await;
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        let body_epoch = html
-            .split("epoch-")
-            .nth(1)
-            .and_then(|tail| tail.split("-marker").next())
-            .expect("rendered body must contain the epoch marker");
-        assert_eq!(
-            body_epoch, header_epoch,
-            "body epoch and x-render-epoch header must come from one render"
-        );
+fn static_view(kind: StaticAppKind) -> AnyView {
+    match kind {
+        StaticAppKind::Home => StaticApp().into_any(),
+        StaticAppKind::Headers => StaticHeaderApp().into_any(),
+        StaticAppKind::Framing => StaticFramingHeaderApp().into_any(),
+        StaticAppKind::Status => StaticStatusApp().into_any(),
+        StaticAppKind::Redirect => StaticRedirectApp().into_any(),
+        StaticAppKind::Splat => StaticSplatApp().into_any(),
     }
-
-    let _ = std::fs::remove_dir_all(&site_root);
 }
 
-#[ntex::test]
-async fn static_route_cached_headers_are_replayed_more_than_once() {
-    let site_root = temp_site_root("static_headers");
-    let (routes, generator) = gen_route_list_with_ssg(StaticHeaderApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_headers")
-        .site_root(site_root.to_string_lossy().to_string())
+fn static_options(root: &std::path::Path) -> LeptosOptions {
+    LeptosOptions::builder()
+        .output_name("static_contract")
+        .site_root(root.to_string_lossy().into_owned())
         .site_pkg_dir("pkg")
-        .build();
+        .build()
+}
 
-    generator.generate(&options).await;
+#[derive(Debug)]
+struct GenerationObservation {
+    index: Option<String>,
+    about: Option<String>,
+    ok: Option<String>,
+    gone: bool,
+    server_error: bool,
+}
 
-    // Overwrite the pre-rendered file with a sentinel the renderer would never
-    // produce. A genuine cache HIT serves the on-disk file (so the body carries
-    // the sentinel) AND replays the captured headers; a regression that
-    // re-rendered instead would emit "Static Headers" and lose the sentinel.
-    // This is what isolates the cache-hit replay path from a re-render.
-    std::fs::write(
-        site_root.join("headers.html"),
-        "<html><body>SENTINEL_CACHE_HIT</body></html>",
-    )
-    .unwrap();
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
-    }))
-    .await;
-
-    for _ in 0..3 {
-        let resp =
-            test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        assert_eq!(
-            resp.headers()
-                .get("x-static-cache")
-                .and_then(|v| v.to_str().ok()),
-            Some("preserved")
-        );
-        // Captured BEFORE the body is consumed. CB-07: the stale `Content-Length`
-        // the component put on `ResponseOptions` (a deliberately wrong "5") must
-        // NOT survive onto a cache-hit response — the framing-strip drops it so
-        // the on-disk file (`NamedFile`) stays authoritative. (`NamedFile`'s own
-        // length header is applied by the h1 encoder, which `test::call_service`
-        // bypasses, so the observable here is the ABSENCE of the bogus value,
-        // not the presence of the real one.)
-        let content_length = resp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = test::read_body(resp).await;
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            html.contains("SENTINEL_CACHE_HIT"),
-            "a cache hit must serve the on-disk file (sentinel), not re-render: {html}"
-        );
-        assert_ne!(
-            content_length.as_deref(),
-            Some("5"),
-            "the stale snapshot Content-Length (5) must be stripped on a cache hit, not served over the file's real size"
-        );
+async fn generation_observation(kind: StaticAppKind) -> GenerationObservation {
+    let root = temp_site_root("static_generation_contract");
+    let app_fn = move || static_view(kind);
+    let (_routes, generator) = gen_route_list_with_ssg(app_fn);
+    generator.generate(&static_options(&root)).await;
+    GenerationObservation {
+        index: std::fs::read_to_string(root.join("index.html")).ok(),
+        about: std::fs::read_to_string(root.join("about.html")).ok(),
+        ok: std::fs::read_to_string(root.join("ok.html")).ok(),
+        gone: root.join("gone.html").exists(),
+        server_error: root.join("server-error.html").exists(),
     }
-
-    let _ = std::fs::remove_dir_all(&site_root);
 }
 
-/// All 8 keys in `handle_static_route`'s framing-header strip list —
-/// `Content-Length`, `Content-Type`, `Content-Encoding`, `Transfer-Encoding`,
-/// `Content-Range`, `Accept-Ranges`, `ETag`, `Last-Modified` — must be
-/// removed from a captured `ResponseParts` snapshot on a file-served
-/// response, not just `Content-Length` (the only one the pre-existing
-/// `StaticHeaderApp`-based test exercises). A non-framing header the app set
-/// (`x-custom-marker`) must still survive, proving the strip is scoped to
-/// exactly those 8 keys and not a wholesale header wipe.
-#[ntex::test]
-async fn static_route_strips_every_framing_header_from_the_cached_snapshot() {
-    let site_root = temp_site_root("static_framing_headers");
-    let (routes, generator) = gen_route_list_with_ssg(StaticFramingHeaderApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_framing_headers")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticFramingHeaderApp);
-    }))
-    .await;
-
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/framing").to_request()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let headers = resp.headers().clone();
-    // None of the 8 bogus sentinel values the component set must survive —
-    // each is either absent or overwritten by NamedFile's own authoritative
-    // value, which is never the sentinel this test planted.
-    assert_ne!(
-        headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some("5"),
-        "the stale Content-Length sentinel must be stripped"
-    );
-    assert_ne!(
-        headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-        Some("text/x-bogus"),
-        "the stale Content-Type sentinel must be stripped; NamedFile derives its own MIME"
-    );
-    assert!(
-        headers.get(header::CONTENT_ENCODING).is_none(),
-        "the stale Content-Encoding sentinel must be stripped"
-    );
-    assert!(
-        headers.get(header::TRANSFER_ENCODING).is_none(),
-        "the stale Transfer-Encoding sentinel must be stripped"
-    );
-    assert!(
-        headers.get(header::CONTENT_RANGE).is_none(),
-        "the stale Content-Range sentinel must be stripped on a full (non-range) serve"
-    );
-    assert_ne!(
-        headers
-            .get(header::ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok()),
-        Some("none"),
-        "the stale Accept-Ranges sentinel must be stripped"
-    );
-    assert_ne!(
-        headers.get(header::ETAG).and_then(|v| v.to_str().ok()),
-        Some("\"bogus-etag\""),
-        "the stale ETag sentinel must be stripped; NamedFile derives its own"
-    );
-    assert_ne!(
-        headers
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok()),
-        Some("Thu, 01 Jan 1970 00:00:00 GMT"),
-        "the stale Last-Modified sentinel must be stripped; NamedFile derives its own"
-    );
-
-    // The non-framing header the app set is NOT in the strip list, so it must
-    // survive exactly as captured.
-    assert_eq!(
-        headers.get("x-custom-marker").and_then(|v| v.to_str().ok()),
-        Some("keep-me"),
-        "a non-framing header must survive the strip untouched"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
+#[derive(Clone)]
+enum Constraint {
+    None,
+    MatchCurrent,
+    FailedMatch,
+    Range(&'static str),
+    MalformedRange,
+}
+#[derive(Clone, Copy)]
+enum ArtifactState {
+    Paired,
+    ChangedBody,
+    Legacy,
+    RemovedBeforeReopen,
 }
 
-/// A captured `ResponseOptions` status must not overwrite the status
-/// `NamedFile` computes from the request's validators / `Range` on the
-/// file-serving branch (RFC 9110 §13, §14.4, §15.4.5). The `/headers` route
-/// sets `201` during its static render; a full serve keeps that `201`, but a
-/// conditional (`If-None-Match`) or range request must report `NamedFile`'s
-/// `304` / `206` instead — otherwise a client sending `If-None-Match` would
-/// receive `201` with an empty body and drop its valid cache. Upstream
-/// `leptos_axum` / `leptos_actix` overwrite unconditionally; this is a
-/// deliberate divergence.
-#[ntex::test]
-async fn static_route_captured_status_yields_to_namedfile_conditional_and_range() {
-    let site_root = temp_site_root("static_conditional_status");
-    let (routes, generator) = gen_route_list_with_ssg(StaticHeaderApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_conditional_status")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
-    }))
-    .await;
-
-    // A full serve keeps the app's captured status and exposes NamedFile's ETag.
-    let full = test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
-    assert_eq!(
-        full.status(),
-        StatusCode::CREATED,
-        "a full serve must keep the app's captured 201"
-    );
-    let etag = full
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .expect("NamedFile must set an ETag on the served static file");
-
-    // If-None-Match matches the file's ETag: NamedFile computes 304, and the
-    // captured 201 must NOT overwrite it.
-    let conditional = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/headers")
-            .header(header::IF_NONE_MATCH, etag.as_str())
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        conditional.status(),
-        StatusCode::NOT_MODIFIED,
-        "If-None-Match match must report 304, not the captured 201"
-    );
-
-    // A satisfiable Range: NamedFile computes 206, and the captured 201 must
-    // NOT overwrite it.
-    let ranged = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/headers")
-            .header(header::RANGE, "bytes=0-3")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        ranged.status(),
-        StatusCode::PARTIAL_CONTENT,
-        "a satisfiable Range must report 206, not the captured 201"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
+#[derive(Clone)]
+struct StaticRequest {
+    kind: StaticAppKind,
+    uri: &'static str,
+    pregenerate: bool,
+    method: ntex::http::Method,
+    constraint: Constraint,
+    artifact: ArtifactState,
+}
+impl Default for StaticRequest {
+    fn default() -> Self {
+        Self {
+            kind: StaticAppKind::Home,
+            uri: "/",
+            pregenerate: true,
+            method: ntex::http::Method::GET,
+            constraint: Constraint::None,
+            artifact: ArtifactState::Paired,
+        }
+    }
 }
 
-/// The THIRD precedence arm — a route with NO captured status at all (`/`,
-/// whose `ResponseParts::status` is always `None`) — must let `NamedFile`'s
-/// conditional/range status through completely unopposed: there is no
-/// captured status to yield OR to fight over. Complements the two tests above,
-/// which only ever drive the `Some(status) if is_success()` and `Some(status)`
-/// (redirect) arms of the match in `handle_static_route`; this one exercises
-/// the `None => {}` arm, otherwise never reached by any conditional/range
-/// request in this file.
-#[ntex::test]
-async fn static_route_with_no_captured_status_still_yields_to_namedfile_conditional_and_range() {
-    let site_root = temp_site_root("static_conditional_no_status");
-    let (routes, generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_conditional_no_status")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticApp);
-    }))
-    .await;
-
-    // A full serve reports NamedFile's plain 200 (there is no captured status
-    // to apply on this route at all).
-    let full = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-    assert_eq!(full.status(), StatusCode::OK);
-    let etag = full
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .expect("NamedFile must set an ETag on the served static file");
-
-    // If-None-Match matches the file's ETag: NamedFile computes 304. The
-    // `None => {}` arm must leave this untouched.
-    let conditional = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/")
-            .header(header::IF_NONE_MATCH, etag.as_str())
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        conditional.status(),
-        StatusCode::NOT_MODIFIED,
-        "a plain static route with no captured status must still report 304 on a conditional hit"
-    );
-
-    // A satisfiable Range: NamedFile computes 206, again untouched by the
-    // (absent) captured status.
-    let ranged = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/")
-            .header(header::RANGE, "bytes=0-3")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        ranged.status(),
-        StatusCode::PARTIAL_CONTENT,
-        "a plain static route with no captured status must still report 206 on a satisfiable range request"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
+#[derive(Debug)]
+struct StaticObservation {
+    status: StatusCode,
+    body: String,
+    content_type: Option<String>,
+    content_length: Option<String>,
+    encoding: Option<String>,
+    transfer: Option<String>,
+    content_range: Option<String>,
+    ranges: Option<String>,
+    etag: Option<String>,
+    modified: Option<String>,
+    marker: Option<String>,
+    location: Option<String>,
+    rendered_on_request: usize,
+    disk_exists: bool,
 }
 
-/// A `SsrMode::Static` route that captured a *redirect* (`302` + `Location`)
-/// must keep redirecting on conditional / range hits: the captured status is
-/// not a success representation, so `NamedFile`'s `304` / `206` must NOT
-/// replace it — otherwise the client is stranded on a `304` / `206` carrying a
-/// `Location` instead of following the redirect. Only a captured `2xx` yields
-/// to `NamedFile`'s conditional/range status.
-#[ntex::test]
-async fn static_route_captured_redirect_survives_conditional_and_range() {
-    let site_root = temp_site_root("static_redirect_status");
-    let (routes, generator) = gen_route_list_with_ssg(StaticRedirectApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_redirect_status")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticRedirectApp);
-    }))
-    .await;
-
-    // A full serve keeps the captured redirect and exposes NamedFile's ETag.
-    let full = test::call_service(&app, test::TestRequest::with_uri("/go").to_request()).await;
-    assert_eq!(
-        full.status(),
-        StatusCode::FOUND,
-        "a full serve must keep the captured 302 redirect"
-    );
-    let etag = full
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .expect("NamedFile must set an ETag on the served static file");
-
-    // A conditional hit must STILL redirect (302), not collapse to NamedFile's 304.
-    let conditional = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/go")
-            .header(header::IF_NONE_MATCH, etag.as_str())
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        conditional.status(),
-        StatusCode::FOUND,
-        "a conditional hit to a static redirect must keep 302, not become 304"
-    );
-
-    // A range request must STILL redirect (302), not collapse to NamedFile's
-    // 206 — and the redirect must not carry NamedFile's range artifacts
-    // (`Content-Range` header + partial file body).
-    let ranged = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/go")
-            .header(header::RANGE, "bytes=0-3")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        ranged.status(),
-        StatusCode::FOUND,
-        "a range request to a static redirect must keep 302, not become 206"
-    );
-    let ranged_has_content_range = ranged.headers().get(header::CONTENT_RANGE).is_some();
-    let ranged_body = test::read_body(ranged).await;
-    assert!(
-        !ranged_has_content_range,
-        "a redirect must not carry NamedFile's `Content-Range` range artifact"
-    );
-    assert!(
-        ranged_body.is_empty(),
-        "a redirect must not carry NamedFile's partial file body, got {} bytes",
-        ranged_body.len()
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// The very FIRST request to a not-yet-pregenerated `SsrMode::Static` route
-/// that captures a non-default status/redirect must already serve it
-/// correctly — not just on a subsequent cache hit. Every other
-/// status/redirect-capturing test in this file calls `generate()` first
-/// (warm-cache only); this one deliberately skips it so the on-demand
-/// write→cache→re-open round trip (the SAME `STATIC_HEADERS` mechanism a
-/// cache hit reads, per `open_paired_static_file`) is proven end-to-end on a
-/// cold cache too, for both a captured status (`StaticHeaderApp`, 201) and a
-/// captured redirect (`StaticRedirectApp`, 302 + Location).
-#[ntex::test]
-async fn static_route_cold_regeneration_preserves_captured_status_and_redirect() {
-    let status_site_root = temp_site_root("static_cold_status");
-    let (status_routes, _status_generator) = gen_route_list_with_ssg(StaticHeaderApp);
-    let status_options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_cold_status")
-        .site_root(status_site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    // Deliberately no `generate()`: `headers.html` is absent, so this is the
-    // route's first-ever request.
-    let status_app = test::init_service(NtexApp::new().state(status_options.clone()).configure(
-        |cfg| {
-            register_leptos_routes(cfg, status_routes.clone(), StaticHeaderApp);
-        },
-    ))
-    .await;
-
-    let status_resp = test::call_service(
-        &status_app,
-        test::TestRequest::with_uri("/headers").to_request(),
-    )
-    .await;
-    assert_eq!(
-        status_resp.status(),
-        StatusCode::CREATED,
-        "the first (regenerating) request to a route that captures a custom status must already report it"
-    );
-
-    let _ = std::fs::remove_dir_all(&status_site_root);
-
-    let redirect_site_root = temp_site_root("static_cold_redirect");
-    let (redirect_routes, _redirect_generator) = gen_route_list_with_ssg(StaticRedirectApp);
-    let redirect_options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_cold_redirect")
-        .site_root(redirect_site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    // Deliberately no `generate()`: `go.html` is absent, so this is the
-    // route's first-ever request.
-    let redirect_app = test::init_service(
+async fn static_request(request: StaticRequest) -> StaticObservation {
+    let root = temp_site_root("static_http_contract");
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app_fn = {
+        let count = count.clone();
+        let kind = request.kind;
+        move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static_view(kind)
+        }
+    };
+    let (routes, generator) = gen_route_list_with_ssg(app_fn.clone());
+    let options = static_options(&root);
+    if request.pregenerate {
+        generator.generate(&options).await;
+    }
+    let file = root.join(if request.uri == "/" {
+        "index.html".to_owned()
+    } else {
+        format!("{}.html", request.uri.trim_start_matches('/'))
+    });
+    let mut _reopen_hook = None;
+    match request.artifact {
+        ArtifactState::Paired => {}
+        ArtifactState::ChangedBody => std::fs::write(&file, "inconsistent-old-body").unwrap(),
+        ArtifactState::Legacy => {
+            let metadata = file
+                .parent()
+                .unwrap()
+                .join(".leptos-static-metadata")
+                .join(file.file_name().unwrap());
+            let _ = std::fs::remove_file(metadata);
+            std::fs::write(&file, "external-legacy-html").unwrap();
+        }
+        ArtifactState::RemovedBeforeReopen => {
+            let path = root.to_path_buf();
+            let owned = root.clone();
+            _reopen_hook = Some(crate::static_routes::test_hooks::on_reopen(
+                path,
+                Box::new(move || std::fs::remove_dir_all(&owned)),
+            ));
+        }
+    }
+    let app = test::init_service(
         NtexApp::new()
-            .state(redirect_options.clone())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, redirect_routes.clone(), StaticRedirectApp);
-            }),
+            .state(options)
+            .configure(|cfg| register_leptos_routes(cfg, routes.clone(), app_fn.clone())),
     )
     .await;
-
-    let redirect_resp = test::call_service(
-        &redirect_app,
-        test::TestRequest::with_uri("/go").to_request(),
-    )
-    .await;
-    assert_eq!(
-        redirect_resp.status(),
-        StatusCode::FOUND,
-        "the first (regenerating) request to a route that captures a redirect must already redirect"
-    );
-    assert_eq!(
-        redirect_resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok()),
-        Some("/elsewhere"),
-        "the first (regenerating) request must already carry the captured Location header"
-    );
-
-    let _ = std::fs::remove_dir_all(&redirect_site_root);
-}
-
-/// If the just-written `.html` vanishes between `write_static_route`'s atomic
-/// rename and `handle_static_route`'s post-regeneration re-open (e.g. deleted
-/// or moved out from under the server), the handler must report `500`, not
-/// panic, hang, or silently serve an empty `200`.
-///
-/// Deterministic by construction: `REGEN_REOPEN_TEST_HOOK` fires exactly once,
-/// synchronously, at the precise point between the write completing and the
-/// re-open starting — no background thread racing OS scheduling, so this
-/// cannot flake on a loaded/fast CI runner the way a timing-based watcher
-/// could (an earlier version of this test used one; see git history).
-#[ntex::test]
-async fn static_route_reopen_failure_after_regeneration_reports_500() {
-    let site_root = temp_site_root("static_regen_vanish");
-    std::fs::create_dir_all(&site_root).unwrap();
-    let (routes, _generator) = gen_route_list_with_ssg(StaticApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_regen_vanish")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    {
-        // Remove the whole directory (not just the file): a regenerating
-        // re-open re-canonicalizes `root` too, so this also covers a root
-        // that disappears mid-race. Keyed by `site_root` — see
-        // `REGEN_REOPEN_TEST_HOOK`'s doc comment — so a concurrently running
-        // on-demand-regeneration test (e.g.
-        // `static_route_on_demand_regeneration_serves_html`) cannot consume
-        // this hook for its own, different, request.
-        let hook_root = site_root.clone();
-        let site_root_to_remove = site_root.clone();
-        *crate::static_routes::REGEN_REOPEN_TEST_HOOK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
-            hook_root,
-            Box::new(move || {
-                std::fs::remove_dir_all(&site_root_to_remove)
-                    .expect("site_root must still be removable at the reopen seam");
-            }),
-        ));
-    }
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticApp);
-    }))
-    .await;
-
-    let resp = test::call_service(&app, test::TestRequest::with_uri("/").to_request()).await;
-
-    let _ = std::fs::remove_dir_all(&site_root);
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a re-open failure right after a successful regeneration must report 500"
-    );
-}
-
-/// A URL that `static_path` rejects (path traversal, a dotfile, a smuggled
-/// separator) must make `handle_static_route`'s registered service answer
-/// `404`, not `500` and not panic — the handler's early-return guard
-/// (`let Some(path_buf) = static_path(...) else { return HttpResponse::
-/// NotFound().finish(); }`) is otherwise only unit-tested as the pure
-/// `static_path` function returning `None`, never driven through an actual
-/// HTTP request against a registered route in this file. A *splat* static
-/// route (`/files/*any`) is required to reach this guard over HTTP at all: a
-/// route registered at a literal path (`/about`) only ever receives that exact
-/// path from ntex's own router, which never contains a traversal/dotfile
-/// segment to reject; a splat is matched by every distinct URL under it
-/// (documented on `STATIC_HEADERS` as the "wildcard static route" case), so a
-/// malicious segment inside the splat's tail DOES reach `static_path`.
-#[ntex::test]
-async fn static_route_rejects_a_traversal_url_with_404() {
-    let site_root = temp_site_root("static_traversal");
-    let (routes, generator) = gen_route_list_with_ssg(StaticSplatApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_traversal")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticSplatApp);
-    }))
-    .await;
-
-    let traversal = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/files/../secret").to_request(),
-    )
-    .await;
-    assert_eq!(
-        traversal.status(),
-        StatusCode::NOT_FOUND,
-        "a path-traversal URL must be rejected with 404, not 500 or a panic"
-    );
-
-    let dotfile = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/files/.env").to_request(),
-    )
-    .await;
-    assert_eq!(
-        dotfile.status(),
-        StatusCode::NOT_FOUND,
-        "a dotfile URL must be rejected with 404, not 500 or a panic"
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// The remaining 3 of the 5 statuses `is_conditional_or_range_status`
-/// protects — `412` (failed `If-Match`), `416` (unsatisfiable `Range`), `400`
-/// (a `Range` header that is not valid text) — must ALSO win over a route's
-/// captured non-error status (`StaticHeaderApp`'s captured `201`), exactly
-/// like the `304`/`206` cases the pre-existing conditional/range test covers.
-/// Closes the gap where only 2 of the 5 protected statuses were ever driven
-/// end-to-end.
-#[ntex::test]
-async fn static_route_captured_status_yields_to_namedfile_precondition_range_and_malformed_range() {
-    let site_root = temp_site_root("static_conditional_status_412_416_400");
-    let (routes, generator) = gen_route_list_with_ssg(StaticHeaderApp);
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_static_conditional_412_416_400")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    generator.generate(&options).await;
-
-    let app = test::init_service(NtexApp::new().state(options.clone()).configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), StaticHeaderApp);
-    }))
-    .await;
-
-    // If-Match with a value that can never match a real ETag: NamedFile
-    // computes 412, and the captured 201 must NOT overwrite it.
-    let precondition_failed = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/headers")
-            .header(header::IF_MATCH, "\"does-not-match\"")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        precondition_failed.status(),
-        StatusCode::PRECONDITION_FAILED,
-        "a failed If-Match must report 412, not the captured 201"
-    );
-
-    // An unsatisfiable Range (far past the end of the small rendered file):
-    // NamedFile computes 416, and the captured 201 must NOT overwrite it.
-    let range_not_satisfiable = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/headers")
-            .header(header::RANGE, "bytes=9000-9999")
-            .to_request(),
-    )
-    .await;
-    assert_eq!(
-        range_not_satisfiable.status(),
-        StatusCode::RANGE_NOT_SATISFIABLE,
-        "an unsatisfiable Range must report 416, not the captured 201"
-    );
-
-    // A Range header that is not valid TEXT (per `is_conditional_or_range_
-    // status`'s own doc comment): `ntex_files` reports 400 specifically when
-    // the raw header bytes fail `to_str()` (invalid UTF-8), as opposed to a
-    // syntactically-invalid-but-valid-UTF-8 range (e.g. "bytes=abc"), which
-    // `HttpRange::parse` treats as unsatisfiable (416) instead. The captured
-    // 201 must NOT overwrite this 400 either.
-    let malformed_range = test::call_service(
-        &app,
-        test::TestRequest::with_uri("/headers")
-            .header(
+    let mut req = test::TestRequest::with_uri(request.uri).method(request.method);
+    match request.constraint {
+        Constraint::None => {}
+        Constraint::MatchCurrent => {
+            let full =
+                test::call_service(&app, test::TestRequest::with_uri(request.uri).to_request())
+                    .await;
+            req = req.header(
+                header::IF_NONE_MATCH,
+                full.headers()
+                    .get(header::ETAG)
+                    .expect("full representation has validator")
+                    .clone(),
+            );
+        }
+        Constraint::FailedMatch => {
+            req = req.header(header::IF_MATCH, "\"not-current\"");
+        }
+        Constraint::Range(range) => {
+            req = req.header(header::RANGE, range);
+        }
+        Constraint::MalformedRange => {
+            req = req.header(
                 header::RANGE,
-                ntex::http::header::HeaderValue::from_bytes(b"bytes=\xff\xff").unwrap(),
-            )
-            .to_request(),
+                header::HeaderValue::from_bytes(b"bytes=\xff").unwrap(),
+            );
+        }
+    }
+    let before = count.load(std::sync::atomic::Ordering::Relaxed);
+    let response = test::call_service(&app, req.to_request()).await;
+    let rendered_on_request = count.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let value = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let status = response.status();
+    let content_type = value(header::CONTENT_TYPE);
+    let content_length = value(header::CONTENT_LENGTH);
+    let encoding = value(header::CONTENT_ENCODING);
+    let transfer = value(header::TRANSFER_ENCODING);
+    let content_range = value(header::CONTENT_RANGE);
+    let ranges = value(header::ACCEPT_RANGES);
+    let etag = value(header::ETAG);
+    let modified = value(header::LAST_MODIFIED);
+    let marker = value(header::HeaderName::from_static(
+        if matches!(request.kind, StaticAppKind::Framing) {
+            "x-custom-marker"
+        } else {
+            "x-static-cache"
+        },
+    ));
+    let location = value(header::LOCATION);
+    let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+    StaticObservation {
+        status,
+        body,
+        content_type,
+        content_length,
+        encoding,
+        transfer,
+        content_range,
+        ranges,
+        etag,
+        modified,
+        marker,
+        location,
+        rendered_on_request,
+        disk_exists: file.exists(),
+    }
+}
+
+fn contains_html(text: &'static str) -> impl Fn(&String) -> lets_expect::AssertionResult {
+    move |actual| {
+        if actual.contains(text) {
+            Ok(())
+        } else {
+            Err(lets_expect::AssertionError {
+                message: vec![format!(
+                    "Expected HTML containing {text:?}; received {actual:?}"
+                )],
+            })
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(generation_observation(kind))) as the_static_generation {
+        let kind = StaticAppKind::Home;
+        to writes_the_home_page { have(index) be_some_and contains_html("Static Home") }
+        to writes_the_other_declared_page { have(about) be_some_and contains_html("Static About") }
+        when the_routes_include_errors {
+            let kind = StaticAppKind::Status;
+            to writes_the_success { have(ok) be_some_and contains_html("Static OK") }
+            to does_not_persist_client_errors { have(gone) be_false }
+            to does_not_persist_server_errors { have(server_error) be_false }
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(request))) as the_static_http_response {
+        let request = StaticRequest::default();
+        to serves_the_pregenerated_page { have(status) equal(StatusCode::OK), have(body) contains_html("Static Home"), have(rendered_on_request) equal(0_usize) }
+        when the_method_is_head {
+            let request = StaticRequest { method: ntex::http::Method::HEAD, ..Default::default() };
+            to preserves_the_representation_metadata { have(status) equal(StatusCode::OK), have(content_type) equal(Some("text/html".to_owned())) }
+        }
+        when the_file_has_not_been_generated {
+            let request = StaticRequest { pregenerate: false, ..Default::default() };
+            to generates_and_serves_the_page { have(status) equal(StatusCode::OK), have(body) contains_html("Static Home"), have(disk_exists) be_true }
+        }
+        when the_body_no_longer_matches_its_metadata {
+            let request = StaticRequest { artifact: ArtifactState::ChangedBody, ..Default::default() };
+            to regenerates_a_valid_representation { have(status) equal(StatusCode::OK), have(body) contains_html("Static Home"), have(rendered_on_request) equal(1_usize) }
+        }
+        when the_artifact_is_legacy_html {
+            let request = StaticRequest { artifact: ArtifactState::Legacy, ..Default::default() };
+            to serves_the_existing_legacy_format { have(status) equal(StatusCode::OK), have(body) equal("external-legacy-html".to_owned()), have(rendered_on_request) equal(0_usize) }
+        }
+        when the_artifact_disappears_before_reopen {
+            let request = StaticRequest { pregenerate: false, artifact: ArtifactState::RemovedBeforeReopen, ..Default::default() };
+            to reports_a_controlled_failure { have(status) equal(StatusCode::INTERNAL_SERVER_ERROR), have(body) equal(String::new()) }
+        }
+        when a_current_validator_is_sent {
+            let request = StaticRequest { constraint: Constraint::MatchCurrent, ..Default::default() };
+            to reports_not_modified { have(status) equal(StatusCode::NOT_MODIFIED), have(body) equal(String::new()) }
+        }
+        when a_partial_range_is_requested {
+            let request = StaticRequest { constraint: Constraint::Range("bytes=0-3"), ..Default::default() };
+            to serves_the_selected_bytes { have(status) equal(StatusCode::PARTIAL_CONTENT), have(body.len()) equal(4_usize), have(content_range) be_some }
+        }
+        when a_range_is_unsatisfiable {
+            let request = StaticRequest { constraint: Constraint::Range("bytes=9000-9999"), ..Default::default() };
+            to reports_range_not_satisfiable { have(status) equal(StatusCode::RANGE_NOT_SATISFIABLE), have(body) equal(String::new()) }
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(request))) as the_captured_static_status {
+        let constraint = Constraint::None;
+        let pregenerate = true;
+        let request = StaticRequest { kind: StaticAppKind::Headers, uri: "/headers", pregenerate, constraint, ..Default::default() };
+        to replays_status_and_headers { have(status) equal(StatusCode::CREATED), have(marker) equal(Some("preserved".to_owned())), have(body) contains_html("Static Headers") }
+        to does_not_rerender_a_paired_hit { have(rendered_on_request) equal(0_usize) }
+        to uses_the_file_framing { have(content_length) not_equal(Some("5".to_owned())) }
+        when generation_is_on_demand {
+            let pregenerate = false;
+            to preserves_status_on_the_first_request { have(status) equal(StatusCode::CREATED), have(marker) equal(Some("preserved".to_owned())), have(disk_exists) be_true }
+        }
+        when a_current_validator_is_sent {
+            let constraint = Constraint::MatchCurrent;
+            to reports_not_modified { have(status) equal(StatusCode::NOT_MODIFIED), have(body) equal(String::new()) }
+        }
+        when if_match_fails {
+            let constraint = Constraint::FailedMatch;
+            to reports_the_failed_precondition { have(status) equal(StatusCode::PRECONDITION_FAILED), have(body) equal(String::new()) }
+        }
+        when a_partial_range_is_requested {
+            let constraint = Constraint::Range("bytes=0-3");
+            to ignores_range_for_a_non_200_representation { have(status) equal(StatusCode::CREATED), have(body) contains_html("Static Headers"), have(content_range) be_none }
+        }
+        when the_range_is_unsatisfiable {
+            let constraint = Constraint::Range("bytes=9000-9999");
+            to ignores_range_for_a_non_200_representation { have(status) equal(StatusCode::CREATED), have(body) contains_html("Static Headers"), have(content_range) be_none }
+        }
+        when the_range_is_non_text {
+            let constraint = Constraint::MalformedRange;
+            to ignores_range_for_a_non_200_representation { have(status) equal(StatusCode::CREATED), have(body) contains_html("Static Headers"), have(content_range) be_none }
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(request))) as the_static_redirect {
+        let constraint = Constraint::None;
+        let pregenerate = true;
+        let request = StaticRequest { kind: StaticAppKind::Redirect, uri: "/go", pregenerate, constraint, ..Default::default() };
+        to preserves_the_redirect { have(status) equal(StatusCode::FOUND), have(location) equal(Some("/elsewhere".to_owned())) }
+        when generation_is_on_demand {
+            let pregenerate = false;
+            to redirects_on_the_first_request { have(status) equal(StatusCode::FOUND), have(location) equal(Some("/elsewhere".to_owned())) }
+        }
+        when a_current_validator_is_sent {
+            let constraint = Constraint::MatchCurrent;
+            to keeps_redirecting { have(status) equal(StatusCode::FOUND), have(location) equal(Some("/elsewhere".to_owned())) }
+        }
+        when a_range_is_sent {
+            let constraint = Constraint::Range("bytes=0-3");
+            to does_not_emit_range_artifacts { have(status) equal(StatusCode::FOUND), have(location) equal(Some("/elsewhere".to_owned())), have(content_range) be_none, have(body) equal(String::new()) }
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(request))) as the_static_error_response {
+        let uri = "/gone";
+        let request = StaticRequest { kind: StaticAppKind::Status, uri, pregenerate: false, ..Default::default() };
+        to preserves_the_client_error_without_caching { have(status) equal(StatusCode::NOT_FOUND), have(disk_exists) be_false }
+        when the_render_has_a_server_error {
+            let uri = "/server-error";
+            to preserves_the_server_error_without_caching { have(status) equal(StatusCode::INTERNAL_SERVER_ERROR), have(disk_exists) be_false }
+        }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(StaticRequest { kind: StaticAppKind::Framing, uri: "/framing", ..Default::default() }))) as the_static_file_framing {
+        to preserves_the_application_marker { have(marker) equal(Some("keep-me".to_owned())), have(body) contains_html("Static Framing") }
+        to preserves_the_explicit_html_media_type { have(content_type) equal(Some("text/html; charset=utf-8".to_owned())) }
+        to uses_the_file_length { have(content_length) not_equal(Some("5".to_owned())) }
+        to does_not_use_a_fake_encoding { have(encoding) be_none }
+        to does_not_use_a_fake_transfer_encoding { have(transfer) be_none }
+        to does_not_use_a_fake_content_range { have(content_range) be_none }
+        to advertises_actual_range_support { have(ranges) equal(Some("bytes".to_owned())) }
+        to uses_the_file_validator { have(etag.clone()) be_some, have(etag) not_equal(Some("\"bogus-etag\"".to_owned())) }
+        to uses_the_file_modification_time { have(modified.clone()) be_some, have(modified) not_equal(Some("Thu, 01 Jan 1970 00:00:00 GMT".to_owned())) }
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(static_request(request))) as the_static_path_rejection {
+        let uri = "/files/../secret";
+        let request = StaticRequest { kind: StaticAppKind::Splat, uri, pregenerate: false, ..Default::default() };
+        to rejects_traversal { have(status) equal(StatusCode::NOT_FOUND), have(disk_exists) be_false }
+        when the_path_contains_a_dotfile {
+            let uri = "/files/.env";
+            to rejects_the_dotfile { have(status) equal(StatusCode::NOT_FOUND), have(disk_exists) be_false }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegenerationObservation {
+    listeners: usize,
+    statuses: Vec<StatusCode>,
+    bodies: Vec<String>,
+}
+
+async fn concurrent_regeneration(delete_after_first: bool) -> RegenerationObservation {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let root = temp_site_root("controlled_regeneration");
+    let listeners = Arc::new(AtomicUsize::new(0));
+    let app_fn = {
+        let listeners = listeners.clone();
+        move || {
+            let listeners = listeners.clone();
+            view! {
+                <Router><Routes fallback=|| "missing">
+                    <Route path=path!("/regen") ssr=SsrMode::Static(StaticRoute::new().regenerate(move |_| {
+                        listeners.fetch_add(1, Ordering::SeqCst);
+                        futures::stream::pending::<()>()
+                    })) view=|| "regenerated"/>
+                </Routes></Router>
+            }
+        }
+    };
+    let routes = crate::generate_route_list(app_fn.clone());
+    let app = test::init_service(
+        NtexApp::new()
+            .state(static_options(&root))
+            .configure(|cfg| register_leptos_routes(cfg, routes.clone(), app_fn.clone())),
     )
     .await;
-    assert_eq!(
-        malformed_range.status(),
-        StatusCode::BAD_REQUEST,
-        "a malformed Range header must report 400, not the captured 201"
+    let barrier = crate::static_routes::test_hooks::two_misses(root.to_path_buf());
+    let (first, second) = futures::join!(
+        test::call_service(&app, test::TestRequest::with_uri("/regen").to_request()),
+        test::call_service(&app, test::TestRequest::with_uri("/regen").to_request())
     );
+    drop(barrier);
+    let mut statuses = vec![first.status(), second.status()];
+    let mut bodies = vec![
+        String::from_utf8(test::read_body(first).await.to_vec()).unwrap(),
+        String::from_utf8(test::read_body(second).await.to_vec()).unwrap(),
+    ];
+    if delete_after_first {
+        std::fs::remove_file(root.join("regen.html")).unwrap();
+        let barrier = crate::static_routes::test_hooks::two_misses(root.to_path_buf());
+        let (first, second) = futures::join!(
+            test::call_service(&app, test::TestRequest::with_uri("/regen").to_request()),
+            test::call_service(&app, test::TestRequest::with_uri("/regen").to_request())
+        );
+        drop(barrier);
+        statuses.extend([first.status(), second.status()]);
+        bodies.extend([
+            String::from_utf8(test::read_body(first).await.to_vec()).unwrap(),
+            String::from_utf8(test::read_body(second).await.to_vec()).unwrap(),
+        ]);
+    }
+    RegenerationObservation {
+        listeners: listeners.load(Ordering::SeqCst),
+        statuses,
+        bodies,
+    }
+}
 
-    let _ = std::fs::remove_dir_all(&site_root);
+fn all_regenerated(bodies: &[String]) -> lets_expect::AssertionResult {
+    if bodies.iter().all(|body| body.contains("regenerated")) {
+        Ok(())
+    } else {
+        Err(lets_expect::AssertionError {
+            message: vec![format!(
+                "Expected regenerated HTML in every response, received {bodies:?}"
+            )],
+        })
+    }
+}
+
+lets_expect::lets_expect! {
+    expect(run_ntex(concurrent_regeneration(delete_after_first))) as the_controlled_static_regeneration {
+        let delete_after_first = false;
+        to serves_both_cold_callers { have(statuses) equal(vec![StatusCode::OK; 2]), have(bodies) all_regenerated }
+        to installs_one_listener { have(listeners) equal(1_usize) }
+        when the_persisted_file_is_deleted {
+            let delete_after_first = true;
+            to serves_the_next_cold_callers { have(statuses) equal(vec![StatusCode::OK; 4]), have(bodies) all_regenerated }
+            to reuses_the_existing_listener { have(listeners) equal(1_usize) }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RepeatedStaticObservation {
+    statuses: Vec<StatusCode>,
+    headers: Vec<Option<String>>,
+    renders: usize,
+}
+async fn repeated_static_hits() -> RepeatedStaticObservation {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let root = temp_site_root("repeated_static_hits");
+    let count = Arc::new(AtomicUsize::new(0));
+    let app_fn = {
+        let count = count.clone();
+        move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            StaticHeaderApp()
+        }
+    };
+    let (routes, generator) = gen_route_list_with_ssg(app_fn.clone());
+    generator.generate(&static_options(&root)).await;
+    let app = test::init_service(
+        NtexApp::new()
+            .state(static_options(&root))
+            .configure(|cfg| register_leptos_routes(cfg, routes.clone(), app_fn.clone())),
+    )
+    .await;
+    let before = count.load(Ordering::Relaxed);
+    let first =
+        test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
+    let second =
+        test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
+    let third =
+        test::call_service(&app, test::TestRequest::with_uri("/headers").to_request()).await;
+    let statuses = vec![first.status(), second.status(), third.status()];
+    let headers = [&first, &second, &third]
+        .into_iter()
+        .map(|response| {
+            response
+                .headers()
+                .get("x-static-cache")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+        .collect();
+    RepeatedStaticObservation {
+        statuses,
+        headers,
+        renders: count.load(Ordering::Relaxed) - before,
+    }
+}
+lets_expect::lets_expect! {
+    expect(run_ntex(repeated_static_hits())) as repeated_static_hits {
+        to replays_the_status_every_time { have(statuses) equal(vec![StatusCode::CREATED; 3]) }
+        to replays_the_headers_every_time { have(headers) equal(vec![Some("preserved".to_owned()); 3]) }
+        to reuses_the_persisted_representation { have(renders) equal(0_usize) }
+    }
+}
+
+struct PollUnwindWitness(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for PollUnwindWitness {
+    fn drop(&mut self) {
+        self.0.store(
+            std::thread::panicking(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+struct OwnerReadingStream {
+    stop: futures::channel::oneshot::Receiver<()>,
+    value: StoredValue<usize>,
+    panic_on_stop: bool,
+    unwound: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl futures::Stream for OwnerReadingStream {
+    type Item = ();
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<()>> {
+        use std::future::Future;
+        match std::pin::Pin::new(&mut self.stop).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(_) if self.panic_on_stop => {
+                let _witness = PollUnwindWitness(self.unwound.clone());
+                panic!("regeneration poll probe")
+            }
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(None),
+        }
+    }
+}
+impl Drop for OwnerReadingStream {
+    fn drop(&mut self) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("stream:{:?}", self.value.try_get_value()));
+    }
+}
+async fn terminated_regeneration_inner(
+    panic_on_stop: bool,
+    unwound: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> Vec<String> {
+    use std::sync::{Arc, Mutex};
+    let root = temp_site_root("regeneration_eof");
+    let (stop, receiver) = futures::channel::oneshot::channel();
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let app_fn = {
+        let events = events.clone();
+        move || {
+            let events = events.clone();
+            let receiver = receiver.clone();
+            let unwound = unwound.clone();
+            view! { <Router><Routes fallback=|| "missing">
+                <Route path=path!("/terminal") ssr=SsrMode::Static(StaticRoute::new().regenerate(move |_| {
+                    let events_for_cleanup = events.clone();
+                    on_cleanup(move || events_for_cleanup.lock().unwrap().push("owner".to_owned()));
+                    OwnerReadingStream { stop: receiver.lock().unwrap().take().unwrap(), value: StoredValue::new(7), panic_on_stop, unwound: unwound.clone(), events: events.clone() }
+                })) view=|| "terminal"/>
+            </Routes></Router> }
+        }
+    };
+    let routes = crate::generate_route_list(app_fn.clone());
+    let runtime = routes[0].runtime.clone();
+    let app = test::init_service(
+        NtexApp::new()
+            .state(static_options(&root))
+            .configure(|cfg| register_leptos_routes(cfg, routes.clone(), app_fn.clone())),
+    )
+    .await;
+    let response =
+        test::call_service(&app, test::TestRequest::with_uri("/terminal").to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    stop.send(()).unwrap();
+    ntex::time::timeout(
+        ntex::time::Millis(1000),
+        futures::future::poll_fn(|cx| {
+            if events.lock().unwrap().len() == 2 {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("regeneration EOF did not finish its cleanup sequence");
+    drop(runtime);
+    events.lock().unwrap().clone()
+}
+fn terminated_regeneration(panic_on_stop: bool) -> Vec<String> {
+    let unwound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = events.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_ntex(terminated_regeneration_inner(
+            panic_on_stop,
+            unwound.clone(),
+            observed,
+        ))
+    }));
+    if let Err(payload) = result {
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("regeneration poll probe"),
+            "unrelated panic must fail the scenario"
+        );
+    }
+    assert_eq!(
+        unwound.load(std::sync::atomic::Ordering::SeqCst),
+        panic_on_stop,
+        "the stream must actually unwind only for the panic scenario"
+    );
+    events.lock().unwrap().clone()
+}
+lets_expect::lets_expect! {
+    expect(terminated_regeneration(panic_on_stop)) as the_terminated_regeneration_stream {
+        let panic_on_stop = false;
+        to drops_before_its_reactive_values_are_cleaned { equal(vec!["stream:Some(7)".to_owned(), "owner".to_owned()]) }
+        when polling_the_stream_panics {
+            let panic_on_stop = true;
+            to preserves_the_same_cleanup_order { equal(vec!["stream:Some(7)".to_owned(), "owner".to_owned()]) }
+        }
+    }
+}
+async fn static_method_response(
+    configuration: bool,
+    allow_get: bool,
+    method: ntex::http::Method,
+) -> StatusCode {
+    use crate::{LeptosRoutes, NtexRouteListing};
+    let root = temp_site_root("static_method_contract");
+    std::fs::create_dir_all(&*root).unwrap();
+    std::fs::write(root.join("method.html"), "legacy-method").unwrap();
+    let mut methods = vec![leptos_router::Method::Post];
+    if allow_get {
+        methods.push(leptos_router::Method::Get);
+    }
+    let routes = vec![NtexRouteListing::new(
+        "/method".to_owned(),
+        SsrMode::Static(StaticRoute::new()),
+        methods,
+        Vec::new(),
+    )];
+    let app = NtexApp::new().state(
+        LeptosOptions::builder()
+            .output_name("static_method_contract")
+            .site_root(root.to_string_lossy().into_owned())
+            .build(),
+    );
+    let app = if configuration {
+        app.configure(|cfg| {
+            cfg.leptos_routes(routes.clone(), || "rendered");
+        })
+    } else {
+        app.leptos_routes(routes, || "rendered")
+    };
+    let app = test::init_service(app).await;
+    test::call_service(
+        &app,
+        test::TestRequest::with_uri("/method")
+            .method(method)
+            .to_request(),
+    )
+    .await
+    .status()
+}
+lets_expect::lets_expect! {
+    expect(run_ntex(static_method_response(configuration, allow_get, method))) as the_static_method_dispatch {
+        let configuration = false;
+        let allow_get = false;
+        let method = ntex::http::Method::POST;
+        when registered_on_the_app {
+            when only_post_is_listed {
+                to accepts_the_listed_post { equal(StatusCode::OK) }
+                when the_request_is_get { let method = ntex::http::Method::GET; to obeys_the_method_listing { equal(StatusCode::NOT_FOUND) } }
+                when the_request_is_head { let method = ntex::http::Method::HEAD; to obeys_the_method_listing { equal(StatusCode::NOT_FOUND) } }
+            }
+            when get_is_also_listed {
+                let allow_get = true;
+                to accepts_the_listed_post { equal(StatusCode::OK) }
+                when the_request_is_get { let method = ntex::http::Method::GET; to obeys_the_method_listing { equal(StatusCode::OK) } }
+                when the_request_is_head { let method = ntex::http::Method::HEAD; to obeys_the_method_listing { equal(StatusCode::OK) } }
+            }
+        }
+        when registered_on_service_configuration {
+            let configuration = true;
+            when only_post_is_listed {
+                to accepts_the_listed_post { equal(StatusCode::OK) }
+                when the_request_is_get { let method = ntex::http::Method::GET; to obeys_the_method_listing { equal(StatusCode::NOT_FOUND) } }
+                when the_request_is_head { let method = ntex::http::Method::HEAD; to obeys_the_method_listing { equal(StatusCode::NOT_FOUND) } }
+            }
+            when get_is_also_listed {
+                let allow_get = true;
+                to accepts_the_listed_post { equal(StatusCode::OK) }
+                when the_request_is_get { let method = ntex::http::Method::GET; to obeys_the_method_listing { equal(StatusCode::OK) } }
+                when the_request_is_head { let method = ntex::http::Method::HEAD; to obeys_the_method_listing { equal(StatusCode::OK) } }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InheritedRegenerationContext(u8);
+#[derive(Clone)]
+struct AdditionalRegenerationContext(u8);
+#[derive(Clone)]
+struct RenderRegenerationContext(u8);
+
+type RegenerationContext = (Option<u8>, Option<u8>, Option<u8>);
+fn regeneration_context() -> RegenerationContext {
+    (
+        use_context::<InheritedRegenerationContext>().map(|value| value.0),
+        use_context::<AdditionalRegenerationContext>().map(|value| value.0),
+        use_context::<RenderRegenerationContext>().map(|value| value.0),
+    )
+}
+#[derive(Clone, Debug, PartialEq)]
+enum RegenerationScopeEvent {
+    Context(&'static str, RegenerationContext),
+    Drop(RegenerationContext, Option<usize>),
+    Cleanup,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum RegenerationEnd {
+    Eof,
+    Panic,
+}
+#[derive(Clone, Copy)]
+enum RegenerationCommand {
+    Trigger,
+    Finish,
+}
+struct ScopedSubscriptionProbe {
+    commands: futures::channel::mpsc::Receiver<RegenerationCommand>,
+    pending_before: Option<futures::channel::oneshot::Sender<()>>,
+    pending_after: Option<futures::channel::oneshot::Sender<()>>,
+    triggered: bool,
+    end: RegenerationEnd,
+    unwound: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    value: StoredValue<usize>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<RegenerationScopeEvent>>>,
+}
+impl futures::Stream for ScopedSubscriptionProbe {
+    type Item = ();
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<()>> {
+        match futures::Stream::poll_next(std::pin::Pin::new(&mut self.commands), cx) {
+            std::task::Poll::Pending => {
+                let (stage, signal) = if self.triggered {
+                    ("pending_after", self.pending_after.take())
+                } else {
+                    ("pending_before", self.pending_before.take())
+                };
+                if let Some(signal) = signal {
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(RegenerationScopeEvent::Context(
+                            stage,
+                            regeneration_context(),
+                        ));
+                    let _ = signal.send(());
+                }
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(Some(RegenerationCommand::Trigger)) => {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(RegenerationScopeEvent::Context(
+                        "trigger",
+                        regeneration_context(),
+                    ));
+                self.triggered = true;
+                std::task::Poll::Ready(Some(()))
+            }
+            std::task::Poll::Ready(Some(RegenerationCommand::Finish)) => {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(RegenerationScopeEvent::Context(
+                        "terminal",
+                        regeneration_context(),
+                    ));
+                if self.end == RegenerationEnd::Panic {
+                    let _witness = PollUnwindWitness(self.unwound.clone());
+                    panic!("controlled regeneration context panic");
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(None) => panic!("fixture sender must outlive the subscription"),
+        }
+    }
+}
+impl Drop for ScopedSubscriptionProbe {
+    fn drop(&mut self) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(RegenerationScopeEvent::Drop(
+                regeneration_context(),
+                self.value.try_get_value(),
+            ));
+    }
+}
+
+async fn regeneration_scope_inner(
+    startup: bool,
+    end: RegenerationEnd,
+    unwound: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<RegenerationScopeEvent>>>,
+    keep_sender: std::sync::Arc<
+        std::sync::Mutex<Option<futures::channel::mpsc::Sender<RegenerationCommand>>>,
+    >,
+) {
+    use crate::LeptosRoutes;
+    use futures::SinkExt;
+    use std::sync::{Arc, Mutex};
+    let body = async move {
+        let root = temp_site_root("regeneration_scope");
+        let options = static_options(&root);
+        let (mut commands, receiver) = futures::channel::mpsc::channel(1);
+        *keep_sender.lock().unwrap() = Some(commands.clone());
+        let (pending_before, first_pending) = futures::channel::oneshot::channel();
+        let (pending_after, next_pending) = futures::channel::oneshot::channel();
+        let (cleaned, cleanup_done) = futures::channel::oneshot::channel();
+        let controls = Arc::new(Mutex::new(Some((
+            receiver,
+            pending_before,
+            pending_after,
+            cleaned,
+        ))));
+        let app_fn = {
+            let events = events.clone();
+            move || {
+                provide_context(RenderRegenerationContext(79));
+                let events = events.clone();
+                let controls = controls.clone();
+                let unwound = unwound.clone();
+                view! { <Router><Routes fallback=|| "missing">
+                    <Route path=path!("/scope") ssr=SsrMode::Static(StaticRoute::new().regenerate(move |_| {
+                        events.lock().unwrap().push(RegenerationScopeEvent::Context("factory", regeneration_context()));
+                        let (receiver, pending_before, pending_after, cleaned) = controls.lock().unwrap().take().unwrap();
+                        let cleanup_events = events.clone();
+                        on_cleanup(move || {
+                            cleanup_events.lock().unwrap().push(RegenerationScopeEvent::Cleanup);
+                            let _ = cleaned.send(());
+                        });
+                        ScopedSubscriptionProbe {
+                            commands: receiver, pending_before: Some(pending_before), pending_after: Some(pending_after),
+                            triggered: false, end, unwound: unwound.clone(), value: StoredValue::new(7), events: events.clone(),
+                        }
+                    })) view=|| "contextual generation"/>
+                </Routes></Router> }
+            }
+        };
+        let additional = || provide_context(AdditionalRegenerationContext(31));
+        let (routes, generator) =
+            gen_route_list_with_exclusions_and_ssg_and_context(app_fn.clone(), None, additional);
+        if startup {
+            generator.generate(&options).await;
+        } else {
+            drop(generator);
+            let app = test::init_service(
+                NtexApp::new()
+                    .state(options)
+                    .leptos_routes_with_context(routes, additional, app_fn),
+            )
+            .await;
+            let response =
+                test::call_service(&app, test::TestRequest::with_uri("/scope").to_request()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "on-demand initial render"
+            );
+            let _ = test::read_body(response).await;
+        }
+        first_pending
+            .await
+            .expect("subscription reaches initial Pending");
+        commands.send(RegenerationCommand::Trigger).await.unwrap();
+        next_pending
+            .await
+            .expect("regeneration completes before next Pending");
+        commands.send(RegenerationCommand::Finish).await.unwrap();
+        cleanup_done
+            .await
+            .expect("subscription owner cleanup completes");
+    };
+    let caller = Owner::new();
+    caller.with(|| provide_context(InheritedRegenerationContext(53)));
+    let body = caller.with(|| leptos::reactive::computed::ScopedFuture::new(body));
+    crate::owner::OwnerContextFuture::new(body).await;
+}
+
+fn regeneration_scope(startup: bool, end: RegenerationEnd) -> Vec<RegenerationScopeEvent> {
+    let unwound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let panic_witness = unwound.clone();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = events.clone();
+    let keep_sender = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let kept = keep_sender.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_ntex(async move {
+            ntex::time::timeout(
+                ntex::time::Millis(2000),
+                regeneration_scope_inner(startup, end, panic_witness, observed, kept),
+            )
+            .await
+            .expect("controlled subscription lifecycle completes");
+        })
+    }));
+    assert_eq!(
+        unwound.load(std::sync::atomic::Ordering::SeqCst),
+        end == RegenerationEnd::Panic,
+        "the subscription must actually unwind only for the panic scenario"
+    );
+    if let Err(payload) = outcome {
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("controlled regeneration context panic"),
+            "a timeout or unrelated panic must not satisfy the terminal scenario"
+        );
+    }
+    drop(keep_sender);
+    events.lock().unwrap().clone()
+}
+fn preserves_regeneration_scope(
+    actual: &Vec<RegenerationScopeEvent>,
+) -> lets_expect::AssertionResult {
+    // Each SSR render gets a new root Owner: unrelated caller context must not
+    // cross that boundary, while additional and render context must survive.
+    let context = (None, Some(31), Some(79));
+    lets_expect::equal(vec![
+        RegenerationScopeEvent::Context("factory", context),
+        RegenerationScopeEvent::Context("pending_before", context),
+        RegenerationScopeEvent::Context("trigger", context),
+        RegenerationScopeEvent::Context("pending_after", context),
+        RegenerationScopeEvent::Context("terminal", context),
+        RegenerationScopeEvent::Drop(context, Some(7)),
+        RegenerationScopeEvent::Cleanup,
+    ])(actual)
+}
+lets_expect::lets_expect! {
+    expect(regeneration_scope(startup, end)) as reactive_scope_of_static_regeneration {
+        let startup = true;
+        let end = RegenerationEnd::Eof;
+        to preserves_its_scope_through_completion { preserves_regeneration_scope }
+        when subscription_poll_panics {
+            let end = RegenerationEnd::Panic;
+            to preserves_its_scope_during_unwind { preserves_regeneration_scope }
+        }
+        when first_render_is_on_demand {
+            let startup = false;
+            to preserves_its_scope_through_completion { preserves_regeneration_scope }
+            when subscription_poll_panics {
+                let end = RegenerationEnd::Panic;
+                to preserves_its_scope_during_unwind { preserves_regeneration_scope }
+            }
+        }
+    }
 }

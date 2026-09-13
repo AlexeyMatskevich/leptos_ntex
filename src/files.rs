@@ -14,7 +14,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::render::{async_stream_builder, provide_contexts};
-use crate::request::Request;
 use crate::response::{NtexResponse, ResponseOptions};
 use crate::routes::ensure_executor_initialized;
 
@@ -38,7 +37,8 @@ use crate::routes::ensure_executor_initialized;
 /// If `.br` / `.gz` siblings exist, they are served when the request's
 /// `Accept-Encoding` allows them. File responses are still built with
 /// [`ntex_files::NamedFile`], so MIME, ETag, Last-Modified, ranges, and
-/// conditional requests remain delegated to `ntex-files`.
+/// streaming remain provided by `ntex-files`. The adapter evaluates request
+/// preconditions before ranges, including HEAD and If-Range semantics.
 pub fn site_pkg_dir_service<Err>(options: &LeptosOptions) -> ntex::web::Scope<Err>
 where
     Err: ErrorRenderer,
@@ -51,7 +51,7 @@ where
     // root realpath on every asset request. Same lifetime/symlink semantics
     // as `ntex_files::Files::new`, which canonicalizes its base at
     // construction: a deploy that swaps the root symlink needs a restart.
-    let canon_root: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
+    let canon_root: Arc<RootCache> = Arc::new(OnceLock::new());
     ntex::web::scope(prefix.clone()).route(
         "/{tail}*",
         Route::<Err>::new()
@@ -69,8 +69,8 @@ where
                         .to_owned();
                     let encodings = accepted_encodings(&req);
                     let opened = ntex::rt::spawn_blocking(move || {
-                        let canon_root = cached_canon_root(&canon_root, &dir)?;
-                        open_static_file(&canon_root, &raw_path, encodings)
+                        let root = cached_site_root(&canon_root, &dir)?;
+                        open_static_file(&root, &raw_path, encodings)
                     })
                     .await
                     .unwrap_or_else(|join_err| {
@@ -79,11 +79,20 @@ where
                     });
 
                     if let Some(opened) = opened {
-                        let mut res = opened.file.into_response(&req);
+                        let opened = match opened {
+                            Ok(opened) => opened,
+                            Err(()) => {
+                                let mut response = HttpResponse::NotAcceptable().finish();
+                                ensure_encoding_vary(&mut response);
+                                return response;
+                            }
+                        };
+                        let mut res = file_response(opened.file, &req, StatusCode::OK);
                         if let Some(content_encoding) = opened.content_encoding {
                             ensure_precompressed_headers(&mut res, content_encoding);
                         }
-                        res
+                        ensure_encoding_vary(&mut res);
+                        crate::stream::terminate_on_body_error(&req, res)
                     } else {
                         HttpResponse::NotFound().finish()
                     }
@@ -228,6 +237,11 @@ struct AcceptedEncodings {
     br: Option<f32>,
     /// Effective q-weight the client gave `gzip` (same rules as `br`).
     gzip: Option<f32>,
+    identity: bool,
+    /// Adapter policy: an explicit identity weight competes with compressed
+    /// codings. An unspecified weight leaves identity as a fallback, unless
+    /// the wildcard excludes it with `*;q=0`.
+    identity_q: Option<f32>,
 }
 
 /// A precompressed sibling variant of a static file (`<file>.br` /
@@ -288,6 +302,7 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
     let mut br_q = None;
     let mut gzip_q = None;
     let mut wildcard_q = None;
+    let mut identity_q = None;
 
     for value in req.headers().get_all(header::ACCEPT_ENCODING) {
         let Ok(value) = value.to_str() else {
@@ -318,6 +333,8 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
                 br_q = Some(q);
             } else if token.eq_ignore_ascii_case("gzip") {
                 gzip_q = Some(q);
+            } else if token.eq_ignore_ascii_case("identity") {
+                identity_q = Some(q);
             } else if token == "*" {
                 wildcard_q = Some(q);
             }
@@ -327,32 +344,34 @@ fn accepted_encodings(req: &HttpRequest) -> AcceptedEncodings {
     AcceptedEncodings {
         br: br_q.or(wildcard_q).filter(|q| *q > 0.0),
         gzip: gzip_q.or(wildcard_q).filter(|q| *q > 0.0),
+        identity: identity_q.map_or(wildcard_q != Some(0.0), |q| q > 0.0),
+        identity_q,
     }
-}
-
-fn canonical_under(canon_root: &Path, path: &Path) -> Option<PathBuf> {
-    let path = path.canonicalize().ok()?;
-    path.starts_with(canon_root).then_some(path)
 }
 
 /// Returns the canonicalized `dir`, resolving it at most once and caching it
 /// in `cache`. The root never changes for the life of the app, so re-running
-/// the full realpath walk on every request is pure waste; the per-request
-/// canonicalize of the *target* (in [`safe_subpath`]) is what actually
-/// enforces the symlink-escape guard and stays per-request. Blocking I/O —
+/// the full realpath walk on every request is unnecessary. Per-request target
+/// resolution proposes a relative path; the final capability-relative open
+/// enforces containment even if the namespace changes afterward. Blocking I/O —
 /// only call from a blocking executor. Caching is lazy because the directory
 /// may not exist when the service is built.
-fn cached_canon_root(cache: &OnceLock<PathBuf>, dir: &Path) -> Option<PathBuf> {
-    if let Some(canon) = cache.get() {
-        return Some(canon.clone());
+/// The served root, resolved and opened once: its canonical path anchors
+/// request-path validation and its directory capability opens every file, so
+/// a request pays neither a realpath walk nor a directory open.
+type RootCache = OnceLock<Arc<crate::fs_boundary::SiteRoot>>;
+
+fn cached_site_root(cache: &RootCache, dir: &Path) -> Option<Arc<crate::fs_boundary::SiteRoot>> {
+    if let Some(root) = cache.get() {
+        return Some(root.clone());
     }
-    let canon = dir.canonicalize().ok()?;
+    let root = Arc::new(crate::fs_boundary::SiteRoot::open(dir).ok()?);
     // A racing worker may win `set`. Return the STORED value rather than this
-    // call's `canon`, so every caller observes the one cached root even if the
+    // call's root, so every caller observes the one cached root even if the
     // root symlink changed between two concurrent first-resolutions. `set`
-    // either stores `canon` or fails because a value is already present —
+    // either stores `root` or fails because a value is already present —
     // either way the cache now holds exactly one root, so `get` yields it.
-    let _ = cache.set(canon);
+    let _ = cache.set(root);
     cache.get().cloned()
 }
 
@@ -368,44 +387,63 @@ pub(crate) fn warn_blocking_join_failed(context: &str, err: &impl std::fmt::Disp
 }
 
 fn open_static_file(
-    canon_root: &Path,
+    root: &crate::fs_boundary::SiteRoot,
     raw_path: &str,
     accepted_encodings: AcceptedEncodings,
-) -> Option<OpenedStaticFile> {
-    let safe = safe_subpath(canon_root, raw_path)?;
+) -> Option<Result<OpenedStaticFile, ()>> {
+    let safe = safe_subpath(root.canonical(), raw_path)?;
     let mime = safe
         .extension()
         .and_then(|ext| ext.to_str())
         .map(ntex_files::file_extension_to_mime);
 
     for variant in precompressed_preference(accepted_encodings) {
-        if let Some(compressed) =
-            canonical_under(canon_root, &compressed_path(&safe, variant.extension()))
-            && let Ok(mut file) = ntex_files::NamedFile::open(&compressed)
+        let weight = match variant {
+            Precompressed::Br => accepted_encodings.br,
+            Precompressed::Gzip => accepted_encodings.gzip,
+        }
+        .unwrap_or_default();
+        if accepted_encodings
+            .identity_q
+            .is_some_and(|identity| identity > weight)
+        {
+            continue;
+        }
+        let compressed = compressed_path(&safe, variant.extension());
+        if let Ok(mut file) = root
+            .open_file(&compressed)
+            .and_then(|file| ntex_files::NamedFile::from_file(file, &safe))
         {
             file = file.set_content_encoding(variant.content_encoding());
             if let Some(mime) = mime.clone() {
                 file = file.set_content_type(mime);
             }
-            return Some(OpenedStaticFile {
+            return Some(Ok(OpenedStaticFile {
                 file,
                 content_encoding: Some(variant.header_value()),
-            });
+            }));
         }
     }
 
-    Some(OpenedStaticFile {
-        file: ntex_files::NamedFile::open(&safe).ok()?,
+    if !accepted_encodings.identity {
+        return Some(Err(()));
+    }
+    Some(Ok(OpenedStaticFile {
+        file: ntex_files::NamedFile::from_file(root.open_file(&safe).ok()?, &safe).ok()?,
         content_encoding: None,
-    })
+    }))
 }
 
+// Callers add `Vary: Accept-Encoding` once for every negotiated response,
+// including identity and refusals, so this only records the selected coding.
 fn ensure_precompressed_headers(res: &mut ntex::web::HttpResponse, content_encoding: &'static str) {
     res.headers_mut().insert(
         header::CONTENT_ENCODING,
         HeaderValue::from_static(content_encoding),
     );
+}
 
+fn ensure_encoding_vary(res: &mut HttpResponse) {
     let already_present = res
         .headers()
         .get_all(header::VARY)
@@ -421,8 +459,212 @@ fn ensure_precompressed_headers(res: &mut ntex::web::HttpResponse, content_encod
     }
 }
 
+/// Applies HTTP preconditions before ranges, containing ntex-files 3.2.0's
+/// empty-range panic and its HEAD/If-Range/precondition-order defects. Keep the
+/// request projection until a dependency update passes the regression matrix.
+pub(crate) fn file_response(
+    mut file: ntex_files::NamedFile,
+    req: &HttpRequest,
+    base_status: StatusCode,
+) -> HttpResponse {
+    use ntex::http::Method;
+    let head_or_get = req.method() == Method::GET || req.method() == Method::HEAD;
+    if base_status.is_redirection()
+        && [
+            header::RANGE,
+            header::IF_NONE_MATCH,
+            header::IF_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::IF_UNMODIFIED_SINCE,
+        ]
+        .iter()
+        .any(|name| req.headers().contains_key(name))
+    {
+        return HttpResponse::build(base_status).finish();
+    }
+    let unsupported_modified = file
+        .file()
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .map_or(true, |duration| duration.as_secs() >= 253_402_300_800)
+        });
+    if unsupported_modified {
+        // ntex-files and httpdate cannot format dates outside 1970..9999.
+        // Omit validators rather than panic or invent a modification time.
+        file = file.use_etag(false).use_last_modified(false);
+    }
+    if [
+        header::RANGE,
+        header::IF_RANGE,
+        header::IF_MATCH,
+        header::IF_NONE_MATCH,
+        header::IF_UNMODIFIED_SINCE,
+        header::IF_MODIFIED_SINCE,
+    ]
+    .iter()
+    .all(|name| !req.headers().contains_key(name))
+    {
+        let mut response = file.into_response(req);
+        if response.status() == StatusCode::OK {
+            *response.status_mut() = base_status;
+        }
+        return response;
+    }
+
+    let mut request = ntex::web::test::TestRequest::default().method(req.method().clone());
+    for (name, value) in req.headers().iter() {
+        if !base_status.is_success()
+            || (name != header::IF_MODIFIED_SINCE && name != header::IF_UNMODIFIED_SINCE)
+            || (name == header::IF_UNMODIFIED_SINCE && req.headers().contains_key(header::IF_MATCH))
+            || (name == header::IF_MODIFIED_SINCE && !head_or_get)
+        {
+            continue;
+        }
+        request = request.header(name.clone(), value.clone());
+    }
+    // Entity-tag fields have list semantics; NamedFile only reads one
+    // field line, so preserve every member by presenting one combined value.
+    if base_status.is_success() {
+        for name in [header::IF_MATCH, header::IF_NONE_MATCH] {
+            let mut combined = Vec::new();
+            for value in req.headers().get_all(&name) {
+                if !combined.is_empty() {
+                    combined.extend_from_slice(b", ");
+                }
+                combined.extend_from_slice(value.as_bytes());
+            }
+            if !combined.is_empty() {
+                let Ok(value) = HeaderValue::from_bytes(&combined) else {
+                    return HttpResponse::BadRequest().finish();
+                };
+                request = request.header(name, value);
+            }
+        }
+    }
+    let projected = request.to_http_request();
+    let range = req
+        .headers()
+        .get(header::RANGE)
+        .filter(|_| req.method() == Method::GET && base_status == StatusCode::OK)
+        .filter(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|text| text.split_once('='))
+                .is_none_or(|(unit, _)| unit.eq_ignore_ascii_case("bytes"))
+        });
+    if let Some(range) = range {
+        let clone = match file
+            .file()
+            .try_clone()
+            .and_then(|clone| ntex_files::NamedFile::from_file(clone, file.path()))
+        {
+            Ok(clone) => clone
+                .use_etag(!unsupported_modified)
+                .use_last_modified(!unsupported_modified),
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        };
+        let preview = clone.into_response(&projected);
+        if matches!(
+            preview.status(),
+            StatusCode::NOT_MODIFIED | StatusCode::PRECONDITION_FAILED
+        ) {
+            return file.into_response(&projected);
+        }
+        let if_range_matches = req.headers().get(header::IF_RANGE).is_none_or(|condition| {
+            let Ok(condition) = condition.to_str() else {
+                return false;
+            };
+            if condition.starts_with('"') || condition.starts_with("W/") {
+                !condition.starts_with("W/")
+                    && preview
+                        .headers()
+                        .get(header::ETAG)
+                        .is_some_and(|etag| etag.as_bytes() == condition.as_bytes())
+            } else {
+                use ntex_files::header::{self as file_header, Header};
+                let parsed = condition.parse::<file_header::HttpDate>();
+                match parsed {
+                    Ok(since) => preview
+                        .headers()
+                        .get(header::LAST_MODIFIED)
+                        .and_then(|value| {
+                            file_header::LastModified::parse_header(&file_header::Raw::from(
+                                value.as_bytes(),
+                            ))
+                            .ok()
+                        })
+                        // RFC 9110 section 13.1.5 requires an exact date match
+                        // for If-Range, unlike If-Unmodified-Since.
+                        .is_some_and(|file_header::LastModified(modified)| modified == since),
+                    _ => false,
+                }
+            }
+        });
+        if if_range_matches {
+            let size = match file.file().metadata() {
+                Ok(meta) => meta.len(),
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
+            let Ok(text) = range.to_str() else {
+                return HttpResponse::BadRequest().finish();
+            };
+            let normalized = text
+                .split_once('=')
+                .map(|(_, ranges)| format!("bytes={ranges}"))
+                .unwrap_or_else(|| text.to_owned());
+            let parsed = if size == 0 {
+                None
+            } else {
+                ntex_files::HttpRange::parse(&normalized, size).ok()
+            };
+            let selected = parsed
+                .as_ref()
+                .and_then(|ranges| ranges.first())
+                .filter(|range| {
+                    range.length > 0 && range.start < size && range.length <= size - range.start
+                });
+            let Some(selected) = selected else {
+                let mut response = HttpResponse::RangeNotSatisfiable();
+                response.header(header::CONTENT_RANGE, format!("bytes */{size}"));
+                return response.finish();
+            };
+            let mut ranged = ntex::web::test::TestRequest::default().method(Method::GET);
+            for (name, value) in projected.headers().iter() {
+                ranged = ranged.header(name.clone(), value.clone());
+            }
+            // ntex-files supports a single range. Normalize the selected range
+            // to avoid suffix underflow/empty vectors in its parser.
+            ranged = ranged.header(
+                header::RANGE,
+                format!(
+                    "bytes={}-{}",
+                    selected.start,
+                    selected.start + selected.length - 1
+                ),
+            );
+            let mut response = file.into_response(&ranged.to_http_request());
+            if response.status() == StatusCode::OK {
+                *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            }
+            return response;
+        }
+    }
+    let mut response = file.into_response(&projected);
+    if response.status() == StatusCode::NOT_MODIFIED && !head_or_get {
+        *response.status_mut() = StatusCode::PRECONDITION_FAILED;
+    } else if response.status() == StatusCode::OK {
+        *response.status_mut() = base_status;
+    }
+    response
+}
+
 /// Variant of [`file_and_error_handler`] that injects additional values
-/// into the reactive context before rendering the shell on a miss.
+/// into the reactive context for a file response, a negotiation refusal, or
+/// the rendered shell on a miss. The callback runs once after context setup;
+/// supplied [`ResponseOptions`] apply to each of these responses.
 pub fn file_and_error_handler_with_context<IV, Err>(
     additional_context: impl Fn() + 'static + Clone + Send,
     shell: impl Fn(LeptosOptions) -> IV + 'static + Clone + Send,
@@ -433,8 +675,9 @@ where
     Err::Container: From<StateExtractorError>,
 {
     ensure_executor_initialized();
-    // Cache the canonical site root across requests (see `cached_canon_root`).
-    let canon_root: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
+    crate::request::check_registration_scope();
+    // Cache the opened site root across requests (see `cached_site_root`).
+    let canon_root: Arc<RootCache> = Arc::new(OnceLock::new());
     let handler = move |req: HttpRequest, state: web::types::State<LeptosOptions>| {
         let shell = shell.clone();
         let additional_context = additional_context.clone();
@@ -446,8 +689,8 @@ where
 
             let encodings = accepted_encodings(&req);
             let opened = ntex::rt::spawn_blocking(move || {
-                let canon_root = cached_canon_root(&canon_root, &site_root)?;
-                open_static_file(&canon_root, &uri_path, encodings)
+                let root = cached_site_root(&canon_root, &site_root)?;
+                open_static_file(&root, &uri_path, encodings)
             })
             .await
             .unwrap_or_else(|join_err| {
@@ -455,29 +698,39 @@ where
                 None
             });
 
+            let req_ctx = match crate::request::scoped_request(&req) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
             if let Some(opened) = opened {
                 let res_options = ResponseOptions::default();
-                let req_ctx = Request::new(&req);
-                let owner = Owner::new();
-                return owner.with(|| {
+                let _restore = crate::owner::RestoreOwner::capture();
+                let owner = crate::owner::OwnerCleanup::new(Owner::new());
+                return owner.owner().with(|| {
                     provide_context(req_ctx);
                     provide_context(res_options.clone());
                     additional_context();
 
-                    let mut res = opened.file.into_response(&req);
-                    if let Some(content_encoding) = opened.content_encoding {
-                        ensure_precompressed_headers(&mut res, content_encoding);
-                    }
+                    let mut res = match opened {
+                        Ok(opened) => {
+                            let mut res = file_response(opened.file, &req, StatusCode::OK);
+                            if let Some(content_encoding) = opened.content_encoding {
+                                ensure_precompressed_headers(&mut res, content_encoding);
+                            }
+                            res
+                        }
+                        Err(()) => HttpResponse::NotAcceptable().finish(),
+                    };
+                    ensure_encoding_vary(&mut res);
                     let mut res = NtexResponse(res);
                     res.extend_response(&res_options);
-                    res.take()
+                    crate::stream::terminate_on_body_error(&req, res.take())
                 });
             }
 
             let res_options = ResponseOptions::default();
             res_options.set_status(StatusCode::NOT_FOUND);
             let (meta_context, meta_output) = ServerMetaContext::new();
-            let req_ctx = Request::new(&req);
 
             let cx = {
                 let meta_context = meta_context.clone();
@@ -539,6 +792,8 @@ mod tests {
         }
         let mut res = builder.finish();
         ensure_precompressed_headers(&mut res, "br");
+        // Every negotiated response passes through ensure_encoding_vary once.
+        ensure_encoding_vary(&mut res);
         res.headers()
             .get_all(header::VARY)
             .filter_map(|v| v.to_str().ok())
@@ -627,18 +882,7 @@ mod tests {
     // stays rejected. Exercises the guard through the real `canonicalize()`
     // (a throwaway site root is built per leaf, holding the two probe files).
     fn resolves_under_root(path: &str) -> bool {
-        // Unique per call: a nanosecond timestamp alone collides when several
-        // of these leaves run concurrently (the clock resolution is coarser
-        // than the spawn interval), so two threads would share one temp root
-        // and race each other's create/remove. A process-scoped atomic
-        // counter makes the path unique regardless of timing.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static UNIQUE: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "leptos_ntex_safe_subpath_{}_{}",
-            std::process::id(),
-            UNIQUE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = crate::tests::temp_site_root("safe_subpath");
         std::fs::create_dir_all(root.join(".well-known")).unwrap();
         std::fs::write(root.join(".well-known/security.txt"), "ok").unwrap();
         std::fs::write(root.join(".env"), "secret").unwrap();
@@ -662,9 +906,7 @@ mod tests {
         #[cfg(unix)]
         std::fs::write(root.join("foo\\bar"), "backslash-target").unwrap();
         let canon_root = root.canonicalize().unwrap();
-        let resolved = safe_subpath(&canon_root, path).is_some();
-        let _ = std::fs::remove_dir_all(&root);
-        resolved
+        safe_subpath(&canon_root, path).is_some()
     }
 
     lets_expect! {
@@ -745,161 +987,121 @@ mod tests {
     }
 
     lets_expect! {
-        expect(preference(accept_encoding)) as the_encoding_preference {
+        expect(preference(accept_encoding)) as the_offered_encoding_names {
             let accept_encoding: &[&str] = &["br, gzip"];
-
             to prefers_brotli_on_an_implicit_tie { equal(vec!["br", "gzip"]) }
-
             when no_accept_encoding_is_sent {
                 let accept_encoding: &[&str] = &[];
                 to accepts_neither { equal(Vec::<&str>::new()) }
             }
-
             when only_brotli_is_offered {
                 let accept_encoding: &[&str] = &["br"];
                 to accepts_brotli_alone { equal(vec!["br"]) }
             }
-
             when only_gzip_is_offered {
                 let accept_encoding: &[&str] = &["gzip"];
                 to accepts_gzip_alone { equal(vec!["gzip"]) }
             }
-
+            when an_unrelated_encoding_is_offered {
+                let accept_encoding: &[&str] = &["deflate"];
+                to accepts_neither { equal(Vec::<&str>::new()) }
+            }
+        }
+        expect(preference(accept_encoding)) as the_relative_encoding_weights {
+            let accept_encoding: &[&str] = &["br, gzip"];
+            to prefers_brotli_on_an_implicit_tie { equal(vec!["br", "gzip"]) }
             when gzip_outweighs_brotli {
                 let accept_encoding: &[&str] = &["gzip;q=1, br;q=0.1"];
                 to prefers_gzip { equal(vec!["gzip", "br"]) }
             }
-
             when brotli_outweighs_gzip {
                 let accept_encoding: &[&str] = &["br;q=0.9, gzip;q=0.2"];
                 to prefers_brotli { equal(vec!["br", "gzip"]) }
             }
-
             when both_share_an_explicit_q {
                 let accept_encoding: &[&str] = &["gzip;q=0.5, br;q=0.5"];
                 to ties_break_to_brotli { equal(vec!["br", "gzip"]) }
             }
-
-            when a_wildcard_is_offered {
-                let accept_encoding: &[&str] = &["*"];
-                to accepts_both { equal(vec!["br", "gzip"]) }
+            when brotli_is_explicitly_refused {
+                let accept_encoding: &[&str] = &["br;q=0, gzip"];
+                to accepts_gzip_only { equal(vec!["gzip"]) }
             }
-
+            when gzip_is_explicitly_refused {
+                let accept_encoding: &[&str] = &["br, gzip;q=0"];
+                to accepts_brotli_only { equal(vec!["br"]) }
+            }
+        }
+        expect(preference(accept_encoding)) as the_encoding_wildcard {
+            let accept_encoding: &[&str] = &["*"];
+            to accepts_both { equal(vec!["br", "gzip"]) }
             when a_wildcard_backfills_only_the_missing_token {
                 let accept_encoding: &[&str] = &["br;q=0.2, *;q=0.9"];
                 to ranks_the_explicit_q_below_the_wildcard {
                     equal(vec!["gzip", "br"])
                 }
             }
-
-            when an_unrelated_encoding_is_offered {
-                let accept_encoding: &[&str] = &["deflate"];
-                to accepts_neither { equal(Vec::<&str>::new()) }
-            }
-
-            when brotli_is_explicitly_refused {
-                let accept_encoding: &[&str] = &["br;q=0, gzip"];
-                to accepts_gzip_only { equal(vec!["gzip"]) }
-            }
-
-            when gzip_is_explicitly_refused {
-                let accept_encoding: &[&str] = &["br, gzip;q=0"];
-                to accepts_brotli_only { equal(vec!["br"]) }
-            }
-
             when the_wildcard_is_refused {
                 let accept_encoding: &[&str] = &["*;q=0"];
                 to accepts_neither { equal(Vec::<&str>::new()) }
             }
-
+            when brotli_is_refused_but_a_wildcard_is_offered {
+                let accept_encoding: &[&str] = &["br;q=0, *;q=1"];
+                to keeps_brotli_refused_and_accepts_gzip { equal(vec!["gzip"]) }
+            }
+            when gzip_is_refused_but_a_wildcard_is_offered {
+                let accept_encoding: &[&str] = &["gzip;q=0, *;q=1"];
+                to keeps_gzip_refused_and_accepts_brotli { equal(vec!["br"]) }
+            }
+        }
+        expect(preference(accept_encoding)) as the_encoding_header_spelling {
+            let accept_encoding: &[&str] = &["br, gzip"];
+            to recognizes_canonical_tokens { equal(vec!["br", "gzip"]) }
             when tokens_are_mixed_case {
                 let accept_encoding: &[&str] = &["BR, GZip;Q=0.5"];
                 to matches_case_insensitively { equal(vec!["br", "gzip"]) }
             }
-
-            when the_q_value_is_malformed {
-                let accept_encoding: &[&str] = &["gzip;q=abc, br;q=0.5"];
-                to treats_the_malformed_q_as_full_weight {
-                    equal(vec!["gzip", "br"])
-                }
+            when the_encodings_span_two_header_lines {
+                let accept_encoding: &[&str] = &["br", "gzip"];
+                to merges_both_lines { equal(vec!["br", "gzip"]) }
             }
-
+            when the_quality_param_name_is_uppercase {
+                let accept_encoding: &[&str] = &["br;q=0.9, gzip;Q=0.1"];
+                to honours_the_uppercase_q_name { equal(vec!["br", "gzip"]) }
+            }
+        }
+        expect(preference(accept_encoding)) as the_malformed_encoding_quality {
+            let accept_encoding: &[&str] = &["gzip;q=abc, br;q=0.5"];
+            to treats_the_malformed_q_as_full_weight { equal(vec!["gzip", "br"]) }
             when the_q_value_is_out_of_range {
                 let accept_encoding: &[&str] = &["gzip;q=2, br;q=1"];
                 to treats_it_as_malformed_and_ties_at_full_weight {
                     equal(vec!["br", "gzip"])
                 }
             }
-
             when the_q_value_is_not_finite {
                 let accept_encoding: &[&str] = &["gzip;q=nan, br;q=0.5"];
                 to treats_it_as_malformed_and_keeps_full_weight {
                     equal(vec!["gzip", "br"])
                 }
             }
-
-            when the_encodings_span_two_header_lines {
-                let accept_encoding: &[&str] = &["br", "gzip"];
-                to merges_both_lines { equal(vec!["br", "gzip"]) }
-            }
-
-            // Discriminating q-NAME-case leaf: with the param name `Q`
-            // recognized, gzip=0.1 < br=0.9 → [br, gzip]; if `Q` were NOT
-            // recognized, gzip would keep its default 1.0 and outrank br →
-            // [gzip, br]. (The mixed-case leaf above can't tell these apart.)
-            when the_quality_param_name_is_uppercase {
-                let accept_encoding: &[&str] = &["br;q=0.9, gzip;Q=0.1"];
-                to honours_the_uppercase_q_name { equal(vec!["br", "gzip"]) }
-            }
-
-            // An explicit refusal must beat the wildcard backfill: `or(wildcard)`
-            // runs BEFORE `filter(q>0)`, so a refused token stays refused even
-            // when `*` is offered, and the wildcard only backfills the OTHER.
-            when brotli_is_refused_but_a_wildcard_is_offered {
-                let accept_encoding: &[&str] = &["br;q=0, *;q=1"];
-                to keeps_brotli_refused_and_accepts_gzip { equal(vec!["gzip"]) }
-            }
-
-            when gzip_is_refused_but_a_wildcard_is_offered {
-                let accept_encoding: &[&str] = &["gzip;q=0, *;q=1"];
-                to keeps_gzip_refused_and_accepts_brotli { equal(vec!["br"]) }
-            }
-
-            // A token repeated across the header is last-write-wins.
-            when a_token_is_repeated_then_refused {
-                let accept_encoding: &[&str] = &["br;q=0.9, br;q=0"];
-                to takes_the_last_weight_and_refuses { equal(Vec::<&str>::new()) }
-            }
-
+        }
+        expect(preference(accept_encoding)) as the_repeated_encoding_token {
+            let accept_encoding: &[&str] = &["br;q=0.9, br;q=0"];
+            to takes_the_last_weight_and_refuses { equal(Vec::<&str>::new()) }
             when a_token_is_refused_then_re_offered {
                 let accept_encoding: &[&str] = &["br;q=0, br;q=0.9"];
                 to takes_the_last_weight_and_accepts { equal(vec!["br"]) }
             }
-
-            // A leading/trailing/doubled comma produces an empty
-            // `split(',')` item; `token` becomes `""`, which must match
-            // neither the `br`/`gzip` branches nor the `*` wildcard branch —
-            // it is silently ignored, not silently accepted. These three
-            // leaves deliberately offer ONLY `gzip` (never `br`), so a
-            // regression that let the empty token wrongly match the
-            // wildcard branch (e.g. `token.is_empty() || token == "*"`)
-            // would backfill `br` too and diverge from the expected
-            // single-element result — a fixture that also offered `br`
-            // explicitly would pass either way and not isolate the bug.
-            when the_header_has_a_leading_comma {
-                let accept_encoding: &[&str] = &[",gzip"];
-                to ignores_the_leading_empty_item_and_does_not_backfill_brotli {
-                    equal(vec!["gzip"])
-                }
-            }
-
+        }
+        expect(preference(accept_encoding)) as the_empty_encoding_list_item {
+            let accept_encoding: &[&str] = &[",gzip"];
+            to ignores_the_leading_empty_item { equal(vec!["gzip"]) }
             when the_header_has_a_trailing_comma {
                 let accept_encoding: &[&str] = &["gzip,"];
                 to ignores_the_trailing_empty_item_and_does_not_backfill_brotli {
                     equal(vec!["gzip"])
                 }
             }
-
             when the_header_has_a_whitespace_only_item {
                 let accept_encoding: &[&str] = &["gzip,   "];
                 to ignores_the_whitespace_only_item_and_does_not_backfill_brotli {

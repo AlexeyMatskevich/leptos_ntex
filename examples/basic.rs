@@ -69,8 +69,15 @@ fn shell() -> impl IntoView {
     }
 }
 
-#[ntex::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    ntex::rt::System::new(
+        "leptos-ntex",
+        leptos_ntex_unofficial::RequestRuntime::new(ntex::rt::DefaultRuntime),
+    )
+    .block_on(run())
+}
+
+async fn run() -> std::io::Result<()> {
     let routes = generate_route_list(App);
 
     web::server(move || {

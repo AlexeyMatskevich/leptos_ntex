@@ -25,9 +25,18 @@ use leptos_router::{
     path,
     static_routes::StaticRoute,
 };
+use lets_expect::*;
+use ntex::http::{
+    Method, StatusCode,
+    header::{CONTENT_TYPE, HeaderMap},
+};
 use ntex::web::{App as NtexApp, test};
 use server_fn::ServerFn;
 use server_fn::codec::Cbor;
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+};
 
 #[component]
 fn App() -> impl IntoView {
@@ -81,436 +90,6 @@ pub async fn sum_two(a: i32, b: i32) -> Result<i32, ServerFnError> {
     Ok(a + b)
 }
 
-fn temp_site_root(name: &str) -> std::path::PathBuf {
-    // A nanosecond timestamp alone collides when several parallel
-    // `cargo-mutants` processes sharing the same temp dir request a root
-    // within one clock tick, so the path carries the pid plus a
-    // process-scoped atomic counter instead (the same pattern as the
-    // in-crate `tests::temp_site_root` and `files::resolves_under_root`).
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static UNIQUE: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "leptos_ntex_integration_{name}_{}_{}",
-        std::process::id(),
-        UNIQUE.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-fn server_url(srv: &test::TestServer, uri: &str) -> String {
-    // `TestServer::url` goes through `localhost`, while these tests want the
-    // exact socket address ntex bound so CI does not add resolver noise.
-    if uri.starts_with('/') {
-        format!("http://{}{}", srv.addr(), uri)
-    } else {
-        format!("http://{}/{}", srv.addr(), uri)
-    }
-}
-
-#[ntex::test]
-async fn real_server_renders_ssr() {
-    let srv = test::server(move || {
-        let routes = generate_route_list(App);
-        async move {
-            NtexApp::new().configure(move |cfg| {
-                register_leptos_routes(cfg, routes.clone(), shell);
-            })
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Integration Home"));
-    assert!(html.contains("<title>Home</title>"));
-}
-
-/// `/about` (plain `OutOfOrder` SSR) and `/static` (`SsrMode::Static`) are
-/// both declared on the shared `App` and registered by every
-/// `generate_route_list`/`register_leptos_routes` pairing in this file, but
-/// were otherwise never requested here. `/static` in particular takes the
-/// `is_static` branch in `leptos_routes.rs`, routing through
-/// `handle_static_route` rather than the stream renderers — proving that
-/// wiring end-to-end over the real TCP path (the in-crate
-/// `static_route_served_over_http` test covers the same handler via
-/// `test::call_service`, not a real listener).
-#[ntex::test]
-async fn real_server_renders_about_and_static_routes() {
-    let site_root = temp_site_root("about_and_static");
-    std::fs::create_dir_all(&site_root).unwrap();
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_integration_about_and_static")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    let srv = test::server(move || {
-        let routes = generate_route_list(App);
-        let options = options.clone();
-        async move {
-            NtexApp::new().state(options.clone()).configure(move |cfg| {
-                register_leptos_routes(cfg, routes.clone(), shell);
-            })
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/about"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    // Pin the rendered tag exactly, not just the bare text, so a
-    // substring-matching wrong page cannot slip through (full-body exact
-    // match would be impractically brittle against hydration-script churn).
-    assert!(html.contains("<h1>Integration About</h1>"));
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/static"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("<h1>Integration Static</h1>"));
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-#[ntex::test]
-async fn real_server_serves_server_fn_through_catchall_alongside_leptos_routes() {
-    register_explicit::<SumTwo>();
-
-    let srv = test::server(move || {
-        let routes = generate_route_list(App);
-        async move {
-            NtexApp::new()
-                .route("/api/{tail}*", handle_server_fns())
-                .configure(move |cfg| {
-                    register_leptos_routes(cfg, routes.clone(), shell);
-                })
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::POST, server_url(&srv, SumTwo::PATH))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .send_body("a=3&b=4")
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    // Exact, not substring: the Json codec serializes `Ok(7)` as the bare
-    // number `7`, and `contains("7")` would also pass for 17/70/27.
-    assert_eq!(
-        text.trim(),
-        "7",
-        "sum_two(3,4) must return exactly 7, got {text:?}"
-    );
-}
-
-#[ntex::test]
-async fn catchall_handle_server_fns_returns_405_on_method_mismatch() {
-    register_explicit::<SumTwo>();
-
-    let srv =
-        test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, SumTwo::PATH))
-        .send()
-        .await
-        .unwrap();
-    // `SumTwo` is POST-only. The catchall accepts every method, so the
-    // request reaches the handler body, which can still distinguish "known
-    // path, wrong method" from "unknown server function".
-    assert_eq!(resp.status(), ntex::http::StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(
-        resp.headers()
-            .get(ntex::http::header::ALLOW)
-            .and_then(|value| value.to_str().ok()),
-        Some("POST")
-    );
-}
-
-/// A path that matches no registered server function at all (as opposed to
-/// a registered path hit with the wrong method) must reject with 400, not
-/// 404/405/500 — the catchall's `allowed.is_empty()` branch.
-#[ntex::test]
-async fn catchall_handle_server_fns_returns_400_on_unknown_path() {
-    register_explicit::<SumTwo>();
-
-    let srv =
-        test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
-
-    let resp = srv
-        .request(
-            ntex::http::Method::POST,
-            server_url(&srv, "/api/no-such-endpoint"),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::BAD_REQUEST);
-}
-
-#[ntex::test]
-async fn real_server_method_specific_routing_rejects_wrong_method() {
-    register_explicit::<SumTwo>();
-
-    let srv = test::server(|| {
-        let routes = generate_route_list(App);
-        async move { NtexApp::new().leptos_routes(routes, shell) }
-    })
-    .await;
-
-    let ok = srv
-        .request(ntex::http::Method::POST, server_url(&srv, SumTwo::PATH))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .send_body("a=3&b=4")
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), ntex::http::StatusCode::OK);
-
-    // SumTwo is registered as POST via leptos_routes. GET on it should be
-    // rejected at the router level; ntex may surface that as either 404 or 405
-    // depending on resource-matching details, so the disjunction is INTENTIONAL
-    // (pinning one would couple the test to an ntex internal). The successful
-    // POST asserted just above anchors that the route genuinely exists, so a
-    // bare 404 here is a real wrong-method rejection, not a missing route.
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, SumTwo::PATH))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            resp.status(),
-            ntex::http::StatusCode::NOT_FOUND | ntex::http::StatusCode::METHOD_NOT_ALLOWED
-        ),
-        "wrong method must be rejected by router, got {}",
-        resp.status()
-    );
-}
-
-#[ntex::test]
-async fn real_server_file_and_error_handler_serves_file_and_falls_back() {
-    let site_root = temp_site_root("file_fallback");
-    std::fs::create_dir_all(&site_root).unwrap();
-    std::fs::write(site_root.join("robots.txt"), "User-agent: *\n").unwrap();
-
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_integration_file_fallback")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    let srv = test::server(move || {
-        let options = options.clone();
-        async move {
-            NtexApp::new()
-                .state(options.clone())
-                .route("/{tail}*", file_and_error_handler(shell_with_options))
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/robots.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(text, "User-agent: *\n");
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/does-not-exist"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::NOT_FOUND);
-    let body = resp.body().await.unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Not Found"));
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-#[ntex::test]
-async fn real_server_site_pkg_dir_service_registers() {
-    let site_root = temp_site_root("pkg_service");
-    let pkg_dir = site_root.join("pkg");
-    std::fs::create_dir_all(pkg_dir.join("snippets/crate")).unwrap();
-    std::fs::write(pkg_dir.join("app.js"), "console.log('hi');").unwrap();
-    std::fs::write(pkg_dir.join("app.js.br"), "br-js").unwrap();
-    // wasm-bindgen emits JS snippets in nested dirs; the tail route must reach
-    // them (only `/{tail}*` matches multi-segment paths in ntex).
-    std::fs::write(
-        pkg_dir.join("snippets/crate/inline.js"),
-        "export const x = 1;",
-    )
-    .unwrap();
-
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_integration_pkg_service")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    let srv = test::server(move || {
-        let options = options.clone();
-        async move {
-            NtexApp::new()
-                .state(options.clone())
-                .service(site_pkg_dir_service::<ntex::web::DefaultError>(&options))
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/app.js"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(text, "console.log('hi');");
-
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/app.js"))
-        .header(ntex::http::header::ACCEPT_ENCODING, "br")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get(ntex::http::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-        Some("br")
-    );
-    let body = resp.body().await.unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(text, "br-js");
-
-    // Nested snippet (2 segments under the scope) is reachable.
-    let resp = srv
-        .request(
-            ntex::http::Method::GET,
-            server_url(&srv, "/pkg/snippets/crate/inline.js"),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    assert_eq!(
-        String::from_utf8(body.to_vec()).unwrap(),
-        "export const x = 1;"
-    );
-
-    // A pkg-relative path that does not exist on disk must 404, not panic
-    // or fall through to some other status.
-    let resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/missing.js"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::NOT_FOUND);
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-/// `site_pkg_dir_service` registers its route with
-/// `guard::Get().or(Head())`, explicitly declaring HEAD support alongside
-/// GET. Verified against the real h1 wire, like
-/// `real_server_head_mirrors_get_with_empty_body`, because body elision on
-/// HEAD is only observable at that layer (`test::call_service` bypasses the
-/// encoder).
-#[ntex::test]
-async fn real_server_site_pkg_dir_service_head_mirrors_get_with_empty_body() {
-    let site_root = temp_site_root("pkg_service_head");
-    let pkg_dir = site_root.join("pkg");
-    std::fs::create_dir_all(&pkg_dir).unwrap();
-    std::fs::write(pkg_dir.join("app.js"), "console.log('hi');").unwrap();
-
-    let options = LeptosOptions::builder()
-        .output_name("leptos_ntex_integration_pkg_service_head")
-        .site_root(site_root.to_string_lossy().to_string())
-        .site_pkg_dir("pkg")
-        .build();
-
-    let srv = test::server(move || {
-        let options = options.clone();
-        async move {
-            NtexApp::new()
-                .state(options.clone())
-                .service(site_pkg_dir_service::<ntex::web::DefaultError>(&options))
-        }
-    })
-    .await;
-
-    let get_resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/pkg/app.js"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_resp.status(), ntex::http::StatusCode::OK);
-    let get_ct = get_resp
-        .headers()
-        .get(ntex::http::header::CONTENT_TYPE)
-        .cloned();
-
-    let head_resp = srv
-        .request(ntex::http::Method::HEAD, server_url(&srv, "/pkg/app.js"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head_resp.status(), ntex::http::StatusCode::OK);
-    assert_eq!(
-        head_resp
-            .headers()
-            .get(ntex::http::header::CONTENT_TYPE)
-            .cloned(),
-        get_ct,
-        "HEAD Content-Type must match GET"
-    );
-    let body = head_resp.body().await.unwrap();
-    assert!(
-        body.is_empty(),
-        "HEAD wire body must be empty, got {} bytes",
-        body.len()
-    );
-
-    let _ = std::fs::remove_dir_all(&site_root);
-}
-
-// ---------------------------------------------------------------------------
-// Inventory auto-registration probe.
-//
-// `server_fn::initialize_server_fn_map!` iterates `inventory::iter::<
-// ServerFnTraitObj<NtexRequest, NtexServerResponse>>`, and the `#[server]`
-// macro emits an `inventory::submit!` keyed by the backend's associated
-// Request/Response types. On native Linux the `inventory` crate uses ctor
-// hooks, so every `#[server(server = NtexServerFnBackend)]` function should
-// appear in `REGISTERED_SERVER_FUNCTIONS` without any `register_explicit::<T>`
-// call. This test deliberately skips `register_explicit` to verify that.
 #[server(
     name = MulTwo,
     prefix = "/api",
@@ -521,48 +100,6 @@ pub async fn mul_two_auto_inventory(a: i32, b: i32) -> Result<i32, ServerFnError
     Ok(a * b)
 }
 
-#[ntex::test]
-async fn server_fn_auto_registers_via_inventory_without_register_explicit() {
-    // NOTE: no `register_explicit::<MulTwo>()` here.
-    let srv = test::server(|| {
-        let routes = generate_route_list(App);
-        async move {
-            NtexApp::new()
-                .route("/api/{tail}*", handle_server_fns())
-                .configure(move |cfg| {
-                    register_leptos_routes(cfg, routes.clone(), shell);
-                })
-        }
-    })
-    .await;
-
-    let resp = srv
-        .request(ntex::http::Method::POST, server_url(&srv, MulTwo::PATH))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .send_body("a=3&b=4")
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    let body = resp.body().await.unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    // Exact, not substring: `contains("12")` would also pass for 112/120/212.
-    assert_eq!(
-        text.trim(),
-        "12",
-        "mul_two_auto_inventory(3,4) must return exactly 12, got {text:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// CBOR end-to-end probe.
-//
-// Proves the adapter is codec-agnostic: `NtexRequest::try_into_bytes` and
-// `NtexServerResponse::try_from_bytes` handle arbitrary binary bodies, so any
-// `server_fn` codec that plugs into the byte pipeline works. Here we wire up
-// a `#[server(input = Cbor, output = Cbor)]` function, encode the arguments
-// with `ciborium` into `application/cbor`, POST through the ntex test server,
-// and decode the response.
 #[server(
     name = SumCbor,
     prefix = "/api",
@@ -575,118 +112,394 @@ pub async fn sum_cbor(a: i32, b: i32) -> Result<i32, ServerFnError> {
     Ok(a + b)
 }
 
-#[ntex::test]
-async fn real_server_roundtrips_cbor_server_fn() {
+// Every subject owns a new ntex runtime and real TCP server. The macro stays
+// synchronous: enabling its Tokio runtime would change the runtime being tested.
+fn run_ntex<F: Future + 'static>(future: F) -> F::Output
+where
+    F::Output: 'static,
+{
+    ntex::rt::System::new(
+        "wire-spec",
+        leptos_ntex_unofficial::RequestRuntime::new(ntex::rt::DefaultRuntime),
+    )
+    .block_on(future)
+}
+
+#[derive(Debug)]
+struct SiteRoot(PathBuf);
+
+impl SiteRoot {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "leptos_ntex_wire_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test root: {error}"),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SiteRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Registration {
+    Config,
+    App,
+    Catchall,
+    Files,
+    Package,
+}
+
+struct WireServer {
+    // Drop the server before removing its files, including on assertion panic.
+    server: test::TestServer,
+    _root: SiteRoot,
+}
+
+impl WireServer {
+    async fn new(registration: Registration) -> Self {
+        let root = SiteRoot::new();
+        std::fs::write(root.path().join("robots.txt"), "User-agent: *\n").unwrap();
+        let pkg = root.path().join("pkg");
+        std::fs::create_dir_all(pkg.join("snippets/crate")).unwrap();
+        std::fs::write(pkg.join("app.js"), "console.log('hi');").unwrap();
+        // Raw fixture bytes deliberately exercise selection, not compression.
+        std::fs::write(pkg.join("app.js.br"), "br-js").unwrap();
+        std::fs::write(pkg.join("snippets/crate/inline.js"), "export const x = 1;").unwrap();
+        let options = LeptosOptions::builder()
+            .output_name("leptos_ntex_wire")
+            .site_root(root.path().to_string_lossy().to_string())
+            .site_pkg_dir("pkg")
+            .build();
+        let server = test::server(move || {
+            let options = options.clone();
+            async move {
+                let app = NtexApp::new().state(options.clone());
+                match registration {
+                    Registration::Config => app.configure(|cfg| {
+                        register_leptos_routes(cfg, generate_route_list(App), shell);
+                    }),
+                    Registration::App => app.leptos_routes(generate_route_list(App), shell),
+                    Registration::Catchall => app
+                        .route("/api/{tail}*", handle_server_fns())
+                        .configure(|cfg| {
+                            register_leptos_routes(cfg, generate_route_list(App), shell);
+                        }),
+                    Registration::Files => {
+                        app.route("/{tail}*", file_and_error_handler(shell_with_options))
+                    }
+                    Registration::Package => {
+                        app.service(site_pkg_dir_service::<ntex::web::DefaultError>(&options))
+                    }
+                }
+            }
+        })
+        .await;
+        Self {
+            server,
+            _root: root,
+        }
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> WireResponse {
+        let url = format!("http://{}{}", self.server.addr(), path);
+        let mut request = self.server.request(method, url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send_body(body).await.expect("send local request");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .body()
+            .await
+            .expect("read local response body")
+            .to_vec();
+        WireResponse {
+            status,
+            headers,
+            body,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WireResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+fn have_status(expected: StatusCode) -> impl Fn(&WireResponse) -> AssertionResult {
+    move |response| equal(expected)(&response.status)
+}
+fn have_header(
+    name: &'static str,
+    expected: &'static str,
+) -> impl Fn(&WireResponse) -> AssertionResult {
+    move |response| {
+        let actual = response.headers.get(name).and_then(|v| v.to_str().ok());
+        if actual == Some(expected) {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "{name}: expected {expected:?}, got {actual:?}"
+            )]))
+        }
+    }
+}
+fn have_body(expected: &'static str) -> impl Fn(&WireResponse) -> AssertionResult {
+    move |response| {
+        if response.body == expected.as_bytes() {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected body {expected:?}, got {:?}",
+                String::from_utf8_lossy(&response.body)
+            )]))
+        }
+    }
+}
+fn contain_html(expected: &'static str) -> impl Fn(&WireResponse) -> AssertionResult {
+    move |response| {
+        let body = String::from_utf8_lossy(&response.body);
+        if body.contains(expected) {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "HTML missing {expected:?}: {body}"
+            )]))
+        }
+    }
+}
+fn decode_cbor_as(expected: i32) -> impl Fn(&WireResponse) -> AssertionResult {
+    move |response| match ciborium::de::from_reader::<i32, _>(response.body.as_slice()) {
+        Ok(actual) if actual == expected => Ok(()),
+        actual => Err(AssertionError::new(vec![format!(
+            "expected CBOR integer {expected}, got {actual:?}"
+        )])),
+    }
+}
+
+async fn get_page(registration: Registration, path: &str, encoding: Option<&str>) -> WireResponse {
+    let srv = WireServer::new(registration).await;
+    let headers: Vec<_> = encoding
+        .map(|value| vec![("Accept-Encoding", value)])
+        .unwrap_or_default();
+    srv.request(Method::GET, path, &headers, Vec::new()).await
+}
+
+async fn function_response(registration: Registration, method: Method, path: &str) -> WireResponse {
+    register_explicit::<SumTwo>();
+    let srv = WireServer::new(registration).await;
+    srv.request(
+        method,
+        path,
+        &[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Accept", "application/json"),
+        ],
+        b"a=3&b=4".to_vec(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum Codec {
+    Json,
+    Cbor,
+}
+
+async fn codec_response(codec: Codec) -> WireResponse {
+    register_explicit::<SumTwo>();
     register_explicit::<SumCbor>();
-
-    let srv =
-        test::server(|| async { NtexApp::new().route("/api/{tail}*", handle_server_fns()) }).await;
-
-    // Encode `{a: 5, b: 9}` as a CBOR map with text keys. The `#[server]`
-    // macro synthesises a struct `SumCbor { a: i32, b: i32 }` on the server
-    // side; ciborium deserialises our map into that struct by field name.
-    let mut args = std::collections::BTreeMap::new();
-    args.insert("a", 5i32);
-    args.insert("b", 9i32);
-    let mut buf: Vec<u8> = Vec::new();
-    ciborium::ser::into_writer(&args, &mut buf).unwrap();
-
-    let resp = srv
-        .request(ntex::http::Method::POST, server_url(&srv, SumCbor::PATH))
-        .header("Content-Type", "application/cbor")
-        .header("Accept", "application/cbor")
-        .send_body(buf)
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), ntex::http::StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/cbor"),
-    );
-
-    let body = resp.body().await.unwrap();
-    let value: i32 = ciborium::de::from_reader(body.as_ref()).unwrap();
-    assert_eq!(value, 14);
+    let srv = WireServer::new(Registration::Catchall).await;
+    match codec {
+        Codec::Json => {
+            srv.request(
+                Method::POST,
+                SumTwo::PATH,
+                &[
+                    ("Content-Type", "application/x-www-form-urlencoded"),
+                    ("Accept", "application/json"),
+                ],
+                b"a=3&b=4".to_vec(),
+            )
+            .await
+        }
+        Codec::Cbor => {
+            let args = std::collections::BTreeMap::from([("a", 5i32), ("b", 9i32)]);
+            let mut body = Vec::new();
+            ciborium::ser::into_writer(&args, &mut body).unwrap();
+            srv.request(
+                Method::POST,
+                SumCbor::PATH,
+                &[
+                    ("Content-Type", "application/cbor"),
+                    ("Accept", "application/cbor"),
+                ],
+                body,
+            )
+            .await
+        }
+    }
 }
 
-/// RFC 9110 §9.3.2: HEAD mirrors GET's status and Content-Type but returns no
-/// body. Verified against the real h1 wire — the test harness’s
-/// `test::call_service` cannot exercise the body-elision path because it
-/// bypasses the encoder. This pins status + Content-Type + an empty wire body;
-/// it does not compare the FULL header set (GET and HEAD share one handler, so
-/// per-header parity is structural, not separately asserted here).
-#[ntex::test]
-async fn real_server_head_mirrors_get_with_empty_body() {
-    let srv = test::server(move || {
-        let routes = generate_route_list(App);
-        async move {
-            NtexApp::new().configure(move |cfg| {
-                register_leptos_routes(cfg, routes.clone(), shell);
-            })
-        }
-    })
-    .await;
-
-    let get_resp = srv
-        .request(ntex::http::Method::GET, server_url(&srv, "/"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_resp.status(), ntex::http::StatusCode::OK);
-    let get_ct = get_resp
-        .headers()
-        .get(ntex::http::header::CONTENT_TYPE)
-        .cloned();
-
-    let head_resp = srv
-        .request(ntex::http::Method::HEAD, server_url(&srv, "/"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head_resp.status(), ntex::http::StatusCode::OK);
-    assert_eq!(
-        head_resp
-            .headers()
-            .get(ntex::http::header::CONTENT_TYPE)
-            .cloned(),
-        get_ct,
-        "HEAD Content-Type must match GET"
-    );
-    let body = head_resp.body().await.unwrap();
-    assert!(
-        body.is_empty(),
-        "HEAD wire body must be empty, got {} bytes",
-        body.len()
-    );
+#[derive(Debug)]
+struct HeadPair {
+    get: WireResponse,
+    head: WireResponse,
 }
 
-/// HEAD on an unregistered route must not return 200 — the old synthetic
-/// HEAD-to-200 handler hid real 404s from monitoring. Regression probe.
-#[ntex::test]
-async fn real_server_head_on_missing_route_not_200() {
-    let srv = test::server(move || {
-        let routes = generate_route_list(App);
-        async move {
-            NtexApp::new().configure(move |cfg| {
-                register_leptos_routes(cfg, routes.clone(), shell);
-            })
-        }
-    })
-    .await;
+async fn head_pair(registration: Registration, path: &str) -> HeadPair {
+    let srv = WireServer::new(registration).await;
+    let get = srv.request(Method::GET, path, &[], Vec::new()).await;
+    let head = srv.request(Method::HEAD, path, &[], Vec::new()).await;
+    HeadPair { get, head }
+}
 
-    let resp = srv
-        .request(
-            ntex::http::Method::HEAD,
-            server_url(&srv, "/this-path-does-not-exist"),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        ntex::http::StatusCode::NOT_FOUND,
-        "HEAD on a missing route must fall through to a real 404, not falsely report 200 (or some other non-OK status)"
-    );
+fn mirror_get(expected_status: StatusCode) -> impl Fn(&HeadPair) -> AssertionResult {
+    move |pair| {
+        let mut errors = Vec::new();
+        if pair.get.status != expected_status || pair.head.status != expected_status {
+            errors.push(format!(
+                "GET/HEAD expected {expected_status}, got {}/{}",
+                pair.get.status, pair.head.status
+            ));
+        }
+        if pair.get.headers.get(CONTENT_TYPE) != pair.head.headers.get(CONTENT_TYPE) {
+            errors.push(format!(
+                "GET/HEAD Content-Type differs: {:?}/{:?}",
+                pair.get.headers.get(CONTENT_TYPE),
+                pair.head.headers.get(CONTENT_TYPE)
+            ));
+        }
+        if !pair.head.body.is_empty() {
+            errors.push(format!("HEAD returned {} body bytes", pair.head.body.len()));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AssertionError::new(errors))
+        }
+    }
+}
+
+lets_expect! {
+    expect(run_ntex(get_page(Registration::Config, path, None))) as wire_ssr {
+        let path = "/";
+        to render_home { have_status(StatusCode::OK), contain_html("<h1>Integration Home</h1>"), contain_html("<title>Home</title>") }
+        when route_is_about {
+            let path = "/about";
+            to render_about { have_status(StatusCode::OK), contain_html("<h1>Integration About</h1>") }
+        }
+        when route_is_static {
+            let path = "/static";
+            to serve_generated_html { have_status(StatusCode::OK), contain_html("<h1>Integration Static</h1>") }
+        }
+        when route_is_missing {
+            let path = "/missing";
+            to reject_unknown_route { have_status(StatusCode::NOT_FOUND) }
+        }
+    }
+    expect(run_ntex(get_page(Registration::App, "/", None))) as wire_app_registration {
+        to render_home { have_status(StatusCode::OK), contain_html("<h1>Integration Home</h1>"), contain_html("<title>Home</title>") }
+    }
+    expect(run_ntex(head_pair(registration, path))) as wire_head_parity {
+        let registration = Registration::Config;
+        let path = "/";
+        to omit_body_and_preserve_metadata { mirror_get(StatusCode::OK) }
+        when endpoint_is_package_asset {
+            let registration = Registration::Package;
+            let path = "/pkg/app.js";
+            to omit_body_and_preserve_metadata { mirror_get(StatusCode::OK) }
+        }
+        when endpoint_is_missing {
+            let path = "/missing";
+            to preserve_not_found { mirror_get(StatusCode::NOT_FOUND) }
+        }
+    }
+    expect(run_ntex(function_response(Registration::Catchall, method, path))) as wire_catchall_function {
+        let method = Method::POST;
+        let path = SumTwo::PATH;
+        to return_sum { have_status(StatusCode::OK), have_body("7") }
+        when method_is_wrong {
+            let method = Method::GET;
+            to report_allowed_method { have_status(StatusCode::METHOD_NOT_ALLOWED), have_header("allow", "POST") }
+        }
+        when endpoint_is_unknown {
+            let path = "/api/no-such-endpoint";
+            to reject_unknown_function { have_status(StatusCode::BAD_REQUEST) }
+        }
+    }
+    expect(run_ntex(function_response(Registration::App, method, SumTwo::PATH))) as wire_method_specific_function {
+        let method = Method::POST;
+        to return_sum { have_status(StatusCode::OK), have_body("7") }
+        when method_is_wrong {
+            let method = Method::GET;
+            to fall_through_router { have_status(StatusCode::NOT_FOUND) }
+        }
+    }
+    // No code in this binary calls register_explicit::<MulTwo>().
+    expect(run_ntex(function_response(Registration::Catchall, Method::POST, MulTwo::PATH))) as wire_inventory_function {
+        to find_inventory_entry { have_status(StatusCode::OK), have_body("12") }
+    }
+    expect(run_ntex(codec_response(codec))) as wire_function_codec {
+        let codec = Codec::Json;
+        to roundtrip_json { have_status(StatusCode::OK), have_body("7") }
+        when codec_is_cbor {
+            let codec = Codec::Cbor;
+            to roundtrip_cbor { have_status(StatusCode::OK), have_header("content-type", "application/cbor"), decode_cbor_as(14) }
+        }
+    }
+    expect(run_ntex(get_page(Registration::Files, path, None))) as wire_file_fallback {
+        let path = "/robots.txt";
+        to serve_file { have_status(StatusCode::OK), have_body("User-agent: *\n") }
+        when file_is_missing {
+            let path = "/does-not-exist";
+            to render_not_found { have_status(StatusCode::NOT_FOUND), contain_html("Not Found") }
+        }
+    }
+    expect(run_ntex(get_page(Registration::Package, path, None))) as wire_package_lookup {
+        let path = "/pkg/app.js";
+        to serve_asset { have_status(StatusCode::OK), have_body("console.log('hi');") }
+        when asset_is_nested {
+            let path = "/pkg/snippets/crate/inline.js";
+            to serve_snippet { have_status(StatusCode::OK), have_body("export const x = 1;") }
+        }
+        when asset_is_missing {
+            let path = "/pkg/missing.js";
+            to return_not_found { have_status(StatusCode::NOT_FOUND) }
+        }
+    }
+    expect(run_ntex(get_page(Registration::Package, "/pkg/app.js", encoding))) as wire_package_representation {
+        let encoding = None;
+        to serve_identity { have_status(StatusCode::OK), have_body("console.log('hi');") }
+        when representation_is_br {
+            let encoding = Some("br");
+            to serve_brotli_sibling { have_status(StatusCode::OK), have_header("content-encoding", "br"), have_body("br-js") }
+        }
+    }
 }

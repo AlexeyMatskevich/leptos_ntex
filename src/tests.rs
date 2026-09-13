@@ -505,14 +505,14 @@ async fn drain_streaming_input(
     Ok(total)
 }
 
-// --- Middleware short-circuit fixtures (Codex P2 regression) ----------------
+// --- Middleware short-circuit fixtures ------------------------------------
 //
 // A server_fn middleware `Layer` that short-circuits `service.run` with its OWN
 // response (an auth-redirect `302`, or a conditional `304`), never calling the
 // inner server fn. `dispatch_server_fn`'s referer-redirect sanitization must
 // leave these 3xx responses intact for a non-HTML client — none of them is
 // server_fn's referer-derived form-redirect fallback. Drives
-// `middleware_redirect_survives_for_non_html_client`.
+// the `middleware_redirect` contract in `server_fn_http`.
 //
 // One generic `Layer` carries a builder fn pointer so each guarded server fn
 // can short-circuit with a different response without duplicating the
@@ -668,20 +668,54 @@ async fn multi_location() -> Result<(), ServerFnError> {
 // Shared helper for the test submodules below.
 // ---------------------------------------------------------------------------
 
-/// Throwaway per-test site root under the system temp dir.
-fn temp_site_root(name: &str) -> std::path::PathBuf {
-    // A nanosecond timestamp alone collides when several tests -- or several
-    // parallel `cargo-mutants` processes sharing the same temp dir -- request
-    // a root within one clock tick, so the path carries the pid plus a
-    // process-scoped atomic counter instead (the same pattern as
-    // `files::resolves_under_root`).
+/// Runs each specification subject on the application's native ntex runtime.
+/// Subjects return their observable results after their asynchronous work ends.
+pub(crate) fn run_ntex<T: 'static>(future: impl std::future::Future<Output = T> + 'static) -> T {
+    ntex::rt::System::build()
+        .testing()
+        .build(crate::RequestRuntime::new(ntex::rt::DefaultRuntime))
+        .block_on(future)
+}
+
+#[derive(Clone)]
+pub(crate) struct TempSiteRoot(std::sync::Arc<TempSiteRootInner>);
+struct TempSiteRootInner(std::path::PathBuf);
+
+impl std::ops::Deref for TempSiteRoot {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempSiteRoot {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.0.as_path()
+    }
+}
+
+impl Drop for TempSiteRootInner {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A uniquely created directory, removed even when a specification panics.
+pub(crate) fn temp_site_root(name: &str) -> TempSiteRoot {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UNIQUE: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "leptos_ntex_{name}_{}_{}",
-        std::process::id(),
-        UNIQUE.fetch_add(1, Ordering::Relaxed)
-    ))
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "leptos_ntex_{name}_{}_{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed),
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return TempSiteRoot(std::sync::Arc::new(TempSiteRootInner(path))),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot create test site root {}: {error}", path.display()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,8 +732,10 @@ fn temp_site_root(name: &str) -> std::path::PathBuf {
 // single-threaded apps. Instead the test suite serializes the two sides:
 // generation takes the WRITE side (brief, synchronous), and the only fixtures
 // that build a `Resource` during render take the READ side, so a generation
-// window can never overlap a resource's first poll. Drop this once the
-// upstream flag is made thread-local / re-checked per poll (filed upstream).
+// window can never overlap a resource's first poll. Consequently these tests
+// do not cover concurrent generation and live SSR; a separate controlled
+// reproduction demonstrates that upstream limitation. Remove this guard only
+// after scoped suppression is available and that reproduction passes.
 pub(super) static ROUTE_GEN_VS_RENDER: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 fn gen_write_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
@@ -761,10 +797,15 @@ where
     )
 }
 
+mod connection_lifetime;
 mod executor;
 mod file_fallback;
+mod owner_lifecycle;
 mod rendering;
 mod server_fn_http;
 mod static_routes;
 mod unit_specs;
 mod websocket;
+
+mod head_containment;
+mod protocol_contract;

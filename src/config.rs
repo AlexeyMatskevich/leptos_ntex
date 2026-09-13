@@ -45,13 +45,18 @@ pub const DEFAULT_WS_CHANNEL_BUFFER: usize = 2048;
 #[derive(Debug, Clone, Copy)]
 pub struct LeptosServerFnConfig {
     /// Maximum accepted body size in bytes for a server-function request.
-    /// HTTP requests exceeding this limit are rejected with
-    /// `413 Payload Too Large`, whether the client declares size up-front
-    /// via `Content-Length` (rejected before the server function runs) or
-    /// streams a body whose length is unknown to the server
-    /// (`Transfer-Encoding: chunked`, any body without `Content-Length`)
-    /// and exceeds the limit mid-flight (rejected once the excess byte is
-    /// observed; the partial payload is discarded).
+    /// A declared oversized `Content-Length` is rejected with `413` before
+    /// the server function runs. Buffered and streaming input also fail when
+    /// the accumulated bytes exceed the limit. The dispatcher returns `413`
+    /// if it observes that failure before returning the response.
+    ///
+    /// A streaming function may return a response before consuming its input.
+    /// Once the dispatcher has returned that response, a later input failure
+    /// remains a stream error even if no response bytes have reached the client.
+    /// If propagated through the response body, it terminates an HTTP/1
+    /// connection without replacing the response with `413`; the client may
+    /// receive no response bytes or an incomplete original response. HTTP/2
+    /// retains ntex's native stream-error handling.
     ///
     /// The same limit also bounds each server-function WebSocket message
     /// (a single frame, or a reassembled fragmented message): exceeding it
@@ -61,10 +66,17 @@ pub struct LeptosServerFnConfig {
     /// Buffer size for the WebSocket mpsc channels used by streaming
     /// server functions. Larger values allow bursts at the cost of
     /// memory; smaller values apply stronger backpressure upstream.
+    ///
+    /// This counts messages, not bytes. The underlying futures channel adds
+    /// one reservation per sender (including application-created clones).
+    /// Fragment assembly, the current output message and ntex/socket buffers
+    /// use additional memory. `payload_limit` bounds incoming messages only.
     pub ws_channel_buffer: usize,
     /// Subprotocol echoed in the `Sec-WebSocket-Protocol` response
     /// header during WebSocket upgrade. `None` negotiates no
-    /// subprotocol (the default; matches bare `ws://` clients).
+    /// subprotocol (the default; matches bare `ws://` clients). An invalid
+    /// configured token, including an empty string, or a protocol not offered
+    /// by the client also negotiates no subprotocol.
     ///
     /// For dynamic per-request selection — e.g. picking the first
     /// subprotocol the client advertises that the server supports —
@@ -138,10 +150,11 @@ pub(crate) fn server_fn_config(req: &HttpRequest) -> LeptosServerFnConfig {
 /// cannot influence the HTTP status from inside `try_into_bytes` /
 /// `try_into_string` / `try_into_stream`. Instead those methods insert
 /// this marker via `HttpRequest::extensions_mut()` before returning the
-/// generic `Args` error; the public handler checks the extension after
-/// the server-fn pipeline completes and rewrites the response with the
-/// correct status. Private — the marker is an internal implementation
-/// detail.
+/// generic `Args` error. The public handler checks the extension once after
+/// the server-fn pipeline returns its response. An overflow observed only when
+/// a lazy response body is polled is too late for this status promotion, even
+/// before any response bytes reach the client. Private — the marker is an
+/// internal implementation detail.
 #[derive(Copy, Clone)]
 pub(crate) struct PayloadTooLarge;
 

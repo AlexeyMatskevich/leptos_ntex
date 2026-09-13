@@ -31,7 +31,10 @@ pub(crate) fn provide_contexts(
     meta_context: &ServerMetaContext,
     res_options: &ResponseOptions,
 ) {
-    provide_context(RequestUrl::new(&leptos_corrected_path(&req)));
+    let url = req
+        .with(leptos_corrected_path)
+        .expect("new request context belongs to the active request scope");
+    provide_context(RequestUrl::new(&url));
     provide_context(meta_context.clone());
     provide_context(res_options.clone());
     provide_context(req);
@@ -119,6 +122,7 @@ where
     Err: ErrorRenderer,
     IV: IntoView + 'static,
 {
+    crate::request::check_registration_scope();
     let handler = move |req: HttpRequest| {
         let add_context = additional_context.clone();
         let app_fn = app_fn.clone();
@@ -148,10 +152,9 @@ where
 /// Exposed so that advanced users can compose it inside their own ntex
 /// route handlers — for example, to render a shell after a custom
 /// static-file fallback, or to add middleware that needs to inspect the
-/// response body before sending. The `render_app_*` family doesn't use
-/// this directly (they wrap a similar pipeline in a `Route`), but this
-/// function mirrors `leptos_axum::handle_response_inner` so existing
-/// axum-style code can be adapted.
+/// response body before sending. The `render_app_*` family also uses this
+/// pipeline through its route handlers. The signature follows
+/// `leptos_axum::handle_response_inner` for adapting existing code.
 ///
 /// The `stream_builder` argument selects how the HTML body is produced:
 /// out-of-order / in-order / async. See the [`render_app_to_stream`] family
@@ -166,7 +169,8 @@ where
 /// dropping it on another thread panics. In particular, do **not**
 /// `tokio::spawn` it or move it onto a foreign runtime's thread pool, despite
 /// the `Send` type that the `leptos_axum::handle_response_inner` shape invites.
-/// Unlike [`Request`], this future has no leak-instead-of-panic drop guard.
+/// The managed [`Request`] context can be moved independently; that does not
+/// make this future's captured native request transferable.
 #[allow(clippy::type_complexity)]
 pub fn handle_response_inner<IV>(
     additional_context: impl FnOnce() + 'static + Send,
@@ -182,37 +186,42 @@ where
     IV: IntoView + 'static,
 {
     ensure_executor_initialized();
-    Box::pin(SendWrapper::new(async move {
-        let is_island_router_navigation =
-            cfg!(feature = "islands-router") && req.headers().contains_key("Islands-Router");
-        let res_options = ResponseOptions::default();
-        let (meta_context, meta_output) = ServerMetaContext::new();
+    Box::pin(crate::owner::OwnerContextFuture::new(SendWrapper::new(
+        async move {
+            let is_island_router_navigation =
+                cfg!(feature = "islands-router") && req.headers().contains_key("Islands-Router");
+            let res_options = ResponseOptions::default();
+            let (meta_context, meta_output) = ServerMetaContext::new();
 
-        let cx = {
-            let meta_context = meta_context.clone();
-            let res_options = res_options.clone();
-            let req_ctx = Request::new(&req);
-            move || {
-                provide_contexts(req_ctx, &meta_context, &res_options);
-                additional_context();
-                if is_island_router_navigation {
-                    provide_context(IslandsRouterNavigation);
+            let req_ctx = match crate::request::scoped_request(&req) {
+                Ok(request) => request,
+                Err(response) => return response,
+            };
+            let cx = {
+                let meta_context = meta_context.clone();
+                let res_options = res_options.clone();
+                move || {
+                    provide_contexts(req_ctx, &meta_context, &res_options);
+                    additional_context();
+                    if is_island_router_navigation {
+                        provide_context(IslandsRouterNavigation);
+                    }
                 }
-            }
-        };
+            };
 
-        let res = NtexResponse::from_app(
-            app_fn,
-            meta_output,
-            cx,
-            res_options,
-            stream_builder,
-            !is_island_router_navigation,
-        )
-        .await;
+            let res = NtexResponse::from_app(
+                app_fn,
+                meta_output,
+                cx,
+                res_options,
+                stream_builder,
+                !is_island_router_navigation,
+            )
+            .await;
 
-        res.take()
-    }))
+            crate::stream::terminate_on_body_error(&req, res.take())
+        },
+    )))
 }
 
 /// Returns an ntex [`Route`] that responds to a request for the given
@@ -406,224 +415,124 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ntex::http::StatusCode;
+    use crate::tests::run_ntex;
+    use lets_expect::lets_expect;
+    use ntex::http::{Method as HttpMethod, StatusCode};
     use ntex::web::{App, test};
 
-    // A future `SsrMode` this integration cannot render must serve a typed 500
-    // — not panic the worker via `unreachable!()`, and not silently mis-render
-    // as OutOfOrder. These tests call `unsupported_ssr_mode_route` DIRECTLY
-    // (not through the dispatch `match`), so the `SsrMode` argument is just an
-    // arbitrary value passed to the 500 route builder — `SsrMode::Async`
-    // happens to be convenient and is NOT a claim that dispatch fails to handle
-    // Async (`leptos_routes` handles it explicitly). The route this helper
-    // builds is the catch-all a new `#[non_exhaustive]` variant falls through
-    // to. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
-    #[ntex::test]
-    async fn unsupported_ssr_mode_serves_500() {
-        let app = test::init_service(App::new().route(
-            "/",
-            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
-        ))
-        .await;
-
-        let req = test::TestRequest::get().uri("/").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        // Pin the exact body, not just the status: any 500 (or an empty body)
-        // would otherwise pass.
-        let body = test::read_body(resp).await;
-        assert_eq!(
-            String::from_utf8(body.to_vec()).unwrap(),
-            "This rendering mode is not supported."
-        );
+    #[derive(Clone, Copy)]
+    enum RequestedMethod {
+        Matching,
+        Head,
+        Other,
     }
 
-    // HEAD must reach the same 500: the helper binds GET+HEAD for a `Method::Get`
-    // route (an intentional divergence from the PR's GET-only registration), so
-    // a HEAD must not fall through to 404/405. Pins that divergence.
-    #[ntex::test]
-    async fn unsupported_ssr_mode_serves_500_for_head() {
-        let app = test::init_service(App::new().route(
-            "/",
-            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
-        ))
-        .await;
-
-        let req = test::TestRequest::default()
-            .method(ntex::http::Method::HEAD)
-            .uri("/")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // A non-GET route exercises the other branch (`.method(ntex_method(method))`)
-    // and must serve the 500 on its own method.
-    #[ntex::test]
-    async fn unsupported_ssr_mode_serves_500_for_non_get_method() {
-        let app = test::init_service(App::new().route(
-            "/",
-            unsupported_ssr_mode_route(Method::Post, &SsrMode::Async),
-        ))
-        .await;
-
-        let req = test::TestRequest::post().uri("/").to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        // Mirror the exact-body pin from `unsupported_ssr_mode_serves_500`:
-        // both branches currently funnel into the same handler closure, so a
-        // body regression specific to the non-GET branch must be caught here
-        // too, not just on the GET branch's own test.
-        let body = test::read_body(resp).await;
-        assert_eq!(
-            String::from_utf8(body.to_vec()).unwrap(),
-            "This rendering mode is not supported."
-        );
-    }
-
-    // The route must reject a MISMATCHED method (it is not an all-method
-    // catch-all): a POST to a `Method::Get` route must NOT 500. `App::route`
-    // (ntex-3.9.6 src/web/app.rs:227-233) hoists the route's guards — the
-    // method guard included — onto the wrapping `Resource` via
-    // `take_guards()`/`add_guards()`, so a mismatched method fails the
-    // Resource-level guard match itself: the app's router never selects this
-    // Resource at all, and it falls through to the app's own 404 default
-    // handler. `Resource`'s inner `MethodNotAllowed` (resource.rs:520) is
-    // reached only when the Resource IS selected but no route inside it
-    // matches (e.g. several `.route()` calls sharing a `web::resource(..)`
-    // without per-route method guards) — not this crate's single-route-per-
-    // path registration. Verified by direct repro against ntex-3.9.6, not
-    // assumed from source alone.
-    #[ntex::test]
-    async fn unsupported_ssr_mode_get_route_rejects_post() {
-        let get_route = test::init_service(App::new().route(
-            "/",
-            unsupported_ssr_mode_route(Method::Get, &SsrMode::Async),
-        ))
-        .await;
-        let resp =
-            test::call_service(&get_route, test::TestRequest::post().uri("/").to_request()).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "POST to a GET-only route must be rejected with exactly 404, got {}",
-            resp.status()
-        );
-    }
-
-    // The `Method::Post` sibling: a GET to a `Method::Post` route must NOT
-    // 500 either — same 404 rejection (see comment above), its own pass/fail
-    // signal.
-    #[ntex::test]
-    async fn unsupported_ssr_mode_post_route_rejects_get() {
-        let post_route = test::init_service(App::new().route(
-            "/",
-            unsupported_ssr_mode_route(Method::Post, &SsrMode::Async),
-        ))
-        .await;
-        let resp =
-            test::call_service(&post_route, test::TestRequest::get().uri("/").to_request()).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "GET to a POST-only route must be rejected with exactly 404, got {}",
-            resp.status()
-        );
-    }
-
-    // `is_island_router_navigation` (islands-router header detection) drives
-    // the `supports_ooo` flag threaded into the stream builder. This crate is
-    // built with the `islands-router` feature OFF by default, so
-    // `cfg!(feature = "islands-router")` is `false` here and the whole
-    // expression short-circuits to `false` regardless of the header — the
-    // header must be a strict no-op in that configuration. Capture the
-    // `supports_ooo` value the stream builder actually observes (rather than
-    // inspecting the body, which carries no visible trace of the flag) so a
-    // broken/inverted header-detection predicate is caught even though the
-    // feature is off.
-    // `stream_builder` must be a plain `fn` pointer (no captures), so the
-    // observed `supports_ooo` value is smuggled out through a thread-local
-    // instead of a closure capture. `#[ntex::test]` runs single-threaded, so
-    // the thread-local is set and read on the same thread within each call.
-    thread_local! {
-        static SEEN_SUPPORTS_OOO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    }
-
-    #[ntex::test]
-    async fn islands_router_header_toggles_supports_ooo_only_when_the_feature_is_on() {
-        use leptos::prelude::*;
-
-        async fn supports_ooo_seen_for(with_header: bool) -> bool {
-            SEEN_SUPPORTS_OOO.with(|cell| cell.set(None));
-            let app = test::init_service(App::new().route(
-                "/",
-                ntex::web::get().to(|req: HttpRequest| async move {
-                    handle_response_inner(
-                        || {},
-                        || view! { <h1>"IslandsProbe"</h1> },
-                        req,
-                        |app, chunks, supports_ooo| {
-                            SEEN_SUPPORTS_OOO.with(|cell| cell.set(Some(supports_ooo)));
-                            Box::pin(async move {
-                                let app = app.to_html_stream_in_order().collect::<String>().await;
-                                Box::pin(once(async move { app }).chain(chunks()))
-                                    as PinnedStream<String>
-                            })
-                        },
-                    )
-                    .await
-                }),
-            ))
+    fn unsupported_response(
+        configured: Method,
+        requested: RequestedMethod,
+    ) -> (StatusCode, String) {
+        run_ntex(async move {
+            let requested = match requested {
+                RequestedMethod::Matching => ntex_method(configured),
+                RequestedMethod::Head => HttpMethod::HEAD,
+                RequestedMethod::Other if configured == Method::Get => HttpMethod::POST,
+                RequestedMethod::Other => HttpMethod::GET,
+            };
+            // Async is merely a diagnostic argument when invoking this private
+            // fallback directly. Normal dispatch supports Async.
+            let app = test::init_service(
+                App::new().route("/", unsupported_ssr_mode_route(configured, &SsrMode::Async)),
+            )
             .await;
-
-            let mut req = test::TestRequest::get().uri("/");
-            if with_header {
-                req = req.header("Islands-Router", "1");
+            let response = test::call_service(
+                &app,
+                test::TestRequest::default()
+                    .method(requested)
+                    .uri("/")
+                    .to_request(),
+            )
+            .await;
+            let status = response.status();
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            (status, body)
+        })
+    }
+    lets_expect! {
+        expect(unsupported_response(configured, requested)) as unsupported_mode_route {
+            let configured = Method::Get;
+            let requested = RequestedMethod::Matching;
+            to returns_the_explicit_unsupported_result {
+                equal((StatusCode::INTERNAL_SERVER_ERROR, "This rendering mode is not supported.".to_string()))
             }
-            let resp = test::call_service(&app, req.to_request()).await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            SEEN_SUPPORTS_OOO
-                .with(|cell| cell.get())
-                .expect("stream_builder must have run and recorded supports_ooo")
-        }
-
-        let without_header = supports_ooo_seen_for(false).await;
-        let with_header = supports_ooo_seen_for(true).await;
-        assert!(
-            without_header,
-            "supports_ooo must be true without the header (no island-router navigation)"
-        );
-        // `is_island_router_navigation` is `cfg!(feature = "islands-router")
-        // && <header present>`, so the header only has an effect when the
-        // crate is actually built with the feature on — this test must hold
-        // (and exercise the real branch) under both build configurations.
-        if cfg!(feature = "islands-router") {
-            assert!(
-                !with_header,
-                "with the islands-router feature on, the Islands-Router header must disable supports_ooo"
-            );
-        } else {
-            assert_eq!(
-                with_header, without_header,
-                "with the islands-router feature off, the Islands-Router header must not change supports_ooo"
-            );
+            when requested_with_head {
+                let requested = RequestedMethod::Head;
+                to selects_the_get_handler { have(0) equal(StatusCode::INTERNAL_SERVER_ERROR) }
+            }
+            when requested_with_another_method {
+                let requested = RequestedMethod::Other;
+                to falls_through_to_the_app_default { have(0) equal(StatusCode::NOT_FOUND) }
+            }
+            when configured_for_post {
+                let configured = Method::Post;
+                to returns_the_explicit_unsupported_result {
+                    equal((StatusCode::INTERNAL_SERVER_ERROR, "This rendering mode is not supported.".to_string()))
+                }
+                when requested_with_head {
+                    let requested = RequestedMethod::Head;
+                    to does_not_add_head_to_a_post_route { have(0) equal(StatusCode::NOT_FOUND) }
+                }
+                when requested_with_another_method {
+                    let requested = RequestedMethod::Other;
+                    to falls_through_to_the_app_default { have(0) equal(StatusCode::NOT_FOUND) }
+                }
+            }
         }
     }
 
-    // `leptos_corrected_path` builds the `RequestUrl` leptos routes on. The
-    // query branch (`?{query}`) is otherwise only reached through the full
-    // render pipeline by query-less URIs, so pin both branches directly.
-    #[ntex::test]
-    async fn leptos_corrected_path_includes_the_query() {
-        let req = test::TestRequest::default()
-            .uri("/p?q=1&x=2")
-            .to_http_request();
-        assert_eq!(leptos_corrected_path(&req), "http://leptos/p?q=1&x=2");
+    fn supports_out_of_order(with_header: bool) -> (StatusCode, Option<bool>) {
+        use leptos::prelude::*;
+        use std::sync::{Arc, Mutex};
+        run_ntex(async move {
+            let seen = Arc::new(Mutex::new(None));
+            let context = seen.clone();
+            let mut request = test::TestRequest::get().uri("/");
+            if with_header {
+                request = request.header("Islands-Router", "1");
+            }
+            let response = handle_response_inner(
+                move || provide_context(context),
+                || view! { <!DOCTYPE html><html><head></head><body><h1>"IslandsProbe"</h1></body></html> },
+                request.to_http_request(),
+                |app, chunks, supports_ooo| {
+                    *expect_context::<Arc<Mutex<Option<bool>>>>().lock().unwrap() = Some(supports_ooo);
+                    Box::pin(async move {
+                        let app = app.to_html_stream_in_order().collect::<String>().await;
+                        Box::pin(once(async move { app }).chain(chunks())) as PinnedStream<String>
+                    })
+                },
+            ).await;
+            let observed = *seen.lock().unwrap();
+            (response.status(), observed)
+        })
     }
-
-    #[ntex::test]
-    async fn leptos_corrected_path_omits_an_absent_query() {
-        let req = test::TestRequest::default().uri("/p").to_http_request();
-        assert_eq!(leptos_corrected_path(&req), "http://leptos/p");
+    lets_expect! {
+        expect(supports_out_of_order(with_header)) as islands_navigation_streaming {
+            let with_header = false;
+            to enables_out_of_order_for_document_navigation { equal((StatusCode::OK, Some(true))) }
+            when the_islands_router_header_is_present {
+                let with_header = true;
+                to disables_out_of_order_only_with_the_feature_enabled {
+                    equal((StatusCode::OK, Some(!cfg!(feature = "islands-router"))))
+                }
+            }
+        }
+        expect(leptos_corrected_path(&test::TestRequest::default().uri(uri).to_http_request())) as leptos_request_url {
+            let uri = "/p";
+            to preserves_the_path_without_a_query_separator { equal("http://leptos/p".to_string()) }
+            when a_query_is_present {
+                let uri = "/p?q=1&x=2";
+                to includes_the_complete_query { equal("http://leptos/p?q=1&x=2".to_string()) }
+            }
+        }
     }
 }

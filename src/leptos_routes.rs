@@ -32,9 +32,13 @@ pub trait LeptosRoutes {
     where
         IV: IntoView + 'static;
 
-    /// Like [`LeptosRoutes::leptos_routes`], but runs `additional_context`
-    /// for every request so you can inject more data into the reactive
-    /// context.
+    /// Like [`LeptosRoutes::leptos_routes`], but injects additional reactive
+    /// context for server-function dispatch and rendering.
+    ///
+    /// Static file hits do not render or run this callback. Requests joining
+    /// an active static generation share its result and context. A miss starting
+    /// a new generation supplies its callbacks for subsequent regeneration events;
+    /// the existing subscription keeps its original scope.
     fn leptos_routes_with_context<IV>(
         self,
         paths: Vec<NtexRouteListing>,
@@ -105,7 +109,7 @@ where
             // GET + HEAD. ntex's h1 writer then strips the body at the
             // wire, giving RFC 9110 §9.3.2-compliant headers/status with
             // no body. Listings that only register POST/PUT/etc. will
-            // correctly 405 on HEAD instead of returning a bogus 200.
+            // fall through to the app default (404 by default) on HEAD instead of returning a bogus 200.
 
             for method in listing.methods() {
                 let additional_context = additional_context.clone();
@@ -117,9 +121,11 @@ where
                     self.route(
                         path,
                         handle_static_route(
+                            method,
                             additional_context_and_method.clone(),
                             app_fn.clone(),
                             listing.regenerate.clone(),
+                            listing.runtime.clone(),
                         ),
                     )
                 } else {
@@ -149,11 +155,9 @@ where
                                 app_fn.clone(),
                                 method,
                             ),
-                            // `SsrMode` is `#[non_exhaustive]`; serve a typed
-                            // 500 for any future variant this integration does
-                            // not know how to render, rather than silently
-                            // mis-rendering it as OutOfOrder or panicking the
-                            // worker. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
+                            // Static modes are handled above. This catch-all
+                            // also returns a typed 500 if a future dependency
+                            // adds a mode this integration cannot render.
                             ref mode => unsupported_ssr_mode_route(method, mode),
                         },
                     )
@@ -228,9 +232,11 @@ where
                     router = router.route(
                         path,
                         handle_static_route(
+                            method,
                             additional_context_and_method.clone(),
                             app_fn.clone(),
                             listing.regenerate.clone(),
+                            listing.runtime.clone(),
                         ),
                     );
                 } else {
@@ -260,11 +266,9 @@ where
                                 app_fn.clone(),
                                 method,
                             ),
-                            // `SsrMode` is `#[non_exhaustive]`; serve a typed
-                            // 500 for any future variant this integration does
-                            // not know how to render, rather than silently
-                            // mis-rendering it as OutOfOrder or panicking the
-                            // worker. Mirrors `leptos_actix` (leptos-rs/leptos#4755).
+                            // Static modes are handled above. This catch-all
+                            // also returns a typed 500 if a future dependency
+                            // adds a mode this integration cannot render.
                             ref mode => unsupported_ssr_mode_route(method, mode),
                         },
                     );
@@ -290,8 +294,15 @@ where
 ///
 /// # fn app() -> impl IntoView { "" }
 /// # fn shell() -> impl IntoView { "" }
-/// #[ntex::main]
-/// async fn main() -> std::io::Result<()> {
+/// fn main() -> std::io::Result<()> {
+///     ntex::rt::System::new(
+///         "leptos-ntex",
+///         leptos_ntex_unofficial::RequestRuntime::new(ntex::rt::DefaultRuntime),
+///     )
+///     .block_on(run())
+/// }
+///
+/// async fn run() -> std::io::Result<()> {
 ///     let routes = generate_route_list(app);
 ///     web::server(move || {
 ///         let routes = routes.clone();

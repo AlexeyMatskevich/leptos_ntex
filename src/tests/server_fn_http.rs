@@ -1,1100 +1,577 @@
 use super::*;
 use crate::{handle_server_fns, register_explicit, register_leptos_routes};
-use ntex::http::{StatusCode, header};
+use lets_expect::*;
+use ntex::http::{
+    Method, StatusCode,
+    header::{self, HeaderMap},
+};
 use ntex::web::{App as NtexApp, test};
 use server_fn::{ServerFn, redirect::REDIRECT_HEADER};
 
-#[ntex::test]
-async fn handles_server_fn_post() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), unit_shell);
-            }),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("Hello, Alice"));
-}
-
-/// `NtexRequest::try_into_stream` enforces the payload limit incrementally as
-/// chunks arrive (`cumulative > limit`) — the only overflow guard for a chunked
-/// streaming body, whose total size the up-front `Content-Length` preflight
-/// cannot see. Pin that boundary from the passing side: a body exactly AT the
-/// limit and one strictly UNDER it must both stream through to the server fn
-/// and succeed with the drained byte count.
-///
-/// Kill matrix for the `>` on `request.rs:122` (`if next > limit`):
-/// - at-limit (16 of 16 bytes, `16 > 16` is false → success) kills `> -> ==`
-///   and `> -> >=` (both would treat the equal case as overflow → 413);
-/// - under-limit (8 of 16 bytes) kills `> -> <` (which would reject every
-///   non-empty body below the limit → 413).
-///
-/// The at-limit body clears the `declared > limit` Content-Length preflight
-/// (`16 > 16` is false), so it genuinely reaches and exercises line 122.
-#[ntex::test]
-async fn streaming_input_payload_limit_boundary() {
-    use crate::LeptosServerFnConfig;
-
-    register_explicit::<DrainStreamingInput>();
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: 16,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    // UNDER the limit: 8 of 16 bytes.
-    let under = test::TestRequest::post()
-        .uri(DrainStreamingInput::PATH)
-        .header("Content-Type", "application/octet-stream")
-        .header("Accept", "application/json")
-        .set_payload("AAAAAAAA")
-        .to_request();
-    let resp = test::call_service(&app, under).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "an under-limit streaming body must drain successfully, not 413"
-    );
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(
-        text.trim().parse::<usize>().ok(),
-        Some(8),
-        "must report EXACTLY 8 drained bytes (a substring check passes for 18/80/108), got: {text:?}"
-    );
-
-    // AT the limit: exactly 16 of 16 bytes.
-    let at_limit = test::TestRequest::post()
-        .uri(DrainStreamingInput::PATH)
-        .header("Content-Type", "application/octet-stream")
-        .header("Accept", "application/json")
-        .set_payload("AAAAAAAAAAAAAAAA")
-        .to_request();
-    let resp = test::call_service(&app, at_limit).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "a body whose size equals the limit must succeed (limit is inclusive), not 413"
-    );
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(
-        text.trim().parse::<usize>().ok(),
-        Some(16),
-        "must report EXACTLY 16 drained bytes (a substring check passes for 116/160), got: {text:?}"
-    );
-}
-
-/// The OVER-limit side of the streaming-input boundary: a body past the limit,
-/// sent WITHOUT a `Content-Length` (so the up-front preflight can't see it),
-/// must trip `try_into_stream`'s per-chunk guard (`next > limit`), stash the
-/// `PayloadTooLarge` marker, and surface as a `413`. This is the streaming-INPUT
-/// overflow path — distinct from the buffered `collect_payload` path the other
-/// 413 tests exercise — and the boundary test above never actually crosses the
-/// limit, so without this a `> -> always-false` regression on `request.rs:122`
-/// would ship undetected.
-#[ntex::test]
-async fn streaming_input_over_limit_returns_413() {
-    use crate::LeptosServerFnConfig;
-
-    register_explicit::<DrainStreamingInput>();
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: 16,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(DrainStreamingInput::PATH)
-        .header("Content-Type", "application/octet-stream")
-        .header("Accept", "application/json")
-        .set_payload("A".repeat(100))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "an over-limit streaming body must 413 via the per-chunk guard, not drain"
-    );
-}
-
-/// The `&mut ServiceConfig` impl registers server functions ITSELF (its
-/// `server_fn_paths()` loop, guarded by `!excluded.contains(path)`), so a
-/// server fn must resolve through `register_leptos_routes` ALONE — WITHOUT
-/// a separate `handle_server_fns()` catch-all. `handles_server_fn_post`
-/// above mounts that catch-all, which masks this registration path; here we
-/// drop it. Inverting the guard (`delete !`) would register only excluded
-/// paths, leaving this non-excluded server fn unrouted → 404.
-#[ntex::test]
-async fn service_config_registers_server_fns_without_a_catch_all() {
-    register_explicit::<EchoName>();
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(NtexApp::new().configure(|cfg| {
-        register_leptos_routes(cfg, routes.clone(), unit_shell);
-    }))
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload("name=Bob")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("Hello, Bob"));
-}
-
-#[ntex::test]
-async fn server_fn_redirect_sets_http_redirect_for_html_form() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), unit_shell);
-            }),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(RedirectToAbout::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/about")
-    );
-}
-
-#[ntex::test]
-async fn server_fn_redirect_sets_client_redirect_header_for_xhr() {
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
-    register_explicit::<EchoWebsocket>();
-    let routes = gen_route_list(UnitApp);
-    let app = test::init_service(
-        NtexApp::new()
-            .route("/api/{tail}*", handle_server_fns())
-            .configure(|cfg| {
-                register_leptos_routes(cfg, routes.clone(), unit_shell);
-            }),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(RedirectToAbout::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/about")
-    );
-    assert!(resp.headers().contains_key(REDIRECT_HEADER));
-}
-
-/// A redirect target that is not a valid HTTP header value (e.g. one
-/// carrying a CR/LF/control byte, as an attacker-influenced `?next=` or
-/// `<Redirect>` path might) must degrade gracefully: no Location, no
-/// status change, and crucially no panic in the request handler.
-#[ntex::test]
-async fn redirect_with_invalid_path_degrades_without_panic() {
-    use leptos::context::provide_context;
-    use leptos::reactive::owner::Owner;
-
-    let mock_req = test::TestRequest::with_uri("/")
-        .header("Accept", "text/html")
-        .to_http_request();
-
-    // Invalid path: a newline is rejected by `HeaderValue::from_str`.
-    let owner = Owner::new();
-    owner.with(|| {
-        provide_context(crate::request::Request::new(&mock_req));
-        let res_options = crate::ResponseOptions::default();
-        provide_context(res_options.clone());
-
-        crate::redirect("/about\r\nX-Injected: 1");
-
-        let parts = res_options.0.read().unwrap();
-        assert!(
-            parts.headers.get(ntex::http::header::LOCATION).is_none(),
-            "invalid redirect path must not set a Location header"
-        );
-        assert!(
-            parts.status.is_none(),
-            "invalid redirect path must not change the status"
-        );
-    });
-}
-
-/// Contrast with the invalid-path degrade case above: a VALID redirect path
-/// still sets Location + 302 for an HTML form. Kept as its own test (rather
-/// than a second assertion block bundled into the degrade test) so a CI
-/// failure here is correctly attributed to the success path, not misread as
-/// a regression in the invalid-path handling.
-#[ntex::test]
-async fn redirect_with_valid_path_still_sets_location_and_302() {
-    use leptos::context::provide_context;
-    use leptos::reactive::owner::Owner;
-
-    let mock_req = test::TestRequest::with_uri("/")
-        .header("Accept", "text/html")
-        .to_http_request();
-
-    let owner = Owner::new();
-    owner.with(|| {
-        provide_context(crate::request::Request::new(&mock_req));
-        let res_options = crate::ResponseOptions::default();
-        provide_context(res_options.clone());
-
-        crate::redirect("/about");
-
-        let parts = res_options.0.read().unwrap();
-        assert_eq!(
-            parts
-                .headers
-                .get(ntex::http::header::LOCATION)
-                .and_then(|v| v.to_str().ok()),
-            Some("/about")
-        );
-        assert_eq!(parts.status, Some(StatusCode::FOUND));
-    });
-}
-
-// NOTE: this is ALSO the success-path exercise of `dispatch_server_fn`'s
-// referer-echo branch (handlers.rs:85-88, `location_is_referrer == true`
-// with `referrer.clone()` present): server_fn's OWN `run_on_server` always
-// calls `res.redirect(referer)` when `accepts_html` — for both `Ok` and
-// `Err` outcomes — so `EchoName` (an Ok-returning fn with no explicit
-// redirect of its own) already has server_fn set `Location` to the exact
-// Referer before `dispatch_server_fn` ever runs its post-processing. That
-// makes `location_is_referrer` true and drives the SUCCESS sibling of the
-// branch pinned on the error side by
-// `server_fn_html_form_same_origin_error_redirect_is_preserved` — replacing
-// `referrer.clone()` with the raw, un-normalized `Referer` header (e.g.
-// dropping the `same_origin_location` normalization) fails this test's
-// exact-location assertion below.
-#[ntex::test]
-async fn server_fn_html_form_falls_back_to_same_origin_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:8080/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/form")
-    );
-}
-
-#[ntex::test]
-async fn server_fn_html_form_does_not_fallback_to_different_port_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:9090/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().get("location").is_none());
-}
-
-/// The genuine "nothing to fall back to" case: an HTML-accepting client that
-/// sends NO `Referer` header at all. Every other referer-fallback test in
-/// this file sends a Referer (matching-origin or wrong-origin); none omits
-/// it entirely while still requesting `Accept: text/html` against an `Ok`,
-/// no-redirect server fn.
-///
-/// With no Referer, server_fn's OWN `run_on_server` still calls
-/// `res.redirect(referer.as_deref().unwrap_or("/"))` for any HTML-accepting
-/// request — Ok or Err — so the response is a `302` to the bare root `/`,
-/// NOT a plain `200`. `raw_referrer` is `None` on our side, so
-/// `location_is_referrer` is false and the bare-200 same-origin fallback
-/// (handlers.rs:93-99) never fires either; the `/` root IS same-origin, so
-/// the wholesale same-origin guard leaves it untouched. This pins that
-/// exact shape: a regression that suppressed this fallback (e.g. treating
-/// `referer.unwrap_or("/")`'s default target as somehow un-routable) would
-/// change the observed status/Location here.
-#[ntex::test]
-async fn server_fn_html_form_with_no_referer_redirects_to_bare_root() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "server_fn's own form-redirect fallback defaults to the bare root when no Referer is present"
-    );
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/"),
-        "with no Referer present, the fallback target is the bare root '/'"
-    );
-}
-
-#[ntex::test]
-async fn server_fn_html_form_does_not_fallback_to_protocol_relative_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test")
-        .header(header::REFERER, "//attacker.test/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().get("location").is_none());
-}
-
-#[ntex::test]
-async fn server_fn_html_form_does_not_fallback_to_different_scheme_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test")
-        .header("X-Forwarded-Proto", "https")
-        .header(header::REFERER, "http://example.test/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().get("location").is_none());
-}
-
-/// The `Accept` axis must not open a hole in the same-origin invariant.
-/// The integration's strict `Accept` parser rejects `text/html;q=0`, so
-/// its own referer-repair block is skipped — but server_fn's form-redirect
-/// fallback gates on a loose `contains("text/html")` and would inject the
-/// raw cross-origin referer as `Location`. The wholesale same-origin guard
-/// must still strip it. (Sibling of the `Accept: text/html` cross-port
-/// case above, varying only the `Accept` value.)
-#[ntex::test]
-async fn server_fn_html_form_with_html_q_zero_accept_does_not_leak_cross_origin_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:9090/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html;q=0")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    // Positive anchor first: the server fn must actually have dispatched and
-    // its (stripped) form redirect must have been reset to `200 OK`. Without
-    // this, the Location-safety assertions pass VACUOUSLY for an undispatched
-    // `400` (no route) or a degraded `500`, which carry no cross-origin
-    // Location either.
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "the server fn must dispatch; the stripped cross-origin redirect resets to 200"
-    );
-    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-    assert!(
-        location.is_none_or(|l| l.starts_with('/')),
-        "Location must never carry a cross-origin target, got {location:?}"
-    );
-}
-
-/// Same-origin sibling of the cross-origin q=0 leak test above. A SAME-origin
-/// form redirect for a `text/html;q=0` client is deliberately LEFT INTACT:
-/// server_fn's form-redirect fallback fires on a loose `contains("text/html")`,
-/// and it is driven solely by `req.accepts()` — which user middleware shares —
-/// so there is no way to suppress only the fallback without corrupting a
-/// middleware's own redirect. This integration therefore matches `leptos_axum` /
-/// `leptos_actix` and lets the same-origin `302` stand; only the cross-origin
-/// leak (test above) is stripped, by the same-origin guard. The real fix belongs
-/// upstream (tighten server_fn's loose `Accept` check).
-#[ntex::test]
-async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_to_same_origin_referrer() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:8080/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html;q=0")
-        .set_payload("name=Alice")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "a same-origin form redirect is preserved (upstream-aligned), got {}",
-        resp.status()
-    );
-    let location = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert!(
-        location.starts_with("http://example.test:8080/form"),
-        "the redirect must target the same-origin referer, got {location:?}"
-    );
-}
-
-/// Error sibling of the q=0 same-origin test above. On the ERROR path server_fn
-/// builds `Location = Referer + ?__path=…&__err=…` and a `302`. For a SAME-origin
-/// referer this is left intact, exactly like the success case — the error rides
-/// in the redirect URL, as `leptos_axum` does. (The CROSS-origin error redirect
-/// IS stripped, and preserves the `500` — see
-/// `server_fn_html_form_error_redirect_strip_preserves_error_status`.)
-#[ntex::test]
-async fn server_fn_html_form_with_html_q_zero_accept_still_redirects_on_error() {
-    register_explicit::<AlwaysErr>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(AlwaysErr::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:8080/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html;q=0")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "a same-origin form-error redirect is preserved (upstream-aligned), got {}",
-        resp.status()
-    );
-    let location = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert!(
-        location.starts_with("http://example.test:8080/form"),
-        "the error redirect must target the same-origin referer (carrying the error query), got {location:?}"
-    );
-    // ...and the error must actually RIDE in the redirect URL: a Location that
-    // dropped the encoded query (bare referer) would pass the prefix check
-    // alone but lose the failure payload the form page needs.
-    assert!(
-        location.contains("__path=") && location.contains("__err="),
-        "the error redirect must carry server_fn's encoded error query, got {location:?}"
-    );
-}
-
-/// A user middleware attached to a server fn can short-circuit the request with
-/// its OWN response — e.g. an auth guard issuing a `302` to a login page —
-/// before the inner server fn ever runs. `dispatch_server_fn` must leave that
-/// `3xx` alone. `dispatch_server_fn` has NO non-HTML redirect-stripping branch:
-/// the only post-run intervention is the cross-origin same-origin guard, and a
-/// same-origin `Location` (here `/login`) passes it untouched. Regression for a
-/// chain of three Codex P2 findings — the original `is_redirection()` guard
-/// corrupted any non-HTML `3xx`, its referer-derived replacement still caught a
-/// middleware redirect back to the Referer, and the `accepts()`-source variant
-/// hid non-HTML media types from middleware. Removing the strip entirely (and
-/// matching upstream on the `q=0` form redirect) is what finally keeps this
-/// green without collateral.
-#[ntex::test]
-async fn middleware_redirect_survives_for_non_html_client() {
-    register_explicit::<GuardedByRedirect>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    // The Codex example verbatim: a JSON (non-HTML) client. The middleware
-    // short-circuits, so the only 3xx is its own same-origin `/login` — and with
-    // no strip branch it reaches the client unchanged.
-    let json = test::TestRequest::post()
-        .uri(GuardedByRedirect::PATH)
-        .header("Accept", "application/json")
-        .set_payload("")
-        .to_request();
-    let resp = test::call_service(&app, json).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "a middleware auth redirect must survive for a JSON client, not collapse to 200/500"
-    );
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/login"),
-        "the middleware's own Location must be preserved"
-    );
-
-    // The case the second Codex finding called out: a loose `text/html` Accept
-    // (`q=0`) WITH a Referer present — exactly when server_fn's fallback WOULD
-    // fire had the inner fn run. The middleware short-circuits so the fallback
-    // never runs, and its same-origin `/login` (not the Referer) passes the
-    // cross-origin guard untouched.
-    let q_zero = test::TestRequest::post()
-        .uri(GuardedByRedirect::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:8080/dashboard")
-        .header("Accept", "text/html;q=0")
-        .set_payload("")
-        .to_request();
-    let resp = test::call_service(&app, q_zero).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "a middleware redirect to a non-referer target must survive even under text/html;q=0"
-    );
-    assert_eq!(
-        resp.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/login")
-    );
-
-    // The other 3xx Codex called out: a conditional `304 Not Modified` from a
-    // caching middleware. It carries no `Location`, so it can never match the
-    // referer-derived form-redirect shape — it must pass through untouched
-    // rather than being reset to `200`.
-    register_explicit::<GuardedByNotModified>();
-    let not_modified = test::TestRequest::post()
-        .uri(GuardedByNotModified::PATH)
-        .header("Accept", "application/json")
-        .set_payload("")
-        .to_request();
-    let resp = test::call_service(&app, not_modified).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_MODIFIED,
-        "a middleware 304 must survive for a JSON client, not collapse to 200"
-    );
-}
-
-/// When a server function **errors** on an HTML form post, server_fn rewrites
-/// the response into a `302` back to the Referer with the error encoded in the
-/// query. With a cross-origin Referer the same-origin guard must strip that
-/// unsafe `Location` WITHOUT promoting the failure to `200 OK` — the caller
-/// still has to observe a server error. Sibling of the successful cross-origin
-/// cases above, varying the server-fn OUTCOME (Err vs Ok).
-#[ntex::test]
-async fn server_fn_html_form_error_redirect_strip_preserves_error_status() {
-    register_explicit::<AlwaysErr>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(AlwaysErr::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://evil.test/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "stripping an unsafe error redirect must preserve the server-fn failure status, got {}",
-        resp.status()
-    );
-    assert!(
-        resp.headers().get("location").is_none(),
-        "the unsafe cross-origin error Location must be stripped"
-    );
-}
-
-/// Same-origin sibling of the cross-origin error case above (C3), varying the
-/// Referer's origin. A SAME-origin form-error redirect is legitimate — the form
-/// page shows the error — so the `302` back to the full referer must be
-/// PRESERVED, not stripped and not normalized to a bare path. Pins both halves
-/// of the redirect machinery: `NtexServerResponse::redirect` must actually set
-/// the `302`+`Location` (a no-op there drops it to a non-redirect), and
-/// `location_matches_referrer` must NOT treat the upstream error-query URL as a
-/// plain referer echo (a blanket match would rewrite it to bare "/form").
-#[ntex::test]
-async fn server_fn_html_form_same_origin_error_redirect_is_preserved() {
-    register_explicit::<AlwaysErr>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(AlwaysErr::PATH)
-        .header(header::HOST, "example.test:8080")
-        .header(header::REFERER, "http://example.test:8080/form")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "text/html")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::FOUND,
-        "a same-origin form error must stay a 302 back to the form, got {}",
-        resp.status()
-    );
-    let location = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    assert!(
-        location
-            .as_deref()
-            .is_some_and(|l| l.starts_with("http://example.test:8080/form")),
-        "the same-origin error redirect must preserve the full referer URL, got {location:?}"
-    );
-    let location = location.unwrap_or_default();
-    assert!(
-        location.contains("__path=") && location.contains("__err="),
-        "the same-origin error redirect must preserve server_fn's encoded error query, got {location:?}"
-    );
-}
-
-/// `NtexServerResponse::content_type` (the `Res::content_type` setter) is only
-/// reached on the server-fn ERROR path, where server_fn sets the error
-/// encoding's media type after `error_response`. A no-op there would leave the
-/// error body with no `Content-Type`, so pin it: an erroring server fn must
-/// report `text/plain` (the `ServerFnError` encoder's `CONTENT_TYPE`). No
-/// Referer/Accept here, so no form redirect intervenes — we observe the raw
-/// error response.
-#[ntex::test]
-async fn server_fn_error_response_sets_error_encoder_content_type() {
-    register_explicit::<AlwaysErr>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(AlwaysErr::PATH)
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
-    assert_eq!(
-        content_type,
-        Some("text/plain"),
-        "the server-fn error encoder's Content-Type must be set on the error response"
-    );
-}
-
-/// Oversize request detected via streaming (no Content-Length
-/// preflight, because `set_payload` doesn't set the header — the
-/// limit trips mid-read in `collect_payload` and is promoted to 413
-/// by the `PayloadTooLarge` extension marker.
-#[ntex::test]
-async fn payload_limit_streaming_overflow_returns_413() {
-    use crate::LeptosServerFnConfig;
-    register_explicit::<EchoName>();
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: 10,
-                ws_channel_buffer: 32,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    let oversized = format!("name={}", "A".repeat(100));
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload(oversized)
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    // Exact match, not `.contains("10")`: the configured limit (10) is a
-    // fixed, known value here, so the full production format string
-    // (`oversize_response`'s `"payload exceeds limit of {limit} bytes"`) is
-    // fully determined. A substring check would also pass for a regression
-    // that reported the observed body size instead of the configured limit
-    // (e.g. "...limit of 105 bytes", which still contains "10").
-    assert_eq!(text, "payload exceeds limit of 10 bytes");
-}
-
-/// Oversize request declared via `Content-Length` is rejected by the
-/// preflight, *before* any body bytes are read. The test uses a
-/// deliberately impossible CL value and a tiny body; if the preflight
-/// did not run, `collect_payload` would still succeed (body is small)
-/// and we would incorrectly return 200.
-#[ntex::test]
-async fn payload_limit_content_length_preflight_returns_413() {
-    use crate::LeptosServerFnConfig;
-    register_explicit::<EchoName>();
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: 32,
-                ws_channel_buffer: 32,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .header("Content-Length", "999999")
-        .set_payload("name=Bob")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[ntex::test]
-async fn payload_limit_accepts_small_body() {
-    use crate::LeptosServerFnConfig;
-    register_explicit::<EchoName>();
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: 1024,
-                ws_channel_buffer: 32,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload("name=Bob")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("Hello, Bob"));
-}
-
-#[ntex::test]
-async fn singleton_location_header_is_replaced_through_res_options() {
-    register_explicit::<MultiLocation>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(MultiLocation::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let locations: Vec<_> = resp
-        .headers()
-        .get_all(ntex::http::header::LOCATION)
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    assert_eq!(locations, vec!["/two"]);
-}
-
-#[ntex::test]
-async fn extract_helper_reads_request_path() {
-    register_explicit::<ProbePath>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri(ProbePath::PATH)
-        .header("Accept", "application/json")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("/api/probe_path"));
-}
-
-/// `register_explicit` is idempotent per `(path, method)`: registering the
-/// same server function any number of times — on top of the `inventory`
-/// entry already installed at startup — leaves exactly ONE registration.
-/// Without dedup, native targets accumulate duplicates (and
-/// `server_fn_paths()` emits one row per call).
-#[test]
-fn registering_a_server_fn_twice_keeps_a_single_registration() {
-    use crate::server_fn_paths;
-
-    register_explicit::<EchoName>();
-    register_explicit::<EchoName>();
-    register_explicit::<EchoName>();
-
-    let echo_post = server_fn_paths()
-        .filter(|(p, m)| *p == EchoName::PATH && *m == ntex::http::Method::POST)
-        .count();
-    assert_eq!(
-        echo_post, 1,
-        "a repeated register_explicit must not accumulate duplicate entries"
-    );
-}
-
-#[ntex::test]
-async fn server_fn_paths_and_get_service_roundtrip() {
-    use crate::{get_server_fn_service, server_fn_paths};
-
-    register_explicit::<EchoName>();
-    register_explicit::<RedirectToAbout>();
-
-    let paths: Vec<_> = server_fn_paths().collect();
-    assert!(paths.iter().any(|(p, _)| *p == EchoName::PATH));
-    assert!(paths.iter().any(|(p, _)| *p == RedirectToAbout::PATH));
-
-    let found = get_server_fn_service(EchoName::PATH, &ntex::http::Method::POST);
-    assert!(found.is_some());
-
-    let not_found = get_server_fn_service(EchoName::PATH, &ntex::http::Method::GET);
-    assert!(not_found.is_none());
-
-    let missing = get_server_fn_service("/api/does_not_exist", &ntex::http::Method::POST);
-    assert!(missing.is_none());
-}
-
-/// `handle_server_fns_with_context`'s else-branch has two HTTP-level
-/// outcomes when `get_server_fn_service` returns `None`: a 400 with a
-/// diagnostic body when NO path matches at all (`allowed.is_empty()`), or a
-/// 405 with an `Allow` header when the path matches but the method doesn't
-/// (`catchall_handle_server_fns_returns_405_on_method_mismatch` in
-/// `tests/integration.rs`). Only the 405 sibling was ever driven through the
-/// actual route; this pins the negative direction: a wholly unregistered
-/// path must 400 and name the requested route in the body.
-#[ntex::test]
-async fn catchall_returns_400_for_a_wholly_unregistered_path() {
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::post()
-        .uri("/api/does_not_exist")
-        .set_payload("")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    // Exact body from `handle_server_fns_with_context`'s `allowed.is_empty()` branch.
-    assert_eq!(
-        text,
-        "Could not find a server function at the route /api/does_not_exist. \n\nIt's likely that either\n1. The API prefix you specify in the `#[server]` macro doesn't match the prefix at which your server function handler is mounted, or\n2. You are on a platform that doesn't support automatic server function registration and you need to call register_explicit() on the server function type, somewhere in your `main` function."
-    );
-}
-
-/// Sibling of the 400 test above: a GET to a POST-only registered server fn
-/// must 405 with an EXACT `Allow: POST` header — the direct HTTP-level
-/// analog of `catchall_handle_server_fns_returns_405_on_method_mismatch` in
-/// `tests/integration.rs`, driven here against `EchoName` through
-/// `handle_server_fns()` in this file's own app-building style.
-#[ntex::test]
-async fn catchall_returns_405_with_allow_header_on_method_mismatch() {
-    register_explicit::<EchoName>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
-
-    let req = test::TestRequest::get().uri(EchoName::PATH).to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(
-        resp.headers()
-            .get(header::ALLOW)
-            .and_then(|v| v.to_str().ok()),
-        Some("POST"),
-        "the Allow header must name exactly the registered method"
-    );
-}
-
-// -- Payload boundary tests ----------------------------------------
-
-/// Payload exactly at the limit must be accepted (the check is `>`,
-/// not `>=`).
-#[ntex::test]
-async fn payload_limit_exactly_at_limit_succeeds() {
-    use crate::LeptosServerFnConfig;
-    register_explicit::<EchoName>();
-    let limit = 32;
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: limit,
-                ws_channel_buffer: 32,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    // "name=X" is 6 bytes overhead; pad the value so total == limit.
-    let value = "A".repeat(limit - "name=".len());
-    let body = format!("name={value}");
-    assert_eq!(body.len(), limit);
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload(body)
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-/// Payload one byte over the limit must be rejected with 413.
-#[ntex::test]
-async fn payload_limit_one_over_limit_returns_413() {
-    use crate::LeptosServerFnConfig;
-    register_explicit::<EchoName>();
-    let limit = 32;
-    let app = test::init_service(
-        NtexApp::new()
-            .state(LeptosServerFnConfig {
-                payload_limit: limit,
-                ws_channel_buffer: 32,
-                ..Default::default()
-            })
-            .route("/api/{tail}*", handle_server_fns()),
-    )
-    .await;
-
-    let value = "A".repeat(limit - "name=".len() + 1);
-    let body = format!("name={value}");
-    assert_eq!(body.len(), limit + 1);
-
-    let req = test::TestRequest::post()
-        .uri(EchoName::PATH)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .set_payload(body)
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-// -- GET-method server fn dispatch ----------------------------------
-
-/// A GET-method server fn (`input = GetUrl`): every other fixture driven
-/// through `handle_server_fns()`/`register_leptos_routes` in this file uses
-/// the `#[server]` macro's default POST method, so no test here ever drove
-/// an actual GET request through either handler's method-dispatch logic —
-/// the only GET-related assertion elsewhere is a pure registry-level lookup
-/// (`server_fn_paths_and_get_service_roundtrip`), which never touches HTTP
-/// dispatch at all.
-#[server(
-    name = EchoNameGet,
-    prefix = "/api",
-    endpoint = "echo_name_get",
-    input = server_fn::codec::GetUrl,
-    server = crate::NtexServerFnBackend
-)]
+#[server(name = EchoNameGet, prefix = "/api", endpoint = "echo_name_get", input = server_fn::codec::GetUrl, server = crate::NtexServerFnBackend)]
 async fn echo_name_get(name: String) -> Result<String, ServerFnError> {
     Ok(format!("Hello, {name}"))
 }
 
-/// Closes the method-dispatch gap: a GET request to a GET-registered server
-/// fn must dispatch through `handle_server_fns()` and return the expected
-/// body — pinning that `.method(server_fn.method())` (and the equivalent
-/// generic `req.method()` branch in the catchall) is not hardcoded/defaulted
-/// to POST.
-#[ntex::test]
-async fn handles_server_fn_get() {
+#[derive(Clone)]
+struct RequestSpec {
+    uri: String,
+    method: Method,
+    body: String,
+    accept: Option<&'static str>,
+    referer: Option<&'static str>,
+    scheme: Option<&'static str>,
+    limit: usize,
+    declared: Option<&'static str>,
+}
+impl Default for RequestSpec {
+    fn default() -> Self {
+        Self {
+            uri: EchoName::PATH.into(),
+            method: Method::POST,
+            body: "name=Alice".into(),
+            accept: Some("application/json"),
+            referer: None,
+            scheme: None,
+            limit: crate::DEFAULT_PAYLOAD_LIMIT,
+            declared: None,
+        }
+    }
+}
+#[derive(Debug)]
+struct ResponseSnapshot {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+async fn response(spec: RequestSpec, config_registration: bool) -> ResponseSnapshot {
+    register_explicit::<EchoName>();
     register_explicit::<EchoNameGet>();
-    let app = test::init_service(NtexApp::new().route("/api/{tail}*", handle_server_fns())).await;
+    register_explicit::<DrainStreamingInput>();
+    register_explicit::<RedirectToAbout>();
+    register_explicit::<AlwaysErr>();
+    register_explicit::<GuardedByRedirect>();
+    register_explicit::<GuardedByNotModified>();
+    register_explicit::<MultiLocation>();
+    register_explicit::<ProbePath>();
+    let mut app =
+        NtexApp::new().state(crate::LeptosServerFnConfig::new().with_payload_limit(spec.limit));
+    if config_registration {
+        let routes = gen_route_list(UnitApp);
+        app = app.configure(|cfg| {
+            register_leptos_routes(cfg, routes.clone(), unit_shell);
+        });
+    } else {
+        app = app.route("/api/{tail}*", handle_server_fns());
+    }
+    let app = test::init_service(app).await;
+    let mut request = test::TestRequest::with_uri(&spec.uri)
+        .method(spec.method)
+        .header(header::HOST, "example.test:8080")
+        .header(
+            header::CONTENT_TYPE,
+            if spec.uri == DrainStreamingInput::PATH {
+                "application/octet-stream"
+            } else {
+                "application/x-www-form-urlencoded"
+            },
+        )
+        .set_payload(spec.body);
+    if let Some(value) = spec.accept {
+        request = request.header(header::ACCEPT, value);
+    }
+    if let Some(value) = spec.referer {
+        request = request.header(header::REFERER, value);
+    }
+    if let Some(value) = spec.scheme {
+        request = request.header("X-Forwarded-Proto", value);
+    }
+    if let Some(value) = spec.declared {
+        request = request.header(header::CONTENT_LENGTH, value);
+    }
+    let response = test::call_service(&app, request.to_request()).await;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = test::read_body(response).await.to_vec();
+    ResponseSnapshot {
+        status,
+        headers,
+        body,
+    }
+}
+fn have_status(expected: StatusCode) -> impl Fn(&ResponseSnapshot) -> AssertionResult {
+    move |response| equal(expected)(&response.status)
+}
+fn have_header(
+    name: &'static str,
+    expected: Option<&'static str>,
+) -> impl Fn(&ResponseSnapshot) -> AssertionResult {
+    move |response| {
+        let actual = response.headers.get(name).and_then(|v| v.to_str().ok());
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "{name}: expected {expected:?}, got {actual:?}"
+            )]))
+        }
+    }
+}
+fn have_body(expected: impl Into<String>) -> impl Fn(&ResponseSnapshot) -> AssertionResult {
+    let expected = expected.into();
+    move |response| {
+        if response.body == expected.as_bytes() {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected body {expected:?}, got {:?}",
+                String::from_utf8_lossy(&response.body)
+            )]))
+        }
+    }
+}
+fn have_client_redirect(response: &ResponseSnapshot) -> AssertionResult {
+    equal(true)(&response.headers.contains_key(REDIRECT_HEADER))
+}
+fn target_same_origin_form(response: &ResponseSnapshot) -> AssertionResult {
+    let location = response
+        .headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    let valid = location
+        .and_then(|s| s.parse::<ntex::http::Uri>().ok())
+        .is_some_and(|uri| {
+            uri.scheme_str() == Some("http")
+                && uri.authority().map(|v| v.as_str()) == Some("example.test:8080")
+                && uri.path() == "/form"
+                && uri.query().is_none_or(str::is_empty)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(AssertionError::new(vec![format!(
+            "expected same-origin form target without query data, got {location:?}"
+        )]))
+    }
+}
+fn carry_form_error(response: &ResponseSnapshot) -> AssertionResult {
+    let location = response
+        .headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    if location.is_some_and(|s| {
+        s.starts_with("http://example.test:8080/form?")
+            && s.contains("__path=")
+            && s.contains("__err=")
+    }) {
+        Ok(())
+    } else {
+        Err(AssertionError::new(vec![format!(
+            "missing form error query in Location: {location:?}"
+        )]))
+    }
+}
+fn have_single_location(response: &ResponseSnapshot) -> AssertionResult {
+    let values: Vec<_> = response
+        .headers
+        .get_all(header::LOCATION)
+        .map(|v| v.to_str().unwrap_or("<non-text>"))
+        .collect();
+    equal(vec!["/two"])(&values)
+}
+fn form_spec(accept: &'static str, referer: Option<&'static str>, error: bool) -> RequestSpec {
+    RequestSpec {
+        uri: if error {
+            AlwaysErr::PATH
+        } else {
+            EchoName::PATH
+        }
+        .into(),
+        body: if error { "" } else { "name=Alice" }.into(),
+        accept: Some(accept),
+        referer,
+        ..Default::default()
+    }
+}
+fn payload_spec(streaming: bool, length: usize, limit: usize) -> RequestSpec {
+    RequestSpec {
+        uri: if streaming {
+            DrainStreamingInput::PATH
+        } else {
+            EchoName::PATH
+        }
+        .into(),
+        body: if streaming {
+            "A".repeat(length)
+        } else {
+            format!("name={}", "A".repeat(length - 5))
+        },
+        limit,
+        ..Default::default()
+    }
+}
+fn redirect_parts(path: &'static str) -> (Option<StatusCode>, Option<String>) {
+    let _scope = crate::RequestScope::new();
+    let request = test::TestRequest::with_uri("/")
+        .header(header::ACCEPT, "text/html")
+        .to_http_request();
+    let owner = leptos::reactive::owner::Owner::new();
+    owner.with(|| {
+        provide_context(crate::Request::new(&request));
+        let options = crate::ResponseOptions::default();
+        provide_context(options.clone());
+        crate::redirect(path);
+        let parts = options.0.read().unwrap();
+        (
+            parts.status,
+            parts
+                .headers
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        )
+    })
+}
+fn registration_count(repeat: bool) -> usize {
+    register_explicit::<EchoName>();
+    if repeat {
+        register_explicit::<EchoName>();
+        register_explicit::<EchoName>();
+    }
+    crate::server_fn_paths()
+        .filter(|(p, m)| *p == EchoName::PATH && *m == Method::POST)
+        .count()
+}
+fn lookup(path: &'static str, method: Method) -> bool {
+    register_explicit::<EchoName>();
+    crate::get_server_fn_service(path, &method).is_some()
+}
+fn listed_paths() -> (bool, bool) {
+    register_explicit::<EchoName>();
+    register_explicit::<RedirectToAbout>();
+    let paths: Vec<_> = crate::server_fn_paths().collect();
+    (
+        paths
+            .iter()
+            .any(|(p, m)| *p == EchoName::PATH && *m == Method::POST),
+        paths
+            .iter()
+            .any(|(p, m)| *p == RedirectToAbout::PATH && *m == Method::POST),
+    )
+}
 
-    let req = test::TestRequest::get()
-        .uri(&format!("{}?name=Carol", EchoNameGet::PATH))
-        .header("Accept", "application/json")
-        .to_request();
+const MISSING_DIAGNOSTIC: &str = "Could not find a server function at the route /api/does_not_exist. \n\nIt's likely that either\n1. The API prefix you specify in the `#[server]` macro doesn't match the prefix at which your server function handler is mounted, or\n2. You are on a platform that doesn't support automatic server function registration and you need to call register_explicit() on the server function type, somewhere in your `main` function.";
 
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+lets_expect! {
+    expect(run_ntex(response(spec, false))) as server_function_dispatch {
+        let spec = RequestSpec::default();
+        to dispatch_post { have_status(StatusCode::OK), have_body("\"Hello, Alice\"") }
+        when registered_function_uses_get {
+            let spec = RequestSpec { uri: format!("{}?name=Carol", EchoNameGet::PATH), method: Method::GET, body: String::new(), ..Default::default() };
+            to dispatch_query { have_status(StatusCode::OK), have_body("\"Hello, Carol\"") }
+        }
+        when method_is_wrong {
+            let spec = RequestSpec { method: Method::GET, ..Default::default() };
+            to report_allowed_method { have_status(StatusCode::METHOD_NOT_ALLOWED), have_header("allow", Some("POST")) }
+        }
+        when function_is_missing {
+            let spec = RequestSpec { uri: "/api/does_not_exist".into(), ..Default::default() };
+            to explain_missing_registration { have_status(StatusCode::BAD_REQUEST), have_body(MISSING_DIAGNOSTIC) }
+        }
+    }
+    expect(run_ntex(response(RequestSpec { body: "name=Bob".into(), ..Default::default() }, true))) as service_config_registration {
+        to dispatch_without_catchall { have_status(StatusCode::OK), have_body("\"Hello, Bob\"") }
+    }
+    expect(run_ntex(response(payload_spec(false, length, limit), false))) as buffered_payload {
+        let length = 8usize;
+        let limit = 32usize;
+        to accept_small_body { have_status(StatusCode::OK), have_body("\"Hello, AAA\"") }
+        when size_equals_limit {
+            let length = 32usize;
+            to accept_inclusive_limit { have_status(StatusCode::OK), have_body(format!("\"Hello, {}\"", "A".repeat(27))) }
+        }
+        when size_is_one_above_limit {
+            let length = 33usize;
+            to reject_body { have_status(StatusCode::PAYLOAD_TOO_LARGE), have_body("payload exceeds limit of 32 bytes") }
+        }
+        when size_is_far_above_limit {
+            let length = 105usize;
+            to report_configured_limit { have_status(StatusCode::PAYLOAD_TOO_LARGE), have_body("payload exceeds limit of 32 bytes") }
+        }
+    }
+    expect(run_ntex(response(payload_spec(true, length, 16), false))) as drained_stream_payload {
+        let length = 8usize;
+        to drain_all_bytes { have_status(StatusCode::OK), have_body("8") }
+        when size_equals_limit { let length = 16usize; to accept_inclusive_limit { have_status(StatusCode::OK), have_body("16") } }
+        when size_is_one_above_limit { let length = 17usize; to reject_before_response { have_status(StatusCode::PAYLOAD_TOO_LARGE) } }
+        when size_is_far_above_limit { let length = 100usize; to reject_before_response { have_status(StatusCode::PAYLOAD_TOO_LARGE) } }
+    }
+    expect(run_ntex(response(RequestSpec { body: "name=Bob".into(), limit: 32, declared, ..Default::default() }, false))) as declared_payload {
+        let declared = None;
+        to accept_small_actual_body { have_status(StatusCode::OK), have_body("\"Hello, Bob\"") }
+        when declared_size_exceeds_limit { let declared = Some("999999"); to reject_before_reading { have_status(StatusCode::PAYLOAD_TOO_LARGE) } }
+    }
+    expect(run_ntex(response(RequestSpec { uri: RedirectToAbout::PATH.into(), body: String::new(), accept: Some(accept), ..Default::default() }, false))) as explicit_redirect {
+        let accept = "text/html";
+        to redirect_html_client { have_status(StatusCode::FOUND), have_header("location", Some("/about")) }
+        when client_accepts_json { let accept = "application/json"; to signal_client_navigation { have_status(StatusCode::OK), have_header("location", Some("/about")), have_client_redirect } }
+    }
+    expect(run_ntex(response(form_spec(accept, referer, false), false))) as successful_form_fallback {
+        let accept = "text/html";
+        let referer = Some("http://example.test:8080/form");
+        to normalize_same_origin { have_status(StatusCode::FOUND), have_header("location", Some("/form")) }
+        when referer_is_missing { let referer = None; to use_root { have_status(StatusCode::FOUND), have_header("location", Some("/")) } }
+        when referer_uses_other_port { let referer = Some("http://example.test:9090/form"); to omit_location { have_status(StatusCode::OK), have_header("location", None) } }
+        when referer_is_protocol_relative { let referer = Some("//other.test/form"); to omit_location { have_status(StatusCode::OK), have_header("location", None) } }
+        // server_fn currently uses a loose HTML check. Preserve its same-origin
+        // q=0 fallback until that dependency contract changes; keep the origin guard.
+        when html_has_zero_quality {
+            let accept = "text/html;q=0";
+            to preserve_dependency_redirect { have_status(StatusCode::FOUND), target_same_origin_form }
+            when referer_uses_other_port { let referer = Some("http://example.test:9090/form"); to omit_location { have_status(StatusCode::OK), have_header("location", None) } }
+        }
+    }
+    expect(run_ntex(response(RequestSpec { scheme: Some("https"), ..form_spec("text/html", Some("http://example.test:8080/form"), false) }, false))) as different_scheme_form {
+        to omit_location { have_status(StatusCode::OK), have_header("location", None) }
+    }
+    expect(run_ntex(response(form_spec(accept, referer, true), false))) as failed_form_fallback {
+        let accept = "text/html";
+        let referer = Some("http://example.test:8080/form");
+        to preserve_form_error { have_status(StatusCode::FOUND), carry_form_error }
+        when referer_has_other_origin { let referer = Some("http://other.test/form"); to preserve_error_status { have_status(StatusCode::INTERNAL_SERVER_ERROR), have_header("location", None) } }
+        when html_has_zero_quality {
+            let accept = "text/html;q=0";
+            to preserve_form_error { have_status(StatusCode::FOUND), carry_form_error }
+            when referer_has_other_origin { let referer = Some("http://other.test/form"); to preserve_error_status { have_status(StatusCode::INTERNAL_SERVER_ERROR), have_header("location", None) } }
+        }
+    }
+    expect(run_ntex(response(RequestSpec { uri: GuardedByRedirect::PATH.into(), body: String::new(), accept: Some(accept), referer, ..Default::default() }, false))) as middleware_redirect {
+        let accept = "application/json";
+        let referer = None;
+        to preserve_middleware_response { have_status(StatusCode::FOUND), have_header("location", Some("/login")) }
+        when client_is_html_q_zero_form {
+            let accept = "text/html;q=0";
+            let referer = Some("http://example.test:8080/dashboard");
+            to preserve_middleware_response { have_status(StatusCode::FOUND), have_header("location", Some("/login")) }
+        }
+    }
+    expect(run_ntex(response(RequestSpec { uri: GuardedByNotModified::PATH.into(), body: String::new(), ..Default::default() }, false))) as middleware_not_modified {
+        to preserve_middleware_response { have_status(StatusCode::NOT_MODIFIED), have_header("location", None) }
+    }
+    expect(run_ntex(response(RequestSpec { uri: AlwaysErr::PATH.into(), body: String::new(), accept: None, ..Default::default() }, false))) as raw_function_error {
+        to report_error_encoding { have_status(StatusCode::INTERNAL_SERVER_ERROR), have_header("content-type", Some("text/plain")) }
+    }
+    expect(run_ntex(response(RequestSpec { uri: MultiLocation::PATH.into(), body: String::new(), ..Default::default() }, false))) as response_options_location {
+        to replace_singleton { have_status(StatusCode::OK), have_single_location }
+    }
+    expect(run_ntex(response(RequestSpec { uri: ProbePath::PATH.into(), body: String::new(), ..Default::default() }, false))) as request_path_extraction {
+        to return_request_path { have_status(StatusCode::OK), have_body("\"/api/probe_path\"") }
+    }
+    expect(run_ntex(async move { redirect_parts(path) })) as redirect_options {
+        let path = "/about";
+        to set_redirect { equal((Some(StatusCode::FOUND), Some("/about".to_string()))) }
+        when target_has_invalid_header_bytes { let path = "/about\r\ninvalid"; to leave_options_unchanged { equal((None, None)) } }
+    }
+    expect(registration_count(repeat)) as explicit_registration {
+        let repeat = false;
+        to contain_one_entry { equal(1) }
+        when registration_is_repeated { let repeat = true; to contain_one_entry { equal(1) } }
+    }
+    expect(lookup(path, method)) as registered_service_lookup {
+        let path = EchoName::PATH;
+        let method = Method::POST;
+        to find_registered_service { be_true }
+        when method_is_wrong { let method = Method::GET; to find_no_service { be_false } }
+        when path_is_missing {
+            let path = "/api/does_not_exist";
+            to find_no_service { be_false }
+            when method_is_get { let method = Method::GET; to find_no_service { be_false } }
+        }
+    }
+    expect(listed_paths()) as server_function_listing { to include_both_registered_methods { equal((true, true)) } }
+}
 
-    let body = test::read_body(resp).await;
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    // Exact JSON-encoded server_fn output, not a substring.
-    assert_eq!(text, "\"Hello, Carol\"");
+#[derive(Clone, Copy)]
+enum Rejection {
+    MissingUpgrade,
+    MissingVersion,
+    UnsupportedVersion,
+    PayloadOverflow,
+}
+
+// The rejected response owns its body metadata; the application has already
+// supplied independent headers and metadata for a response that never completed.
+fn rejected_response_context() {
+    let options = use_context::<crate::ResponseOptions>().unwrap();
+    options.set_status(StatusCode::ACCEPTED);
+    options.append_header(
+        header::SET_COOKIE,
+        header::HeaderValue::from_static("session=one; HttpOnly"),
+    );
+    options.append_header(
+        header::SET_COOKIE,
+        header::HeaderValue::from_static("csrf=two; SameSite=Lax"),
+    );
+    options.append_header(header::VARY, header::HeaderValue::from_static("Accept"));
+    options.append_header(header::VARY, header::HeaderValue::from_static("Origin"));
+    options.insert_header(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, no-store"),
+    );
+    options.insert_header(
+        header::LOCATION,
+        header::HeaderValue::from_static("/account"),
+    );
+    options.append_header(
+        header::HeaderName::from_static("x-application"),
+        header::HeaderValue::from_static("first"),
+    );
+    options.append_header(
+        header::HeaderName::from_static("x-application"),
+        header::HeaderValue::from_static("second"),
+    );
+    for (name, value) in [
+        (header::CONTENT_TYPE, "application/json"),
+        (header::CONTENT_LENGTH, "999"),
+        (header::CONTENT_ENCODING, "gzip"),
+        (header::CONTENT_RANGE, "bytes 0-998/999"),
+        (header::CONTENT_LANGUAGE, "fr"),
+        (header::CONTENT_LOCATION, "/old-representation"),
+        (header::TRANSFER_ENCODING, "chunked"),
+        (header::ETAG, "\"old\""),
+        (header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT"),
+        (header::ACCEPT_RANGES, "bytes"),
+        (header::SEC_WEBSOCKET_VERSION, "999"),
+    ] {
+        options.insert_header(name, header::HeaderValue::from_static(value));
+    }
+}
+
+async fn rejected_response(rejection: Rejection, per_path: bool) -> ResponseSnapshot {
+    use crate::LeptosRoutes;
+    register_explicit::<EchoWebsocket>();
+    register_explicit::<EchoName>();
+    let app = NtexApp::new().state(crate::LeptosServerFnConfig::new().with_payload_limit(1));
+    let app = if per_path {
+        app.leptos_routes_with_context(Vec::new(), rejected_response_context, || ())
+    } else {
+        app.route(
+            "/api/{tail}*",
+            crate::handle_server_fns_with_context(rejected_response_context),
+        )
+    };
+    let app = test::init_service(app).await;
+    let request = match rejection {
+        Rejection::PayloadOverflow => test::TestRequest::with_uri(EchoName::PATH)
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .set_payload("name=Alice"),
+        Rejection::MissingUpgrade => {
+            test::TestRequest::with_uri(EchoWebsocket::PATH).method(Method::GET)
+        }
+        Rejection::MissingVersion => test::TestRequest::with_uri(EchoWebsocket::PATH)
+            .method(Method::GET)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "upgrade"),
+        Rejection::UnsupportedVersion => test::TestRequest::with_uri(EchoWebsocket::PATH)
+            .method(Method::GET)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "upgrade")
+            .header(header::SEC_WEBSOCKET_VERSION, "999"),
+    };
+    let response = test::call_service(&app, request.to_request()).await;
+    ResponseSnapshot {
+        status: response.status(),
+        headers: response.headers().clone(),
+        body: test::read_body(response).await.to_vec(),
+    }
+}
+
+fn completed_rejection(rejection: Rejection) -> impl Fn(&ResponseSnapshot) -> AssertionResult {
+    move |response| {
+        let (status, body, content_type) = match rejection {
+            Rejection::PayloadOverflow => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload exceeds limit of 1 bytes",
+                Some("text/plain; charset=utf-8"),
+            ),
+            _ => (StatusCode::BAD_REQUEST, "", None),
+        };
+        have_status(status)(response)?;
+        have_body(body)(response)?;
+        have_header("content-type", content_type)(response)?;
+        for name in [
+            "content-length",
+            "content-encoding",
+            "content-range",
+            "content-language",
+            "content-location",
+            "transfer-encoding",
+            "etag",
+            "last-modified",
+            "accept-ranges",
+        ] {
+            have_header(name, None)(response)?;
+        }
+        have_header("cache-control", Some("private, no-store"))(response)?;
+        have_header("location", Some("/account"))(response)?;
+        let values = |name| {
+            response
+                .headers
+                .get_all(name)
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        equal(vec![
+            "session=one; HttpOnly".to_owned(),
+            "csrf=two; SameSite=Lax".to_owned(),
+        ])(&values(header::SET_COOKIE))?;
+        equal(vec!["Accept".to_owned(), "Origin".to_owned()])(&values(header::VARY))?;
+        equal(vec!["first".to_owned(), "second".to_owned()])(&values(
+            header::HeaderName::from_static("x-application"),
+        ))?;
+        let versions = if matches!(rejection, Rejection::UnsupportedVersion) {
+            vec!["13, 8, 7".to_owned()]
+        } else {
+            Vec::new()
+        };
+        equal(versions)(&values(header::SEC_WEBSOCKET_VERSION))
+    }
+}
+
+lets_expect! {
+    expect(run_ntex(rejected_response(rejection, per_path))) as rejected_server_response_completion {
+        let rejection = Rejection::MissingUpgrade;
+        let per_path = false;
+        to preserves_application_headers_and_the_handshake_error { completed_rejection(rejection) }
+        when registration_is_per_path {
+            let per_path = true;
+            to preserves_application_headers_and_the_handshake_error { completed_rejection(rejection) }
+        }
+        when the_version_is_missing {
+            let rejection = Rejection::MissingVersion;
+            to preserves_application_headers_and_the_version_error { completed_rejection(rejection) }
+            when registration_is_per_path {
+                let per_path = true;
+                to preserves_application_headers_and_the_version_error { completed_rejection(rejection) }
+            }
+        }
+        when the_version_is_unsupported {
+            let rejection = Rejection::UnsupportedVersion;
+            to preserves_application_headers_and_supported_versions { completed_rejection(rejection) }
+            when registration_is_per_path {
+                let per_path = true;
+                to preserves_application_headers_and_supported_versions { completed_rejection(rejection) }
+            }
+        }
+        when the_payload_exceeds_the_budget {
+            let rejection = Rejection::PayloadOverflow;
+            to preserves_application_headers_and_the_payload_error { completed_rejection(rejection) }
+            when registration_is_per_path {
+                let per_path = true;
+                to preserves_application_headers_and_the_payload_error { completed_rejection(rejection) }
+            }
+        }
+    }
 }

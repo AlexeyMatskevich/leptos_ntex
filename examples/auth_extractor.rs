@@ -110,8 +110,15 @@ async fn current_user_name() -> Result<String, ServerFnError> {
     Ok(user.name)
 }
 
-#[ntex::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    ntex::rt::System::new(
+        "leptos-ntex",
+        leptos_ntex_unofficial::RequestRuntime::new(ntex::rt::DefaultRuntime),
+    )
+    .block_on(run())
+}
+
+async fn run() -> std::io::Result<()> {
     web::server(|| async {
         NtexApp::new()
             // Make `AuthState` available to ntex handlers and extractors.
