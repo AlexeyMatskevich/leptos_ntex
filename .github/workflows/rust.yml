@@ -2,9 +2,12 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,17 +15,64 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.88.0", stable]
+        runtime: ["", "ntex/tokio"]
+        features: ["", "cookie", "tracing", "islands-router", "cookie,tracing", "cookie,islands-router", "tracing,islands-router", "cookie,tracing,islands-router"]
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.88
-      with:
-        components: rustfmt, clippy
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-    - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
-    - name: Test
-      run: cargo test --all-features --verbose
-    - name: Docs
-      run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Test feature combination, including doctests
+        env:
+          TEST_FEATURES: ${{ matrix.features }}
+          RUNTIME_FEATURE: ${{ matrix.runtime }}
+        run: |
+          features="$TEST_FEATURES"
+          if [ -n "$RUNTIME_FEATURE" ]; then
+            features="${features:+$features,}$RUNTIME_FEATURE"
+          fi
+          cargo test --locked --no-default-features --features "$features"
+
+  # ntex-rt 3.17 changed `Runner::block_on` to return a panic result; build.rs
+  # selects the signature at compile time. Cargo.lock pins the older shape, so
+  # this leg resolves the newest dependencies and exercises the other one.
+  runner-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: stable
+      - name: Resolve the newest compatible dependencies
+        run: cargo update
+      - name: Build every target against the panic-result Runner
+        run: cargo check --all-targets --all-features
+      - name: Run the RequestRuntime specs
+        run: cargo test --test managed_request
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+      - name: Verify package without publishing
+        run: cargo package --locked
