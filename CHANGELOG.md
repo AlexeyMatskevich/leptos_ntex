@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-13
+
 ### Breaking
 
 - Replace `Request`'s `Deref`/`DerefMut` access with scoped `with` callbacks.
@@ -731,7 +733,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `tracing` feature and `islands-router` feature flag forwarded to
   Leptos.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/AlexeyMatskevich/leptos_ntex/compare/v0.5.0...v0.6.0
