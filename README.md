@@ -54,8 +54,15 @@ fn shell() -> impl IntoView {
     }
 }
 
-#[ntex::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+    ntex::rt::System::new(
+        "leptos-ntex",
+        leptos_ntex_unofficial::RequestRuntime::new(ntex::rt::DefaultRuntime),
+    )
+    .block_on(run())
+}
+
+async fn run() -> std::io::Result<()> {
     let routes = generate_route_list(App);
     web::server(move || {
         let routes = routes.clone();
@@ -188,6 +195,298 @@ Configured WebSocket subprotocols are only echoed when the client offered the
 same protocol in `Sec-WebSocket-Protocol`. For dynamic negotiation, use a
 custom ntex WebSocket handler and `ntex::web::ws::subprotocols`.
 
+### Streaming and connection lifetime
+
+The payload limit applies to incoming HTTP bodies and complete incoming
+WebSocket messages. Oversized declared lengths and overflow observed by the
+dispatcher before it returns the response produce `413`. A streaming server
+function can return its response before it finishes reading its input. A later
+input error remains a stream error, even if no response bytes have reached the
+client yet; an already sent status cannot change. On HTTP/1 the adapter
+terminates a failed response connection; HTTP/2 keeps ntex's native stream-error
+handling. A lazy response can therefore end without any response bytes or with
+an incomplete original response. Clients must treat a truncated body as a
+failed response.
+
+Application headers supplied through `ResponseOptions` survive handshake and
+payload-limit errors detected after context setup. These errors retain their
+own status, representation metadata and supported WebSocket version header.
+Rejections before context setup, including an oversized declared
+`Content-Length`, do not run the context callback.
+
+HEAD still constructs the response, including SSR setup and any required
+prefetch. Once constructed, the response retains its body size and ownership
+for headers and cleanup, but does not poll its body producer.
+
+The WebSocket bridge has one I/O task per connection. It pauses input when the
+application stops reading and waits for transport write capacity before taking
+more output. `ws_channel_buffer` is a message count, not a connection memory
+quota: `futures` channels also reserve one slot per sender, and memory includes
+fragment assembly, the current output message, ntex buffers and socket buffers.
+Application-created sender clones add reservations. If input stays full and the
+application retains its receiver without reading it, ntex may also delay
+observing a transport close until reading resumes; there is no automatic
+application inactivity timeout. The incoming payload limit
+does not limit application-produced output message sizes.
+
+Authenticate requests and check cookie/CSRF and WebSocket Origin policy in ntex
+middleware before upgrade. A WebSocket server function runs after the `101`
+response has been sent. The adapter does not provide an application Origin
+allowlist or authorization policy.
+
+### Static routes and deployment
+
+Generated static HTML is shared by requests for a static route.
+Use it only for public representations: request-specific cookies, headers,
+nonces or personal data captured during generation are also shared. Use dynamic
+SSR for representations that depend on the requesting user.
+Generation uses a synthetic request; it does not receive the visitor's cookies.
+Values supplied by the app through `additional_context` and `ResponseOptions`
+are still captured, including `Set-Cookie`. Setting `Cache-Control: private` or
+`no-store` controls downstream HTTP caches; it does not switch a static route to
+per-user rendering or prevent the origin from saving its generated artifact.
+
+Deploy each generated HTML file together with its hidden metadata, stored as
+`.leptos-static-metadata/<HTML filename>` in the same parent directory. The
+metadata entry follows the same filename limits and case/Unicode equivalence
+rules as the HTML entry. `.leptos-static-metadata` is reserved for this
+protocol: when deploying it separately, preserve the parent directory's case and
+Unicode lookup rules, including any per-directory filesystem flags. A dangling
+metadata symlink or metadata-directory symlink is a damaged artifact, so it
+permits neither guessed metadata nor serving as a metadata-free file. A link
+with a missing or unrepresentable target is damaged metadata, even when its own
+filename is short. Regeneration can replace a damaged final metadata entry; an
+unusable metadata directory, including an ordinary file at that name, cannot be
+published into and is never removed or replaced by the adapter. Valid internal
+symlinks remain usable.
+The directory form preserves the captured status and response
+headers, including an explicitly selected media type, across process restarts.
+When serving a file, an invalid media type falls back to the type inferred from
+its name. Conditional and partial responses preserve `Content-Location`;
+`Content-Language` is omitted from `304` and from `206` responses to `If-Range`
+requests, where the client already has the representation metadata.
+The per-directory publication and scratch bucket lock files may be omitted
+from an immutable deployment. The root's `.leptos-static-policy.lock` stores
+an installed budget and must be retained if publication may resume. Readers also support complete pairs on read-only storage without
+creating lock files; if a concurrent publisher creates a lock, they reopen the
+pair under that lock. Existing lock files must remain readable and must never
+be removed while cooperating processes are serving or publishing.
+Readers verify the HTML digest before applying metadata. Present but unreadable
+or inconsistent metadata is not replaced with a guessed status. HTML without
+metadata is treated as a legacy plain file, so omitting all hidden files loses
+the captured status and headers.
+
+Generation uses capability-relative file operations, exclusive temporary-file
+creation, and advisory locks shared by cooperating adapter processes. A reader
+verifies that the selected HTML bytes match the digest stored with the metadata.
+The two file replacements are not a power-loss transaction: interruption between
+them can temporarily make the route unavailable until regeneration. If the old
+and new HTML bytes are identical, the new metadata can already be valid with the
+old file; this format does not preserve a physical generation identifier.
+External writers must deploy complete pairs and honor the same coordination.
+Arbitrary in-place editing is outside this guarantee. Live publishers must use
+the same publication protocol; backward-readable artifacts do not make concurrent
+publication by an older adapter version safe.
+The `.leptos-static-publish.lock` in each physical parent directory coordinates
+the two replacements, including paths that differ only in case or Unicode form
+on filesystems that treat them as aliases. Readers hold it shared only while
+opening the two files, then validate their pinned contents after releasing it.
+Rendering, digest computation and temporary-file preparation happen outside
+this publication lock. Preparation still uses 32 lock buckets per directory
+to retain one active metadata serialization buffer and temporary pair per bucket
+across cooperating publishers. Unrelated publishers in one bucket can wait for
+each other's preparation; completed preparations serialize their commits within
+the parent directory.
+This adds one publication lock per directory and creates the metadata directory
+only when needed. Migrating an existing route to that directory leaves its old
+adjacent sidecar in place; readers use the directory entry once it exists. The
+adapter does not delete older artifacts automatically.
+
+On-demand generation for a route listing shares pending work and a regeneration
+subscription. A persisted HTML hit after restart does not restore a live
+subscription: call `generator.generate(&options).await` on the serving process's
+ntex runtime before accepting requests, on every startup. Keep that runtime
+alive while serving. Existing files are refreshed and the process installs its
+own regeneration subscriptions. A separate pre-build process cannot transfer
+its callbacks or reactive contexts into the server.
+
+When a cache miss starts a new generation, its app function and
+`additional_context` become the rendering callbacks for later regeneration
+events. Requests joining a generation already in progress share that result.
+An existing subscription retains its initial reactive scope and is not recreated
+for a cache miss, including when the initial generation creates a relative
+`site_root`. Static file hits do not run rendering callbacks.
+
+Generation work is keyed by the publication directory entry: the physical
+parent directory plus the entry's stored spelling as listed by that directory,
+without following a final symlink. A missing entry keeps its requested
+spelling. Where the directory demonstrably folds ASCII case, spellings fold so
+that aliases of one future or replaced entry share one generation and one
+regeneration subscription. Distinct symlinks to one target, including
+hard-linked symlink entries, are separate work. Not covered: non-ASCII case or
+Unicode-normalization aliases of a still-missing entry, and directories whose
+case rule cannot be observed (an empty directory at a volume root); such
+aliases run separate generations until an entry exists.
+
+URL aliases that map to one HTML file, such as `/x/` and `/x/index`, share that
+artifact. Static rendering and its context must describe shared content; use
+dynamic SSR for representations that vary by visitor or request.
+
+The [`isr_startup` example](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/examples/isr_startup.rs) demonstrates this sequence
+and a bounded refresh notification channel:
+
+```sh
+cargo run --locked --example isr_startup -- target/isr-site
+# In another terminal:
+curl -X POST http://127.0.0.1:3000/refresh
+```
+
+Visit `http://127.0.0.1:3000/`, request a refresh, and reload after regeneration.
+The endpoint returns 202 while work is pending; rapid changes are coalesced.
+The revision is in-memory demo data and resets after restart. Restarting the
+command refreshes the saved page and recreates the listener in the new process.
+
+To serve existing artifacts without startup generation or the refresh endpoint:
+
+```sh
+cargo run --locked --example isr_startup -- target/isr-site --prebuilt
+```
+
+`--prebuilt` only changes the example's startup. It does not provide a general
+no-generation mode: Static handlers can still attempt on-demand rendering when
+an artifact is missing or inconsistent. Deploy complete HTML/metadata/lock
+artifacts and enforce filesystem permissions separately for read-only storage.
+Valid prebuilt artifacts are served without installing a regeneration subscription.
+
+The default has no automatic disk quota or eviction. To opt into admission
+limits, open one `StaticRoutePolicy` per process and bind it to the route
+listings or their generator before that site root starts generating. Listings
+and generators produced by one `generate_route_list*` call share a runtime, as
+do all listings and generators composed by hand; binding the policy through
+`with_static_policy` or `configure_routes` on either side governs both.
+`StaticRoutePolicy::open` may be awaited on any executor: without a running ntex
+System the installation runs inline. `StaticStorageLimits`
+sets logical named-file bytes and namespace entries for cooperating processes
+using the same site root. `StaticWorkLimits` sets process-local active renders,
+live regeneration streams and waiting callers. Every limit defaults to `None`;
+zero refuses acquisition of that resource. Handles opened independently share
+the persisted storage policy but have independent work counters.
+
+The [`isr_startup` example](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/examples/isr_startup.rs)
+also demonstrates policy installation and `try_generate`:
+
+```sh
+cargo run --locked --example isr_startup -- target/bounded-isr --bounded
+```
+
+Its limits are demonstration values, not recommended capacities or library
+defaults. Choose limits for your route set, assets and publication peak.
+`try_generate` reports completed paths and typed failures; earlier artifacts and
+subscriptions survive a later failure. The existing `generate` method retains
+its unit return type and logs failures. A refused capacity on an HTTP cache miss
+returns `503`; a configuration fault, such as a publisher that is not bound to
+the installed policy, returns `500`. Cache hits continue serving existing
+artifacts. No eviction is performed. An ISR trigger waiting for a render slot is
+coalesced and resumes when a slot becomes available; filesystem admission
+failures are reported and require a later trigger or cache miss after the
+condition has been resolved. An error render, such as a `404`, holds its
+regeneration subscription like a successful one, so that a later trigger can
+publish the page once it exists.
+
+Storage accounting includes existing assets, metadata, hidden locks, staging,
+crash remnants and missing parent directories. It reserves the publication peak
+while both old and new files exist. This bounds logical file lengths and named
+entries, not physical disk blocks, unlinked files still open by readers, or
+arbitrary memory allocations made by application rendering. Cached reads do not
+scan storage. Managed publications take an exclusive root lock and wait for one
+another; the site inventory is scanned once per process and then kept exact
+from the directories a publication touches, and a publication generation in the
+control record tells cooperating processes when their cached inventory is
+stale. Installing a policy never waits behind a publisher and reports `Busy`
+instead. The render permit remains held until blocking I/O actually ends, even
+after request cancellation. Unlimited publishers use the same root control
+file, without the inventory scan, and refuse writing into a managed root unless
+they bind its policy.
+
+Installing a storage policy currently requires Unix. The policy is immutable
+and stored in `.leptos-static-policy.lock`; all cooperating writers for that root
+must use this adapter version and matching limits. Do not remove or replace
+that file while publishers are running. Independent managed roots must not
+overlap; install only while no publisher uses an overlapping, different root.
+Installation coordinates publishers using exactly the same root. External
+writers and overlapping roots cannot be used to obtain a global disk quota.
+Opening a policy may create the root and control file before reporting an error.
+The default serving path continues to support prebuilt read-only artifacts.
+The serving helpers do not expose hidden metadata files.
+
+### Runtime and context
+
+Wrap the selected ntex runner in `RequestRuntime`, as in the quick start.
+It creates a local request scope for the system and every worker. Handlers
+registered without such a scope report the misconfiguration once and answer
+every affected request with `500` rather than panicking the worker. The same
+wrapper supports ntex's default Neon backend and its Tokio backend; enable
+`features = ["tokio"]` on the application's `ntex` dependency to select Tokio.
+`RequestRuntime` preserves that selection and does not install a Tokio executor.
+
+`Request` is a clonable, transferable handle to a native request owned by that
+scope. Access the native request through `request.with(|http| ...)`: access on
+another thread or after scope closure returns `RequestAccessError`. The callback
+must finish before its borrowed request data can be released. Return owned data
+when it is needed later, for example `request.with(|http| http.path().to_owned())`.
+There is no `Deref`/`DerefMut` access. These are breaking changes to the request
+context API and application startup; see the migration example below.
+
+The final handle releases its native entry on the origin thread. A final drop on
+another thread wakes the runner to collect it; scope shutdown releases remaining
+entries even if an application retained handles or the runtime retained a pending
+task. Scope closure makes those handles unavailable. This does not forcibly free
+native `HttpRequest` clones explicitly obtained by application code.
+
+For synchronous embedding, create a local `RequestScope` before constructing a
+`Request`. Its `collect()` method processes foreign-thread retirements; dropping
+it closes all of its entries. A manual scope must enclose the request's actual
+work. Tokio's `SystemRunner::run_local` bypasses the configured runner, so it also
+needs an explicit scope that lives outside the awaited operation. Scopes are
+thread-wide, so enclose the whole local run, rather than one yielding request
+future that shares the thread with other requests. Such embedding
+must arrange `collect()` calls while running if foreign drops should be reclaimed
+before scope closure.
+
+Native requests, response bodies and the server-function `SendWrapper` values
+still require polling, access and destruction on their origin thread. In
+particular, the `Send` return type of `handle_response_inner` does not permit
+moving that future onto `tokio::spawn` or a different thread pool.
+
+```rust
+use leptos_ntex_unofficial::{Request, RequestScope};
+
+let scope = RequestScope::new();
+let native = ntex::web::test::TestRequest::with_uri("/account").to_http_request();
+let request = Request::new(&native);
+// Previously: request.path().to_owned()
+let path = request.with(|http| http.path().to_owned()).unwrap();
+assert_eq!(path, "/account");
+drop(scope);
+assert!(request.with(|http| http.path().to_owned()).is_err());
+```
+
+`Request::new` requires an active scope; `Request::try_new` reports its absence
+without panicking. `into_inner` returns an owned native request on the origin
+thread, and `try_into_inner` reports unavailable access. The application assumes
+responsibility for that native value, including its thread and destruction.
+
+Executor installation and server-function registration are process-wide.
+`try_init_executor()` detects an already selected executor; it does not validate
+that the calling thread is currently running a compatible runtime. Register
+server functions consistently across apps sharing a process.
+
+Leptos currently suppresses resource loading with process-wide state while it
+enumerates routes. Concurrent enumeration and active SSR in separate apps can
+leave a resource pending. Enumerating routes during application startup avoids
+that overlap; it is an upstream limitation, not an isolation guarantee supplied
+by this adapter.
+
 ### Proxy headers
 
 ntex's `ConnectionInfo` trusts `Forwarded`, `X-Forwarded-Host`, and
@@ -203,10 +502,10 @@ The shortest local feedback loop is:
 
 ```sh
 cargo fmt --all -- --check
-cargo test
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+cargo test --locked
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
 
 See [`CONTRIBUTING.md`](https://github.com/AlexeyMatskevich/leptos_ntex/blob/master/CONTRIBUTING.md) for the repository workflow and

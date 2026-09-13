@@ -7,37 +7,187 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Breaking
 
-- The inner `SendWrapper` field of the server-function newtypes `NtexRequest`
-  and `NtexServerResponse` is now crate-private (`pub(crate)`), matching
-  `server_fn`'s own `ActixRequest` / `ActixResponse`. Both types are still
-  constructed with `From` and consumed with `take()`; the `SendWrapper`
-  cross-thread-panic hazard (accessing or dropping the value off its origin
-  thread) is now documented on each. **Breaking:** code that reached into the
-  `.0` field directly must use `take()` instead.
+- Replace `Request`'s `Deref`/`DerefMut` access with scoped `with` callbacks.
+  Native requests belong to an origin-thread scope; transferable handles no
+  longer own a `SendWrapper<HttpRequest>`. Access after scope closure or on
+  another thread returns `RequestAccessError`. Handle clones cannot extend
+  native lifetime beyond scope shutdown.
+- Require an active request scope when creating request contexts. Wrap the
+  application's ntex runner in `RequestRuntime::new(DefaultRuntime)` for both
+  Neon and Tokio, or use an explicit `RequestScope` for manual embedding.
+  `Request::new` and `into_inner` retain their signatures; `try_new` and
+  `try_into_inner` expose access failures without panicking. Explicitly extracted
+  native requests remain the application's responsibility. Handlers registered
+  without a scope report the misconfiguration once at registration and answer
+  every affected request with `500` instead of panicking the worker.
+
+### Added
+
+- Support both unit-returning and panic-result `ntex-rt::Runner` APIs in
+  `RequestRuntime`, selecting the resolved signature during compilation.
+- Add opt-in `StaticRoutePolicy` with persisted logical storage budgets for
+  cooperating processes and shared process-local render, regeneration-stream
+  and waiter permits. Refuse new work without evicting existing artifacts; keep
+  render permits through actual blocking publication and resume coalesced ISR
+  work when a render slot becomes available. Policy installation currently
+  requires Unix; default operation remains unlimited. Managed publications wait
+  for one another at the root lock instead of failing with `Busy`; the site
+  inventory is cached and kept exact across publications, with a publication
+  generation in the control record retiring stale caches of cooperating
+  processes. Capacity refusals answer `503`; configuration faults such as an
+  unbound publisher, a mismatched policy or an unsupported root answer `500`.
+  The policy opens inline where no ntex System is running, and a site root
+  below a search-only ancestor directory is supported.
+- Bind policies per site root: listings created with `NtexRouteListing::new`
+  and generators created with `StaticRouteGenerator::new` share one process
+  runtime, so a policy bound through either side governs both and startup and
+  request renders of one path share one generation. Late binding fails once
+  that root has started generating rather than once a handler is registered.
+- Add `StaticRouteGenerator::try_generate` with completed-path counts and typed
+  partial failures, and demonstrate opt-in policy setup in `isr_startup`.
 
 ### Fixed
 
-- A `SsrMode::Static` route that captured a custom **success** status via
-  `ResponseOptions::set_status` no longer overwrites the conditional / range
-  status `NamedFile` computes from a request's validators or `Range`. A
-  captured `2xx` (e.g. `201`) still applies to a full `200` serve, but on an
-  `If-None-Match` / `If-Modified-Since` hit (`304`), a precondition failure
-  (`412`), a range response (`206` / `416`), or a malformed `Range` header
-  (`400`) it now keeps `NamedFile`'s status rather than being replaced —
-  previously a conditional GET could receive `201` with an empty body and drop
-  its valid cache (RFC 9110 §13, §14.4, §15.4.5). These are exactly the
-  non-`200` statuses `NamedFile::into_response` produces. A captured
-  **redirect** (e.g. a `302` + `Location` from a `SsrMode::Static` route that
-  calls `redirect()`, which SSG caches because the error-skip predicate covers
-  only `4xx`/`5xx`) is not a representation status, so it still fires on such
-  hits — as a bare redirect, without the file's range/conditional artifacts (a
-  `206`'s `Content-Range` header and partial body are dropped). This extends the
-  file-serving snapshot reconciliation (which already strips body-framing
-  headers) to the status line; it is a deliberate divergence from the upstream
-  `leptos_axum` / `leptos_actix` adapters, which
-  overwrite the status unconditionally.
+- Key static generation work by the replaceable publication directory entry
+  instead of a final symlink target or the raw requested spelling. Native
+  aliases of one existing or missing entry share one generation and one
+  regeneration subscription across replacement; distinct symlinks to one
+  target, including hard-linked symlink entries, stay independent.
+- Keep static generation work stable when publication creates a relative root,
+  including missing parent components and parent-directory aliases.
+- Distinguish absent static metadata from dangling metadata or directory links,
+  including links whose targets exceed filesystem name limits.
+  Regenerate damaged metadata or report an error instead of serving a guessed
+  plain-file status; retain valid internal links. An ordinary file occupying
+  the metadata directory name is a damaged deployment that is never replaced.
+- Retain the generation owner before invoking regeneration factories, so a
+  later factory panic cannot clean up values still used by earlier streams.
+
+- Refresh static rendering callbacks when a cache miss starts a new generation,
+  while retaining one regeneration subscription and its original reactive scope.
+  Admit new waiters atomically with abandonment and subscription completion, so
+  they do not receive an earlier generation's cancellation error.
+- Preserve application response headers, including repeated cookies, on rejected
+  WebSocket handshakes, payload overflows detected during dispatch, and static
+  file negotiation failures. Handshake and payload errors keep the adapter's
+  status and metadata for the actual error response.
+- Complete HEAD response bodies without polling their producers, preserving the
+  body size, owner lifetime and subsequent requests on the connection,
+  including streamed SSR routes whose deferred fragments no longer render.
+- Strip `Content-Digest`, `Repr-Digest` and `Digest` with the other
+  representation fields from adapter-generated error responses, and merge
+  single-valued fields such as `Content-Location`, `Retry-After` and
+  `Strict-Transport-Security` by replacement; the fields the adapter owns are
+  checked against its merge rules by a spec.
+- Accept empty elements around offered WebSocket subprotocols and validate
+  unique tokens across repeated fields. Ignore invalid configured subprotocols
+  when matching client offers, including empty strings.
+- Copy complete incoming WebSocket message payloads out of transport buffers so
+  retained messages do not pin larger allocations.
+- Keep the request's reactive scope active during pending SSR setup, deferred
+  work, streamed response polling and user-stream destruction. Apply the same
+  scope to server-function dispatch/output, request-owned background work and
+  static generation, including cancellation of startup parameter resolution,
+  while preserving the caller's owner and cleanup ordering.
+- Store static response metadata as `.leptos-static-metadata/<HTML filename>`
+  beside every HTML artifact, so metadata entries share the HTML entry's
+  filename limits and case/Unicode equivalence. HTML without a metadata entry
+  is served as a plain file of an older publisher; a damaged entry or
+  directory is regenerated or reported, never guessed.
+- Reuse verified HTML/metadata pairs across cache hits: the digest and
+  metadata are checked once per pair identity and again only after the files
+  change, so a hit no longer hashes the whole body per request.
+- Open lock and control entries through one helper that never follows
+  symlinks, refuses directories, FIFOs and hard-linked inodes, and ends the
+  lease explicitly, for the per-directory publication and scratch locks as
+  well as the policy control record.
+- Coordinate static publication through case and Unicode path aliases with a
+  per-directory commit lock. Keep rendering and temporary-file preparation
+  outside that lock, and validate pinned reader snapshots after releasing it.
+- Omit redundant `Content-Language` metadata from static `304` responses and
+  `206` responses to `If-Range`, while preserving required `Content-Location`.
+- Preserve an explicitly selected static `Content-Type`, including its
+  parameters, when serving generated files and applying HTTP preconditions.
+- Serve verified HTML/metadata pairs without a deployed lock file, including
+  on read-only storage; recheck for a concurrent publisher before accepting a
+  lockless snapshot.
+- Buffer static metadata reads, open served files through one cached root
+  capability instead of resolving the root and file paths per request, project
+  the request only when conditional or range headers are present, and compute
+  digests before taking the publication lock.
+- Preserve repeated response header values when replacing an existing list
+  field, including all `Cache-Control` directives. Continue appending cookies.
+- Clean up Leptos owners on cancellation, panic and stream completion, after
+  user futures and streams have been dropped. Restore the caller's current
+  owner on every poll and drop. Keep contexts alive for server-function output
+  and cancel pending WebSocket work when ntex detects the disconnect.
+- Preserve the public tuple fields of `NtexRequest` and `NtexServerResponse`
+  exposed by 0.7.1.
+- Honor the configured methods of static route listings.
+- Persist static response status and headers with a verified HTML digest;
+  coordinate publication and reads across cooperating processes and path
+  aliases. Share on-demand generation and regeneration per route listing.
+- Preserve the captured reactive scope of static regeneration tasks and
+  subscriptions during polling and destruction, including values supplied by
+  `additional_context`. Drop pending work before releasing its captured owner.
+- Use bounded temporary filenames for static publication so valid long HTML
+  and metadata filenames are not rejected by the temporary suffix.
+- Use capability-relative file operations and exclusively created temporary
+  files. Reject non-regular files before serving, and retain only owned
+  temporary files for cleanup.
+- Honor `identity` quality values and `Vary` for precompressed assets. Correct
+  conditional and range handling at the `ntex-files` boundary, including HEAD,
+  `If-Range`, precondition ordering and empty representations. Apply ranges only
+  to otherwise successful GET responses with status 200; a captured 201 remains
+  a full 201 response. Conditional/range requests preserve captured redirects
+  without range artifacts.
+- Bound WebSocket I/O work with one connection pump, apply the configured
+  message limit to the codec, and validate handshake and frame fields before
+  ntex discards them. Preserve valid fragmentation, UTF-8 and offered
+  subprotocol negotiation. Successful upgrades have no transfer encoding.
+- Terminate HTTP/1 connections on a response-body error before ntex can insert a
+  second HTTP response into the original body. This is a containment workaround
+  for the dependency's error path. HTTP/2 retains native stream-error handling;
+  streaming commit semantics are unchanged.
+- Remove the unused LRU dependency and refresh the whole lockfile: ntex 3.12.3
+  with ntex-net 3.15.0, which carries the io-uring body fix for
+  ntex-rs/ntex#932, leptos 0.8.20 and leptos_router 0.8.15.
+
+### Changed
+
+- Depend on `ntex-rt` 3.15.4 or newer directly, so `StaticRoutePolicy::open`
+  can detect a running ntex System; every supported `ntex` already resolves to
+  it, and the build script keeps selecting the Runner signature at compile time.
+- Restructure unit and request/API specs around explicit characteristics;
+  add controlled lifecycle, publication, flow-control and wire regressions.
+- Pin CI actions, restrict workflow permissions, and exercise all eight feature
+  combinations on MSRV and stable. A separate job resolves the newest
+  dependencies to build and test the panic-result `ntex-rt` Runner signature.
+  MCP development wrappers now require an explicitly installed executable
+  before retrieving credentials.
+- Document thread-affinity, process-wide registries, static deployment files,
+  streaming response limits and remaining upstream restrictions.
+- Clarify that HTTP input overflow becomes `413` only when observed before the
+  dispatcher returns its response. Later lazy input errors remain stream errors,
+  including before any response bytes reach the client; cover all three timing
+  stages with real HTTP/1 connections. This corrects the earlier unconditional
+  `413` description without buffering streaming requests.
+- Add an `isr_startup` example and process-isolated restart regressions for
+  `StaticRouteGenerator::generate`: a fresh serving process recreates its
+  subscription and publishes updated body, status and repeated headers after a
+  regeneration signal. Separately verify complete artifacts on read-only storage
+  without installing subscriptions. The example's `--prebuilt` option skips
+  startup generation; it does not disable the adapter's on-demand rendering.
+
+### Removed
+
+- `LEPTOS_STATIC_HEADERS_CACHE_SIZE` is no longer read and has no effect. The
+  in-memory static response cache has been replaced by durable per-file metadata
+  stored with the generated HTML. Default operation remains unlimited and never
+  evicts artifacts; use an explicit `StaticRoutePolicy` or deployment quotas.
+
 
 ## [0.7.1] - 2026-06-21
 
@@ -311,7 +461,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   striped locks — so two concurrent regenerations of a path can't persist a
   mismatched file/header pair, without reintroducing a per-path map that could
   grow without bound.
-- An unknown future `SsrMode` variant (the type is `#[non_exhaustive]`) is now
+- An unknown future `SsrMode` variant reaching the dispatch catch-all is now
   served as a logged `500 Internal Server Error` instead of being silently
   rendered as out-of-order. **Behaviour change:** a route whose SSR mode this
   integration cannot render now fails loud rather than degrading to the
