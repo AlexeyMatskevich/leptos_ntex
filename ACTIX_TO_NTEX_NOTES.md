@@ -47,8 +47,8 @@ does; all of them adapted to ntex types:
   axum's `ServeDir` wrapper. Both this helper and the catch-all
   `file_and_error_handler` serve adjacent `.br` / `.gz` variants when
   the request advertises support, while delegating MIME, ETag,
-  Last-Modified, ranges, and conditional requests to
-  `ntex_files::NamedFile`.
+  and Last-Modified to `ntex_files::NamedFile`. The adapter applies
+  conditional-request precedence and range corrections at this boundary.
 - **`PinnedHtmlStream`.** Public type alias
   `Pin<Box<dyn Stream<Item = io::Result<NBytes>> + Send>>`.
 - **`generate_request_and_parts(req, payload) -> (NtexRequest,
@@ -58,14 +58,17 @@ does; all of them adapted to ntex types:
   running the SSR pipeline on a single request (returns
   `PinnedFuture<HttpResponse>`), so it can be embedded in custom
   route handlers.
-- **Async filesystem I/O on the static path.** `write_static_route`
-  and `handle_static_route` run their blocking filesystem work
-  (`create_dir_all`, the atomic `write_file_atomic` temp-write + `rename`,
-  `canonicalize`, and `NamedFile::open`) on `ntex::rt::spawn_blocking` so
-  slow filesystems (NFS, FUSE, overloaded disks) don't stall the arbiter.
-  The write is atomic (temp sibling + `rename`, guarded against scratch-file
-  leaks) so a concurrent reader never observes a truncated file; see the
-  hardening note below.
+- **Filesystem I/O on the static path.** Lookup, digest verification and
+  publication run on `ntex::rt::spawn_blocking`; ntex-files streams file contents
+  through its blocking executor. Response construction still reads file metadata
+  synchronously for the unsupported-date guard and range preview/size checks.
+  Open directory capabilities anchor lookup and
+  publication; temporary files are created exclusively and removed only by
+  their owner. Static HTML and durable response metadata use a digest and an
+  advisory lock shared by cooperating processes. Each file replacement is
+  atomic, but the pair is not a power-loss transaction: an interrupted pair with
+  a mismatching digest is rejected until regeneration. Identical old/new HTML
+  bytes can match new metadata even before the HTML replacement.
 
 ## Original to this crate
 
@@ -96,7 +99,7 @@ Public API that has no counterpart in either `leptos_actix` or
 - **Per-method server-fn routing.** When registered through
   `leptos_routes*`, every `(path, method)` gets its own `Route` with
   a method filter so a wrong method is rejected at the router level
-  (ntex may surface this as 404 or 405 depending on resource matching).
+  (ntex 3.9.6 returns 404 for an unmatched generated route method).
   The catch-all `handle_server_fns()` returns `405 Method Not Allowed`
   with `Allow` when the path is known but the method is wrong; unknown
   paths still return 400 with the migration-oriented diagnostic.
@@ -128,17 +131,24 @@ not stylistic:
   `iter()` with cloned values.
 - **`HttpRequest` / `HttpResponse` are `!Send`.** This drives most of
   the adapter's plumbing:
-  - `Request` stores `Option<SendWrapper<HttpRequest>>`.
+  - `Request` stores a transferable token; a local `RequestScope` owns the native request.
   - The `server_fn` backend (`NtexRequest`, `NtexServerResponse`,
     `NtexServerFnBackend`) uses `SendWrapper` throughout.
   - `extract()` and `handle_response_inner()` wrap their async
     bodies in `SendWrapper` because `PinnedFuture<HttpResponse>`
     requires `Send`.
-- **`Request::Drop` defensive leak.** If the `SendWrapper<HttpRequest>`
-  ends up on a different thread (static prerender can migrate
-  `Owner`s), dropping would panic. We `std::mem::forget` instead,
-  accepting a bounded `Rc` leak in exchange for never tearing down an
-  arbiter. Documented in-place on the `Request` type.
+- **Managed request lifetime.** `RequestRuntime<DefaultRuntime>` opens a local
+  request scope outside each worker's runtime execution. Origin final-token
+  drops release entries immediately; foreign drops wake the runtime to collect
+  retired entries. Closing the scope releases its remaining native handles and
+  invalidates tokens even if a backend retains pending tasks. The implementation
+  does not rely on TLS destructor order or a keeper task being destroyed.
+  Callback access replaces `Deref`/`DerefMut`, and constructing request contexts
+  requires a live scope. This is an intentional public compatibility change;
+  the README explains startup and access migration. A manually managed scope
+  needs explicit collection of foreign retirements while it remains open.
+  Native clones deliberately extracted by the application retain their own
+  origin-thread lifetime requirements.
 - **Executor bridge.** ntex supports three runtimes (`tokio`, `compio`,
   the default `neon`) and `any_spawner` knows about none of them.
   `NtexExecutor` implements `any_spawner::CustomExecutor` by
@@ -147,8 +157,8 @@ not stylistic:
   arbiter that handles the request. Installed idempotently (guarded
   by a `std::sync::Once`) from every public entry point; the
   `try_init_executor()` helper lets apps that mix runtimes fail fast
-  at startup with `ExecutorError::AlreadySet` rather than discover the
-  conflict under load. When the fallback fires, the warning is sent
+  at startup with `ExecutorError::AlreadySet`. Installation does not check
+  whether the caller is currently inside a compatible runtime. When the fallback fires, the warning is sent
   to both `tracing::warn!` (when the feature is on) and `eprintln!`
   so the conflict is never silent.
 
@@ -171,7 +181,11 @@ coexist. The adapter surfaces this with two idioms:
 Dynamic and statically pre-rendered routes bind HEAD to the GET
 handler via `guard::Any(guard::Get()).or(guard::Head())`. ntex's h1
 encoder then strips the body at the wire when the request method is
-HEAD, so status and headers mirror GET byte-for-byte with no body.
+HEAD. The response describes the selected representation without sending its
+body. File responses ignore `Range` on HEAD, as required by RFC 9110 §14.2:
+a HEAD can therefore return the full representation's `200` and metadata where
+the corresponding ranged GET returns `206` and `Content-Range`. This is not a
+promise of byte-for-byte identical GET and HEAD headers.
 
 `Route::method()` was intentionally not used for this: `take_guards()`
 turns it into an AND-combined `MethodGuard` on the owning Resource,
@@ -203,8 +217,9 @@ Both paths share `dispatch_server_fn(...)`, which sets up the reactive
 `Owner`, provided contexts (`Request`, `ResponseOptions`), the
 referrer-based 302 fallback for HTML form submissions, and the
 `Location` header merge from `ResponseOptions` (singleton response
-headers replace earlier values; `Set-Cookie` and other repeatable
-headers still append).
+headers replace earlier values; list overrides such as `Cache-Control`
+replace the old set while preserving all new values; `Set-Cookie` and
+other append-policy fields retain earlier values).
 
 The referrer fallback is same-origin only. `server_fn`'s own
 form-redirect feature decides whether to echo the raw `Referer` using a
@@ -214,7 +229,8 @@ derived from the referrer can reach `dispatch_server_fn` even for
 `text/html;q=0`) or rewritten error URLs. Rather than mirror every
 shape, the handler enforces the invariant wholesale: any `Location` left
 by the server-fn layer that does not resolve to the current origin is
-stripped (and a redirect status downgraded to `200`). Application-level
+stripped (and a redirect status restored to `500` for a server-function
+error, otherwise `200`). Application-level
 redirects set through `redirect()` / `ResponseOptions` are applied
 afterwards and are unaffected.
 
@@ -237,70 +253,122 @@ crate-specific path:
   `ServerFnErrorErr::Args` (semantically "error reading arguments
   from the request"). The outer handler observes the marker after the
   `server_fn` pipeline returns and rewrites the response to 413 with
-  a human-readable body that states the limit.
+  a human-readable body that states the limit. A lazy streaming input may be
+  read only after the function returned its response. Such a later error stays
+  a body error even before the first response bytes reach the client. Once the
+  response has committed, its status cannot be replaced. A propagated body error aborts
+  an HTTP/1 connection; HTTP/2 retains ntex's native stream-error handling.
+  Unconditional 413 would require buffering before dispatch and
+  would change streaming and duplex behavior.
 
 ## WebSocket bridge
 
-The `Req::try_into_websocket` impl on `NtexRequest` upgrades via
-`ntex::web::ws::start` and hands the `server_fn` runtime an
-`(incoming_stream, outgoing_sink, response)` triple. Notable pieces:
+`NtexRequest::try_into_websocket` uses ntex's public handshake builder and
+`take_io`, then gives `server_fn` its incoming stream, outgoing sink and
+response. A private codec validates fields that ntex's decoded `Frame` loses:
+reserved bits, control-frame completeness, minimal lengths and Close payloads.
+The normal codec still handles masking, framing and encoding. Its frame limit
+is configured from `payload_limit`, with space for valid control frames.
 
-- **Backpressure.** Both incoming and outgoing channels are bounded
-  `futures::channel::mpsc`. Producers call `Sink::send().await`, so a
-  slow consumer suspends the frame-reader task. Buffer capacity is
-  `LeptosServerFnConfig::ws_channel_buffer`.
-- **Disconnect teardown.** The outbound bridge task parks on the
-  server-fn output receiver while holding a clone of the input sender, so
-  it also selects on `WsSink::on_disconnect()`. When the peer goes away it
-  returns and drops that sender clone, signalling EOF to the server fn so
-  the forwarder unwinds — otherwise the bridge and forwarder would wait on
-  each other forever, leaking the task, both channels, and the socket on
-  every closed connection.
-- **Fragment reassembly (RFC 6455 §5.4).** ntex delivers
-  fragmented messages as
-  `Frame::Continuation(Item::{FirstText, FirstBinary, Continue,
-  Last})`. The bridge keeps a per-connection
-  `Rc<RefCell<Option<(FragmentKind, BytesMut)>>>` and hands the
-  reassembled payload to the server-fn on `Item::Last`. Without this
-  any client that fragments large messages (browsers often do) would
-  silently lose data.
-- **Limit enforcement.** `payload_limit` is checked on each
-  unfragmented frame, on the opening fragment, and on the cumulative
-  buffer. On overflow the bridge closes the connection with
-  `CloseCode::Size` (1009, "Message Too Big" per RFC 6455 §7.4.1) and
-  delivers a typed `InputStreamError` to the server-fn receiver so
-  the client gets a structured reason rather than an abrupt
-  disconnect. Invalid fragmentation state (e.g. a `Continue` without a
-  prior `First*`) closes with `CloseCode::Protocol`.
-- **Subprotocol.** Configurable via
-  `LeptosServerFnConfig::ws_subprotocol`. For dynamic per-request
-  selection, callers can read `ntex::web::ws::subprotocols(&req)`
-  inside a custom WebSocket handler instead of going through
-  `handle_server_fns`.
+One pump polls both directions and the connection-disconnect signal. It owns
+one incoming sender, stops reading when that sender has no capacity, and polls
+transport flushing before taking another outgoing message. This avoids both
+per-frame pending tasks and an ever-growing encoded output buffer. Channel
+capacity is a message count plus futures' sender reservations; fragment
+assembly, one current output message, ntex watermarks and OS buffers are extra.
+Application-created sender clones and arbitrarily large outgoing messages are
+not bounded by the incoming message limit.
 
-## Static-file fallback hardening
+Fragment assembly is private to the pump. Text is validated after complete
+assembly, so a Unicode scalar may span fragments. Oversize input closes with
+1009; invalid text closes with 1007; protocol violations close with 1002.
+Sending a typed input error is best effort during teardown and never waits for
+an application that has stopped reading. A blocked input or transport can delay
+a control frame behind queued data; the adapter does not create another
+unbounded control queue to bypass backpressure.
 
-`file_and_error_handler` resolves a URL path to an absolute filesystem
-path through `safe_subpath`, which:
+After ntex detects disconnect, an adapter-dispatch connection scope cancels both
+a pending function body and independent pending output. If input remains full
+and the application keeps its receiver without reading, paused transport reads
+can delay even FIN/RST detection until input resumes. The adapter currently has
+no inactivity deadline that resolves that case. Owner leases keep user context alive
+until those futures are dropped, then clean it even if application code retained
+an Owner clone. Direct callers of `Req::try_into_websocket` own their own spawned
+application tasks and must manage them themselves.
 
-- splits the URI on `/` and percent-decodes each segment before any
-  comparison (so `%2e%2e` cannot bypass the filter);
-- rejects `..`, dotfiles (`.env`, `.htaccess`), embedded NUL bytes,
-  forward slashes or backslashes that appear after percent-decoding
-  a segment;
-- requires every resulting path component to be
-  `Component::Normal` and not hidden, which blocks absolute-path
-  smuggling and encoded separator tricks such as `%2F.env`;
-- canonicalizes the candidate path and requires it to stay under the
-  canonical `site_root`, which defeats symlink-escape.
+Handshake validation requires a valid nonce, exact protocol tokens and a valid
+offered-subprotocol list. The configured subprotocol is echoed only when
+offered. Legacy versions 7 and 8 remain accepted alongside 13. The upgrade
+explicitly disables HTTP chunking: removing `Transfer-Encoding` alone does not
+prevent ntex's HTTP/1 encoder from recreating it for a 101 response.
 
-The whole check runs on `ntex::rt::spawn_blocking` because
-`canonicalize` and `NamedFile::open` both perform blocking I/O. The
-`site_root` realpath itself is resolved once per file-serving handler and
-cached (the root is fixed for the app's lifetime; only the per-request
-*target* is re-canonicalized), the same construction-time canonicalization
-`ntex_files::Files` performs — a deploy that swaps the root symlink needs a
-restart to take effect. Adds `percent-encoding` as a required dep.
+Origin policy, authentication and CSRF checks belong in middleware before
+upgrade. The WebSocket server-function body executes after the 101 response.
+
+## File serving and static publication
+
+URL components are decoded once and reject dot components, hidden files,
+separators and NUL. The actual opens are relative to directory capabilities:
+canonicalization alone is not an authorization check across a concurrent path
+replacement. Internal symlinks remain usable when their resolved target is
+inside the root. On Unix, nonblocking opens followed by regular-file checks
+prevent a FIFO from parking a blocking worker indefinitely.
+
+A shared response builder adapts `NamedFile` semantics at the ntex boundary:
+preconditions precede ranges, HEAD ignores Range, `If-Range` gates ranges, and
+empty files do not enter ntex-files' zero-length range path. Unknown range units
+are ignored. Ranges only modify an otherwise 200 GET response; a captured 201
+is a complete 201. Conditional/range requests keep a captured redirect without
+range artifacts; ordinary redirects retain the existing HTML-body behavior.
+Repeated validators and negotiated encoding are handled consistently by both
+asset serving and generated static routes. Identity rejection can yield 406;
+negotiated file responses include `Vary: Accept-Encoding`.
+
+Generated HTML is accompanied by hidden digest/status/header metadata. Readers
+use the publication lock when present. If it is absent, they verify a pinned
+snapshot and check again for a newly created lock before accepting the result;
+a new lock requires reopening the pair under its shared lock. Writers create
+the lock before publishing and never delete it. Deploy HTML and metadata
+together; immutable/read-only deployment need not include the lock files.
+The digest binds metadata to HTML bytes, not to an inode generation. Preparation
+uses 32 lock buckets per physical directory to retain one active metadata
+serialization buffer and temporary pair per bucket. SHA happens before that
+lock. A separate `.leptos-static-publish.lock` coordinates the commit within
+each physical parent, including case and Unicode aliases that can choose
+different preparation buckets. Its exclusive section covers metadata destination
+selection, both replacements and directory synchronization; hashing and staging
+are already complete. Readers hold the shared publication lock only while
+opening both files and validate the pinned contents after releasing it.
+Legacy HTML without metadata keeps plain-file behavior. Changing a root symlink
+requires rebuilding the file-serving handler, which caches the canonical root.
+Directory capabilities are opened for individual filesystem operations.
+Already cached canonical roots are not resolved again when opening the
+capability. Compressed siblings still pass through its containment check.
+Conditional/range request projection contains only fields consumed by
+ntex-files; requests without those controls use the original request directly.
+
+On-demand work and regeneration are owned by the route listing's shared runtime.
+A persisted HTML hit does not recreate a regeneration callback or its reactive
+Owner after restart. Call `generate` in the serving process at startup to resume
+regeneration; running a generator in a separate pre-build process does not move
+its live subscriptions into the server.
+The `isr_startup` example shows both startup paths. Skipping startup generation
+does not disable on-demand rendering for a missing or inconsistent artifact;
+read-only deployment requires complete artifacts and filesystem permissions.
+Concurrent misses share generation; cancellation of the last waiter can cancel
+unused pending work. Regeneration streams are dropped before their Owner is
+cleaned. Default path cardinality and disk usage remain unlimited; applications
+can opt into `StaticRoutePolicy` for named storage and process work budgets.
+Static responses are shared
+representations, including their captured headers, and must not contain
+request-specific private data or nonce values.
+
+Response-body I/O errors preserve their original error and terminate an HTTP/1
+connection before ntex's error handler can serialize a second HTTP response.
+HTTP/2 retains native stream-error handling instead of closing a shared socket.
+Remove this containment, the `NamedFile` request projection and extra WS checks
+only after supported dependency versions satisfy the corresponding wire and
+lifecycle regressions.
 
 ## Feature flags
 
@@ -331,12 +399,15 @@ islands-router = ["leptos/islands-router"]
 - `LeptosRoutes for App<...>` carries more verbose type bounds than
   actix; the `register_leptos_routes(cfg, ...)` shortcut is the
   ergonomic escape hatch.
-- `Request::Drop` leaks an `Rc` increment on cross-thread drops
-  instead of panicking. `actix_web::HttpRequest` is **not** `Send`
-  either — `leptos_actix` wraps it in the same `SendWrapper`. The
-  divergence is the drop *policy*: `leptos_actix` lets a cross-thread
-  drop panic, whereas this crate leaks a bounded `Rc` increment instead,
-  so a migrating `Owner` never tears down an arbiter.
+- The managed `Request` context uses scoped callback access instead of the
+  native request's `Deref` API. `RequestRuntime` is required for automatic worker
+  lifetime and retirement collection; manual scopes cover explicit embedding.
+  Other `SendWrapper` values still require origin-thread polling and destruction.
+- Leptos's route enumeration currently changes a process-wide resource-loading
+  flag. Enumeration overlapping SSR in another application can leave a resource
+  pending. Startup enumeration avoids the overlap; the adapter cannot give
+  per-app isolation for this upstream global. The test suite's enumeration lock
+  excludes this known external failure and is not a production fix.
 - The `replace_blocks` argument on
   `render_app_to_stream_with_context_and_replace_blocks` is accepted
   for API parity with `leptos_actix` / `leptos_axum` but is currently
@@ -345,3 +416,16 @@ islands-router = ["leptos/islands-router"]
   payload. This means
   `SsrMode::PartiallyBlocked` produces the same stream as
   `SsrMode::OutOfOrder` across all three integrations today.
+
+
+### Optional static admission
+
+`StaticRoutePolicy` adds opt-in logical file-byte and namespace-entry budgets
+for cooperating processes using one non-overlapping Unix site root, plus shared
+process-local render, regeneration-stream and waiter counters. Default operation
+is unlimited. Storage admission counts the publication peak and never evicts
+existing artifacts. A root control lock coordinates installation and publication;
+its persisted policy must not be removed while writers run. Managed publication
+can return 503 on capacity refusal or lock contention. Cache hits remain readable.
+`try_generate` exposes typed partial failures while the existing `generate`
+method retains its unit-returning, error-reporting contract.
